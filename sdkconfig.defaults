@@ -1,0 +1,10 @@
+# This board's single USB-C connector wires to the ESP32-S3's native
+# USB-Serial-JTAG peripheral, not to physical UART0 (GPIO43/44 are
+# unconnected on this devkit). Confirmed empirically: with UART0 as the
+# primary console, log output still appeared (via the USB-Serial-JTAG
+# *secondary* console mirror, which is TX-only) but nothing ever arrived
+# on UART0's RX no matter what was sent - the physical link simply isn't
+# there. Using USB-Serial-JTAG as the primary console fixes both
+# directions, since ESP-IDF wires stdin/stdout to it via VFS.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
