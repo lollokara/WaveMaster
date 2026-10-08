@@ -328,6 +328,13 @@ static int exec_gcode(const char *line, bool jog)
         }
     }
     if (!s_fault) {
+        /* Arm, guide and preview act on the ATmega at once, so they must not
+         * overtake motion that is still queued (GRBL treats M62/M63 the same
+         * way): M11 would disarm in the middle of the previous job, M67 would
+         * drop the guide laser halfway through a frame. Wait for the queue
+         * to drain first; same handling as G4. */
+        if ((arm >= 0 || guide >= 0 || preview >= 0) && !wait_idle())
+            return E_ABORT;
         if (arm >= 0)
             atmega_link_set_armed(arm == 1);
         if (guide >= 0)

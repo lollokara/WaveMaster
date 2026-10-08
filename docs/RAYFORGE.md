@@ -106,7 +106,7 @@ Then **Settings > Machines > Add Machine** > **Choose a Machine** > **Import fro
 The dialect "WaveMaster Galvo" is Rayforge's `GRBL Raster` dialect (`grbl_raster`: `M4 S0` once, `S` on every move, modal `F`) with two changes:
 
 - `can_g0_with_speed: false`. Jumps always run at `$201`, whatever F says, and an F on a G0 line still changes the modal feed rate of the next mark. So Rayforge must not send one, and it does not offer a travel speed in the step settings.
-- Preamble `G21`, `G90` (Rayforge adds `G54` after it). Postscript `G4 P0`, `M5`, `M67`. `G4 P0` is a barrier: the firmware waits until its motion queue is empty (`wait_idle()` in `src/grbl.c`) before it does anything else. Without it, `M67` would be applied while up to 512 queued segments are still being marked, which would switch the guide laser off in the middle of a frame. There is no `G0 X0 Y0` return to origin.
+- Preamble `G21`, `G90` (Rayforge adds `G54` after it). Postscript `G4 P0`, `M5`, `M67`. `G4 P0` is a barrier: the firmware waits until its motion queue is empty (`wait_idle()` in `src/grbl.c`) before it does anything else. Current firmware already waits for the queue before `M10`/`M11`, `M62`/`M63` and `M66`/`M67` (they act on the ATmega at once, so they must not overtake queued motion); `G4 P0` keeps the profile safe with older firmware, where `M67` could switch the guide laser off in the middle of a frame. There is no `G0 X0 Y0` return to origin.
 
 Example output (from Rayforge's own encoder, an 80 percent vector job with an arc):
 

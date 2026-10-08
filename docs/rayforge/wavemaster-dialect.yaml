@@ -12,9 +12,9 @@
 #     $201), so Rayforge must not emit it.
 #   * postscript: no "G0 X0 Y0" return-to-origin (pointless for a galvo).
 #     "G4 P0" is a barrier (the firmware waits until all queued motion has
-#     finished), then M5 and M67 (preview off, guide laser off). Without the
-#     barrier M67 would be applied while up to 512 queued segments are still
-#     being marked, and the guide laser would go dark mid-frame.
+#     finished), then M5 and M67 (preview off, guide laser off). Current
+#     firmware syncs M67 with motion itself; the barrier keeps older firmware
+#     from switching the guide laser off mid-frame.
 #   * bezier_cubic stays empty (curves are linearised by Rayforge).
 label: WaveMaster Galvo
 description: WaveMaster galvo fiber-laser controller (GRBL 1.1 subset). M4 S0 once, S on every move, modal F, preview off at job end.
