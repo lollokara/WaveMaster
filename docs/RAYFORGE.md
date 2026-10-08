@@ -76,6 +76,9 @@ Change `$200` only if you need to. The delay settings above are the normal tunin
 
 ## 9. Calibration
 
+The guided way is the calibration wizard, `python3 tools/calibrate.py PORT` (add `--fire` for the real-laser steps). It walks through orientation, scale, distortion, offset, delays, power and speed, computes the `$` values from your measurements, writes them and keeps a restorable backup. The procedure, the measuring technique and troubleshooting are in **[tools/CALIBRATION.md](../tools/CALIBRATION.md)**. The manual summary:
+
+
 - **Scale, `$100` / `$101` (V/mm):** draw a 50 mm square, measure it, then adjust the scale until it measures 50 mm.
 - **Offset, `$140` / `$141` (V):** added to the X / Y output voltage.
 - **Invert, `$3`:** bit 0 inverts X, bit 1 inverts Y.

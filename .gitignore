@@ -14,3 +14,6 @@ tools/backups/
 # rftest run output
 tools/rftest/runs/
 __pycache__/
+
+# calibration wizard output and remembered exact values
+tools/calibrate/
