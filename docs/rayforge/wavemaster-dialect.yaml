@@ -1,0 +1,63 @@
+# WaveMaster G-code dialect for Rayforge (GcodeDialect.to_dict() format).
+#
+# Install: copy to <Rayforge config dir>/dialects/wavemaster.yaml
+#   macOS : ~/Library/Application Support/rayforge/dialects/wavemaster.yaml
+#   Linux : ~/.config/rayforge/dialects/wavemaster.yaml
+# The file name MUST be "<uid>.yaml", i.e. wavemaster.yaml (Rayforge saves and
+# deletes custom dialects under that name). Restart Rayforge afterwards.
+#
+# Derived from the built-in "GRBL Raster" dialect (grbl_raster): M4 S0 once,
+# S on every move, modal F. Differences to grbl_raster:
+#   * can_g0_with_speed: false. The firmware ignores F on G0 (jumps run at
+#     $201), so Rayforge must not emit it.
+#   * postscript: no "G0 X0 Y0" return-to-origin (pointless for a galvo).
+#     "G4 P0" is a barrier (the firmware waits until all queued motion has
+#     finished), then M5 and M67 (preview off, guide laser off). Current
+#     firmware syncs M67 with motion itself; the barrier keeps older firmware
+#     from switching the guide laser off mid-frame.
+#   * bezier_cubic stays empty (curves are linearised by Rayforge).
+label: WaveMaster Galvo
+description: WaveMaster galvo fiber-laser controller (GRBL 1.1 subset). M4 S0 once, S on every move, modal F, preview off at job end.
+laser_on: M4 S0
+laser_off: M5
+focus_laser_on: M3 S{power:.0f}
+tool_change: T{tool_number}
+set_speed: ''
+travel_move: G0{x_cmd}{y_cmd}{z_cmd}{extra_cmd}{f_command}{s_command}
+linear_move: G1{x_cmd}{y_cmd}{z_cmd}{extra_cmd}{f_command}{s_command}
+arc_cw: G2{x_cmd}{y_cmd}{z_cmd}{extra_cmd} I{i} J{j}{f_command}{s_command}
+arc_ccw: G3{x_cmd}{y_cmd}{z_cmd}{extra_cmd} I{i} J{j}{f_command}{s_command}
+bezier_cubic: ''
+air_assist_on: M8
+air_assist_off: M9
+home_all: $H
+home_axis: $H{axis_letter}
+move_to: $J=G90 G21 F{speed} X{x} Y{y}{z_cmd}
+jog: $J=G91 G21 F{speed}
+clear_alarm: $X
+set_wcs_offset: G10 L2 P{p_num} X{x} Y{y} Z{z}
+probe_cycle: G38.2 {axis_letter}{max_travel} F{feed_rate}
+dwell: G4 P{seconds:.3f}
+spindle_on_cw: M3 S{rpm}
+spindle_on_ccw: M4 S{rpm}
+spindle_off: M5
+coolant_flood: M8
+coolant_mist: M7
+coolant_off: M9
+emergency_stop: ''
+preamble:
+- G21 ;Set units to mm
+- G90 ;Absolute positioning
+postscript:
+- G4 P0 ;Wait until all queued motion is done
+- M5 ;Marking laser off
+- M67 ;Preview off (also switches the guide laser off)
+inject_wcs_after_preamble: true
+can_g0_with_speed: false
+omit_unchanged_coords: true
+continuous_laser_mode: true
+modal_feedrate: true
+uid: wavemaster
+is_custom: true
+parent_uid: grbl_raster
+extra: {}

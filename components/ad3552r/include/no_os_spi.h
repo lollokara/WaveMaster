@@ -95,4 +95,27 @@ int32_t ad3552r_esp32_spi_set_clock(struct no_os_spi_desc *desc, uint32_t hz);
  * cannot be determined. */
 uint32_t ad3552r_esp32_spi_actual_hz(struct no_os_spi_desc *desc);
 
+/* ---- Streaming support (galvo output stage) ---------------------------
+ *
+ * Callbacks run in the SPI interrupt, right before a queued transaction
+ * whose spi_transaction_t.user is non-NULL is started (pre) and right after
+ * it completes (post). Must be IRAM-safe. Transactions issued by this shim
+ * itself always have user == NULL. */
+typedef void (*ad3552r_spi_stream_cb_t)(void *user);
+void ad3552r_esp32_spi_set_stream_cbs(ad3552r_spi_stream_cb_t pre,
+                                       ad3552r_spi_stream_cb_t post);
+
+/* The clock the SPI peripheral will really use for a requested rate. */
+uint32_t ad3552r_esp32_spi_quantize_hz(uint32_t hz);
+
+/* Current spi_device_handle_t (changes whenever set_clock() swaps it). */
+void *ad3552r_esp32_spi_dev(struct no_os_spi_desc *desc);
+
+/* The next no_os_spi_transfer() of two messages whose second message's tx
+ * pointer equals marker sends only the first message (CS kept active) and
+ * returns with the bus acquired. Pair with ad3552r_esp32_spi_stream_release()
+ * after the last (non keep-active) transaction has completed. */
+void ad3552r_esp32_spi_stream_arm(const uint8_t *marker);
+void ad3552r_esp32_spi_stream_release(struct no_os_spi_desc *desc);
+
 #endif /* NO_OS_SPI_H_ */

@@ -8,3 +8,30 @@
 # directions, since ESP-IDF wires stdin/stdout to it via VFS.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Performance: the tick generator (core 1) and the stream ISRs (core 0)
+# both benefit from full clock and real optimisation.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# 1 ms scheduler tick: timeouts in the motion/stream pipeline (prebuffer
+# idle, underrun margin, link polling) are a few ms, which a 10 ms tick
+# cannot express. Nothing in the fast paths depends on the tick any more.
+CONFIG_FREERTOS_HZ=1000
+
+# The stream ISRs (SPI pre/post callbacks, gate edge timer) call these from
+# interrupt context.
+CONFIG_GPTIMER_ISR_HANDLER_IN_IRAM=y
+CONFIG_GPTIMER_CTRL_FUNC_IN_IRAM=y
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+
+# Logs share the host link; keep runtime chatter low (raise with esp_log
+# level calls when debugging).
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Gate-edge timer ISR must keep running during flash writes (NVS on a $ setting),
+# otherwise a laser-off edge could be delayed by a flash operation.
+CONFIG_GPTIMER_ISR_CACHE_SAFE=y
+
+# 4 MB flash module (see platformio.ini board_upload.flash_size).
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

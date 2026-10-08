@@ -1,0 +1,176 @@
+# WaveMaster machine profile for Rayforge (Machine.to_dict() format).
+#
+# Install: copy to <Rayforge config dir>/machines/wavemaster.yaml (together
+# with wavemaster-dialect.yaml -> dialects/wavemaster.yaml), then restart
+# Rayforge. The file name stem becomes the machine id.
+#   macOS : ~/Library/Application Support/rayforge/machines/wavemaster.yaml
+#   Linux : ~/.config/rayforge/machines/wavemaster.yaml
+#
+# Edit before use:
+#   driver_args.port        serial port of the ESP32-S3 native USB (macOS:
+#                           ls /dev/cu.usbmodem*). A "VID:PID" such as
+#                           303a:1001 also works.
+#   axes extents / axis_extents   must equal $130 / $131 on the controller.
+#   heads[0].max_power_watts      optical power of your laser (0 = unset).
+#   heads[0].spot_size_mm         your real spot size; sets the raster pitch.
+#
+# Assumes the controller keeps $144=0 (corner origin: (0,0)..(W,H), Y up),
+# which is Rayforge's "Bottom Left" origin.
+machine:
+  name: WaveMaster Galvo
+  driver: GrblSerialDriver
+  driver_args:
+    port: /dev/cu.usbmodem1101
+    baudrate: 115200
+    poll_status_while_running: false
+    deadlock_detection: false
+    rx_buffer_size_override: 1024
+  driver_config:
+    rx_buffer_size: 1024
+    firmware_version: 1.1h.WaveMaster
+    arc_tolerance: 0.01
+  auto_connect: true
+  clear_alarm_on_connect: false
+  placeholder: false
+  home_on_start: false
+  single_axis_homing_enabled: false
+  dialect_uid: wavemaster
+  active_wcs: G54
+  coordinate_systems:
+  - name: G54
+    offset: [0.0, 0.0, 0.0]
+  - name: G55
+    offset: [0.0, 0.0, 0.0]
+  - name: G56
+    offset: [0.0, 0.0, 0.0]
+  - name: G57
+    offset: [0.0, 0.0, 0.0]
+  - name: G58
+    offset: [0.0, 0.0, 0.0]
+  - name: G59
+    offset: [0.0, 0.0, 0.0]
+  supports_arcs: true
+  supports_curves: false
+  arc_tolerance: 0.01
+  axes:
+    configs:
+    - letter: X
+      axis_type: linear
+      extents: [0, 100]
+      direction: normal
+      resolution: 0.01
+    - letter: Y
+      axis_type: linear
+      extents: [0, 100]
+      direction: normal
+      resolution: 0.01
+  axis_extents: [100, 100]
+  work_margins: [0.0, 0.0, 0.0, 0.0]
+  soft_limits: null
+  origin: bottom_left
+  panel_orientation: native
+  reverse_x_axis: false
+  reverse_y_axis: false
+  reverse_z_axis: false
+  rotary_enabled_default: false
+  default_rotary_module_uid: null
+  wcs_origin_is_workarea_origin: false
+  source_profile_id: null
+  reviewed_profile_hash: null
+  device_notes: null
+  user_notes: WaveMaster galvo fiber-laser controller. See docs/RAYFORGE.md in the WaveMaster repo.
+  schema_version: 1
+  usb_vid: null
+  usb_pid: null
+  heads:
+  - type: LaserHead
+    uid: wavemaster-laser
+    name: Fiber laser
+    tool_number: 0
+    model_path: null
+    transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    max_power: 1000
+    frame_power_percent: 0
+    focus_power_percent: 0
+    frame_speed: 60000
+    frame_repeat_count: 20
+    frame_corner_pause: 0
+    spot_size_mm: [0.05, 0.05]
+    cut_color: '#ff00ff'
+    focal_distance: 0.0
+    laser_type: fiber
+    wavelength_nm: 1064.0
+    max_power_watts: 0.0
+    pwm_frequency: 500
+    max_pwm_frequency: 5000
+    pulse_width: 50
+    min_pulse_width: 5
+    max_pulse_width: 500
+    pointer_offset_enabled: false
+    pointer_offset_x: 0.0
+    pointer_offset_y: 0.0
+  cameras: []
+  rotary_modules: []
+  nogo_zones: []
+  capabilities: null
+  hookmacros: {}
+  macros:
+    wavemaster-preview-on:
+      uid: wavemaster-preview-on
+      name: 'Preview ON (M66)'
+      code:
+      - 'M66 ;guide laser on, marking laser forced off, real trajectory runs'
+      enabled: true
+    wavemaster-preview-off:
+      uid: wavemaster-preview-off
+      name: 'Preview OFF (M67)'
+      code:
+      - 'M67 ;preview off, guide laser off'
+      enabled: true
+    wavemaster-guide-on:
+      uid: wavemaster-guide-on
+      name: 'Guide laser ON (M62)'
+      code:
+      - 'M62'
+      enabled: true
+    wavemaster-guide-off:
+      uid: wavemaster-guide-off
+      name: 'Guide laser OFF (M63)'
+      code:
+      - 'M63'
+      enabled: true
+    wavemaster-arm:
+      uid: wavemaster-arm
+      name: 'Arm (M10)'
+      code:
+      - 'M10'
+      enabled: true
+    wavemaster-disarm:
+      uid: wavemaster-disarm
+      name: 'Disarm (M11)'
+      code:
+      - 'M11'
+      enabled: true
+    wavemaster-status:
+      uid: wavemaster-status
+      name: 'Status ($S)'
+      code:
+      - '$S ;stream and ATmega link statistics, shown in the Console'
+      enabled: true
+    wavemaster-readback:
+      uid: wavemaster-readback
+      name: 'DAC readback ($RB)'
+      code:
+      - '$RB ;read the two DAC output registers (idle only)'
+      enabled: true
+  speeds:
+    max_cut_speed: 60000
+    max_travel_speed: 180000
+    acceleration: 2000000
+  gcode:
+    gcode_precision: 3
+  units:
+    unit_system: metric
+  machine_hours:
+    total_hours: 0.0
+    counters: {}

@@ -720,6 +720,8 @@ int32_t ad3552r_get_dev_value(struct ad3552r_desc *desc,
 		//return -EINVAL;
 		*val = 0;
 		return -EINVAL;
+	default:
+		break;
 	}
 	return 0;
 #endif
@@ -1620,6 +1622,9 @@ static int ad3552r_hs_set_bus_io_mode_hs(struct ad3552r_desc *desc)
 		   AXI_DAC_IO_MODE_QSPI : AXI_DAC_IO_MODE_DSPI;
 
 	return axi_dac_set_io_mode(desc->ad3552r_core_ip, bus_mode);
+#else
+	(void)desc;
+	return -ENOSYS;
 #endif
 }
 
@@ -1819,6 +1824,9 @@ exit_err:
 	ad3552r_hs_buffer_postdisable(desc);
 
 	return ret;
+#else
+	(void)desc;
+	return -ENOSYS;
 #endif
 }
 

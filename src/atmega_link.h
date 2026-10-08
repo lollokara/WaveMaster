@@ -1,45 +1,60 @@
 #ifndef ATMEGA_LINK_H_
 #define ATMEGA_LINK_H_
 
+/*
+ * Link to the ATmega328P companion (ArduinoCompanion/) over UART0
+ * (GPIO44 TX / GPIO43 RX after the pin swap, 250000 baud 8N1).
+ *
+ * The ATmega owns the slow laser-interface lines of the IPG DB25:
+ *   - power word D0..D7 + LATCH strobe
+ *   - EMISSION ENABLE / MO ("arm"), with its non-blocking 2 s arm sequence
+ *   - guide (red) laser
+ *   - status inputs (STAT 11/12/16, 5 V detect)
+ * The fast lines (EMISSION MODULATION = gate, SYNC = PRR) are driven
+ * directly by the ESP32 (laser_io.h).
+ *
+ * Wire protocol v2 (framed, CRC-8, see ArduinoCompanion/README.md):
+ *   frame := 0xA5 | cmd | len | payload[len] | crc8(cmd,len,payload)
+ *   every command is answered by a frame with cmd | 0x80 (ACK) whose
+ *   payload is the 8-byte status block, or cmd 0xFF (NAK, payload = error).
+ * The ATmega disarms and zeroes power if it hears nothing for 1 s
+ * (heartbeat), so an ESP32 crash/reset can never leave the laser armed.
+ *
+ * All setters are asynchronous for the caller: they update the desired
+ * state and wake the link task (core 1), which sends it, retries, and
+ * keeps polling status every 200 ms (the heartbeat).
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 
-/*
- * Serial link to the ATmega328P board in ../arduino-laser-control (see
- * that project's src/main.cpp for the authoritative protocol). It owns:
- * guide-laser on/off, laser power setpoint, and system arming. It does
- * NOT own firing (the Engrave GPIO, driven directly by this ESP32 - see
- * engrave_gpio.h) or PRR (driven directly by this ESP32 - see prr_pwm.h) -
- * the ATMEGA's own SET_PWM_EMIT/SET_PWM_SYNC commands exist for its
- * internal modulation/sync signals and are intentionally not driven from
- * the GRBL S/Q words.
- *
- * Wiring: UART0's default pins (GPIO43 TX / GPIO44 RX) - free on this
- * board since the PC/GRBL link uses the native USB-Serial-JTAG peripheral
- * instead (see grbl_task.c / sdkconfig.defaults). Baud 250000, 8N1,
- * matching arduino-laser-control's Serial.begin(250000).
- */
+struct atmega_status {
+    bool link_ok;        /* got a valid reply within the last 500 ms */
+    bool armed;          /* EMISSION ENABLE is asserted */
+    bool ready;          /* armed and the arm settle time has elapsed */
+    bool guide_on;
+    uint8_t power;       /* power word currently latched */
+    uint8_t stat_bits;   /* bit0 STAT11, bit1 STAT12, bit2 STAT16 */
+    uint16_t vdetect_mv; /* 5 V detect input, millivolts */
+    uint32_t errors;     /* CRC/timeout/NAK count since boot */
+};
 
 void atmega_link_init(void);
 
-/* Async (fire-and-forget, queued to a background task) - never blocks the
- * caller, so grbl_task stays responsive ('?' queries, new lines, Ctrl-X)
- * no matter what the ATMEGA is doing. See atmega_link.c's header comment
- * for the full design rationale, especially around atmega_link_set_power()
- * and atmega_link_wait_power_settled() below. */
-void atmega_link_set_guide(bool on);
 void atmega_link_set_armed(bool armed);
-void atmega_link_set_power(float percent); /* 0-100, converted to the ATMEGA's 0-255 byte */
+void atmega_link_set_guide(bool on);
 
-/* Blocks the CALLER (not grbl_task - meant for dac_task) until the most
- * recently queued atmega_link_set_power() has been confirmed applied by
- * the ATMEGA (or has timed out / been dropped - either way, it has
- * settled). Bounded at timeout_ms. For dithered/raster engraving: a move
- * queued alongside an S-word should gate on this before dac_task actually
- * writes the DAC, so the galvo never reaches the next position before the
- * current pixel's power has taken effect. Returns true if confirmed
- * within the window, false otherwise (caller should treat false as
- * "power may not match the commanded value yet"). */
-bool atmega_link_wait_power_settled(uint32_t timeout_ms);
+/* Request a new power word. Returns immediately. */
+void atmega_link_set_power(uint8_t power);
+
+/* Block the caller (dac_task) until the ATmega has confirmed the given power
+ * word is latched, or timeout_ms elapses. Returns true when confirmed. */
+bool atmega_link_wait_power(uint8_t power, uint32_t timeout_ms);
+
+/* Block the caller until the laser reports ready (armed + settled), or
+ * timeout_ms elapses. Returns true when ready. */
+bool atmega_link_wait_ready(uint32_t timeout_ms);
+
+void atmega_link_get_status(struct atmega_status *out);
 
 #endif /* ATMEGA_LINK_H_ */

@@ -1,28 +1,32 @@
 #ifndef DAC_TASK_H_
 #define DAC_TASK_H_
 
+/*
+ * Core-0 owner of the SPI bus / AD3552R. Consumes chunks produced by
+ * galvo_out.c and clocks them out as one continuous hardware-paced stream
+ * (SPI clock = point rate, CS held low across chunks), driving the laser
+ * gate in lock-step. Also services sync barriers (power / PRR changes,
+ * arm-and-wait) between chunks.
+ *
+ * The chunk structures and the producer/consumer queues are private to
+ * galvo_out.c + dac_task.c (see galvo_chunk.h).
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
-/* Starts the DAC/SPI task pinned to core 0. Must be called after
- * laser_ctrl_init(). Returns true if the AD3552R initialized and the task
- * was created successfully. */
+/* Initialises the AD3552R and starts the task pinned to core 0. */
 bool dac_task_start(void);
 
-/* Fixed cost of emitting one point of a paced stream (the two X/Y SPI
- * register writes), in microseconds, on top of whatever per-point delay
- * the caller asks for. Derived from the per-transaction throughput
- * actually measured at boot rather than assumed, and rounded up.
- *
- * Callers that tell a host how long a burst will take must add this to
- * their commanded delay: at typical preview rates it dominates. For the
- * M68 preview loop's 20us/point it is roughly 3x the commanded delay, so
- * ignoring it made grbl_task under-report a 2.3s burst as "~0s" - which in
- * turn made tools/square_loop.py re-issue M68 while the previous 160KB
- * point buffer was still allocated, and the second allocation failed
- * ("M68: out of memory"), dropping whole revolutions of the preview.
- *
- * Returns 0 until the boot speed test has run. */
-uint32_t dac_task_us_per_point(void);
+/* Diagnostic: read back the two DAC output registers. Only valid while the
+ * stream is closed (idle); returns false otherwise or on SPI error. Runs on
+ * the caller's task but serialises with dac_task internally. */
+bool dac_task_readback(uint16_t *code_x, uint16_t *code_y);
+
+/* Diagnostic: reads the DAC configuration registers (range, offsets, gains,
+ * interface and stream config). Same rules as dac_task_readback(). Returns
+ * the number of registers read into addrs/vals, or a negative value. */
+int dac_task_regdump(const uint8_t **addrs, uint16_t *vals, size_t max);
 
 #endif /* DAC_TASK_H_ */

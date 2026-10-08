@@ -1,60 +1,45 @@
 #include <stdio.h>
-#include <stdarg.h>
-#include "esp_log.h"
-#include "laser_ctrl.h"
+
+#include "atmega_link.h"
 #include "calib.h"
 #include "dac_task.h"
-#include "grbl_task.h"
-#include "atmega_link.h"
+#include "esp_log.h"
+#include "galvo_out.h"
+#include "grbl.h"
+#include "host_serial.h"
+#include "laser_io.h"
+#include "motion_task.h"
 
 static const char *TAG = "wavemaster";
 
-/*
- * Debug logs share the same physical link (USB-Serial-JTAG) as the
- * GRBL/PC protocol - this board only exposes one usable serial connection
- * to a PC. To keep a strict GRBL sender from choking on interleaved log
- * output, every log line is prefixed with "; " - the GRBL comment marker,
- * which compliant senders/parsers ignore. This assumes esp_log makes one
- * vprintf call per complete line (the common case); it is not a
- * byte-exact guarantee for multi-line messages.
- */
-static int grbl_comment_vprintf(const char *fmt, va_list args)
-{
-    char buf[256];
-    int len;
-
-    len = vsnprintf(buf + 2, sizeof(buf) - 2, fmt, args);
-    if (len <= 0)
-        return len;
-
-    buf[0] = ';';
-    buf[1] = ' ';
-    /* Single write call to minimize (not eliminate) interleaving with the
-     * other core's concurrent log/GRBL-response writes to the same UART. */
-    fwrite(buf, 1, (size_t)len + 2 > sizeof(buf) ? sizeof(buf) : (size_t)len + 2, stdout);
-
-    return len;
-}
-
 void app_main(void)
 {
-    esp_log_set_vprintf(grbl_comment_vprintf);
+    bool hw_ok;
 
-    ESP_LOGI(TAG, "WaveMaster ESP32-S3 boot");
-
+    laser_io_early_init();               /* gate inactive before anything else */
     calib_init();
-    laser_ctrl_init();
+    /* Apply the stored gate polarity at once: with an active-low gate the
+     * early-init level (low) would otherwise mean "laser on" until the
+     * output stage starts. */
+    laser_io_set_gate_active_low(calib_get(CAL_GATE_ACTIVE_LOW) != 0.0f);
     atmega_link_init();
+    if (!host_serial_init())             /* from here on logs are [MSG:...] lines */
+        ESP_LOGE(TAG, "host serial init failed");
 
-    if (!dac_task_start()) {
-        ESP_LOGE(TAG, "DAC task failed to start, halting bring-up");
-        return;
+    hw_ok = dac_task_start();
+    if (hw_ok) {
+        galvo_out_init();
+        hw_ok = motion_task_start();
     }
+    if (!hw_ok)
+        grbl_set_fault("DAC/motion start failed");
 
-    if (!grbl_task_start()) {
-        ESP_LOGE(TAG, "GRBL task failed to start, halting bring-up");
-        return;
-    }
+    if (!grbl_task_start())
+        ESP_LOGE(TAG, "GRBL task failed to start");
 
-    ESP_LOGI(TAG, "WaveMaster ready: core0=DAC/SPI, core1=GRBL/UART");
+    if (hw_ok)
+        ESP_LOGI(TAG, "ready: tick %.2f us, field %.0fx%.0f mm, scale %.4f/%.4f V/mm",
+                 (double)galvo_out_tick_us(), (double)calib_get(CAL_FIELD_W),
+                 (double)calib_get(CAL_FIELD_H), (double)calib_get(CAL_X_SCALE),
+                 (double)calib_get(CAL_Y_SCALE));
 }

@@ -1,516 +1,618 @@
+/*
+ * Output stage, consumer side (core 0): owns the SPI bus / AD3552R.
+ *
+ * Chunks from galvo_out.c are clocked out as ONE hardware-paced stream: the
+ * SPI clock is 12 / tick_us MHz (12 quad clocks per X+Y point), CS stays low
+ * across chunks, and each chunk is one data-only QIO transaction. Up to
+ * MAX_INFLIGHT transactions are queued so the SPI driver's ISR starts the
+ * next chunk immediately when one finishes.
+ *
+ * Laser gate lock-step: the SPI driver calls our pre-callback in the ISR
+ * right before it starts a chunk. We capture a free-running GPTimer there,
+ * set the chunk's initial gate level and arm the timer alarm for the first
+ * gate edge at start + edge_tick * tick. The alarm ISR toggles the gate and
+ * arms the next edge. Everything the ISRs touch lives in IRAM / DRAM.
+ *
+ * The task never sleeps in the streaming path: it blocks on a task
+ * notification (new chunk, completion, hold release, abort).
+ */
 #include "dac_task.h"
+#include "galvo_chunk.h"
+#include "galvo_out.h"
 #include "ad3552r_board.h"
-#include "laser_ctrl.h"
-#include "engrave_gpio.h"
-#include "prr_pwm.h"
+#include "no_os_spi.h"
 #include "atmega_link.h"
 #include "calib.h"
-#include <stdlib.h>
-#include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/idf_additions.h"
+#include "laser_io.h"
+#include "driver/gptimer.h"
+#include "driver/spi_master.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_rom_sys.h"
-#include "esp_task_wdt.h"
+#include "freertos/task.h"
+#include <math.h>
+#include <string.h>
 
 static const char *TAG = "dac_task";
 
-#define DAC_TASK_STACK_SIZE 4096
-#define DAC_TASK_PRIORITY   10
-#define DAC_TASK_CORE       0
+#define DAC_TASK_STACK     6144
+#define DAC_TASK_PRIORITY  10
+#define DAC_TASK_CORE      0
 
-/* Measured cost of one single-channel ad3552r_board_write_volts() call, in
- * microseconds, filled in by run_dac_speed_test() at boot. Used by
- * dac_task_us_per_point() so grbl_task can estimate how long a paced burst
- * will really take (see dac_task.h) instead of assuming the commanded
- * per-point delay is the whole cost - it isn't, the SPI transaction
- * dominates at typical preview rates. */
-static float s_write_us = 0.0f;
+#define MAX_INFLIGHT       3        /* transactions queued in the SPI driver */
+#define IDLE_CLOSE_US      30000    /* close the stream after this long idle */
+#define POWER_WAIT_MS      50
 
-/* RAM budget for batching whole revolutions into one hardware-paced SPI
- * transaction (see run_paced_in_hardware()). Trades memory against how
- * often the inter-transaction hold lands: bigger means a rarer artefact.
- * 16KB is comfortable against this board's ~300KB heap and, for a typical
- * preview shape, already pushes the boundary out to every ~50ms. */
-#define PACED_BATCH_MAX_BYTES 16384
+#define TIMER_RES_HZ       20000000u
+#define TIMER_RES_MHZ      20u
+/* Gate edge alarms never get armed closer than this to "now" (2 us). */
+#define ARM_MARGIN_COUNTS  (2u * TIMER_RES_MHZ)
+/* Delay between the pre-callback and the first SCLK edge of a chunk, in
+ * timer counts. To be measured on the scope; compensates a constant skew
+ * between the gate and the DAC samples (the laser on/off delays absorb any
+ * remainder). */
+#define START_LATENCY_COUNTS 0u
 
-/* One-shot speed tests run at boot, measuring real DAC write throughput
- * over the actual SPI bus/driver path (not a theoretical bit-rate
- * calculation) - reported as MUPS (mega updates per second) to match the
- * datasheet's own throughput unit. See STATUS.md for the full writeup of
- * what was tried and why per-transaction writes can't approach the
- * datasheet's 33 MUPS figure (that number is for the AD3552R's own
- * quad+DDR streaming hardware mode, not reachable via ESP-IDF's generic
- * spi_master driver for arbitrary transfers). */
-#define SPEED_TEST_WRITES 5000
-#define SPEED_TEST_STREAM_POINTS 5000
+/* ---- ISR-shared state (DRAM) ------------------------------------------ */
+static gptimer_handle_t s_timer;
+static gptimer_alarm_config_t s_alarm_cfg;
+static TaskHandle_t s_task;
+static struct galvo_chunk *s_cur;       /* chunk currently on the wire */
+static uint32_t s_edge_idx;
+static uint64_t s_chunk_start;
+static uint64_t s_next_edge_time;
+static volatile bool s_alarm_armed;
+static volatile bool s_gate_state;
+static uint32_t s_tick_q8;              /* timer counts per tick * 256 */
+static atomic_int s_isr_inflight;       /* queued and not yet completed */
+static volatile bool s_isr_drained;     /* inflight reached 0 */
+static volatile bool s_isr_drain_lit;   /* ...while the gate was on */
 
-static void run_dac_speed_test(void)
+static uint64_t IRAM_ATTR timer_now(void)
 {
-    int64_t t0, t1;
-    double secs, ups, mups;
-    int32_t err;
-    uint32_t i;
-    float *x, *y;
+    unsigned long long v = 0;
 
-    /* Per-transaction single-channel writes: one SPI burst per point. */
-    t0 = esp_timer_get_time();
-    for (i = 0; i < SPEED_TEST_WRITES; i++) {
-        err = ad3552r_board_write_volts(0, (i & 1) ? 5.0f : -5.0f);
-        if (err) {
-            ESP_LOGE(TAG, "speed test write failed at i=%lu: %ld",
-                     (unsigned long)i, (long)err);
-            return;
+    gptimer_get_raw_count(s_timer, &v);
+    return v;
+}
+
+static void IRAM_ATTR isr_disarm(void)
+{
+    if (s_alarm_armed) {
+        gptimer_set_alarm_action(s_timer, NULL);
+        s_alarm_armed = false;
+    }
+}
+
+static void IRAM_ATTR isr_toggle(void)
+{
+    s_gate_state = !s_gate_state;
+    laser_io_gate(s_gate_state);
+}
+
+/* Arm the alarm for the next unapplied edge of s_cur; edges already in the
+ * past are applied immediately. */
+static void IRAM_ATTR isr_arm_next(void)
+{
+    struct galvo_chunk *c = s_cur;
+
+    while (c && s_edge_idx < c->n_edges) {
+        uint64_t t = s_chunk_start + (((uint64_t)c->edge_tick[s_edge_idx] * s_tick_q8) >> 8);
+        uint64_t now = timer_now();
+
+        if (t <= now) {
+            isr_toggle();
+            s_edge_idx++;
+            continue;
         }
-    }
-    t1 = esp_timer_get_time();
-
-    secs = (double)(t1 - t0) / 1e6;
-    ups = SPEED_TEST_WRITES / secs;
-    mups = ups / 1e6;
-    s_write_us = (float)(secs * 1e6 / SPEED_TEST_WRITES);
-    ESP_LOGI(TAG, "per-transaction speed test: %d single-channel writes in %.4f s "
-             "= %.1f updates/sec = %.5f MUPS (single-lane SPI, no CRC - see ad3552r_board.c for clock rate)",
-             SPEED_TEST_WRITES, secs, ups, mups);
-
-    /* Buffered streaming: one SPI burst for the whole precomputed path,
-     * both X and Y channels per point (see ad3552r_board_stream_xy()). */
-    x = malloc(SPEED_TEST_STREAM_POINTS * sizeof(float));
-    y = malloc(SPEED_TEST_STREAM_POINTS * sizeof(float));
-    if (!x || !y) {
-        ESP_LOGE(TAG, "speed test: out of memory for stream buffers");
-        free(x);
-        free(y);
+        if (t < now + ARM_MARGIN_COUNTS)
+            t = now + ARM_MARGIN_COUNTS;
+        s_next_edge_time = t;
+        s_alarm_cfg.alarm_count = t;
+        s_alarm_cfg.reload_count = 0;
+        s_alarm_cfg.flags.auto_reload_on_alarm = false;
+        gptimer_set_alarm_action(s_timer, &s_alarm_cfg);
+        s_alarm_armed = true;
         return;
     }
-    for (i = 0; i < SPEED_TEST_STREAM_POINTS; i++) {
-        x[i] = (i & 1) ? 5.0f : -5.0f;
-        y[i] = (i & 1) ? -5.0f : 5.0f;
-    }
+    isr_disarm();
+}
 
-    /* First call: the one-time diagnostic logging inside
-     * ad3552r_board_stream_xy()/no_os_spi_transfer() (buffer-build timing,
-     * the stage-profile dump) fires during this call and is itself several
-     * hundred microseconds of USB-CDC log output per line, which would
-     * otherwise contaminate the timing below. Run it once, unmeasured,
-     * to get that one-time cost out of the way first. */
-    err = ad3552r_board_stream_xy(x, y, SPEED_TEST_STREAM_POINTS);
+static bool IRAM_ATTR on_alarm(gptimer_handle_t t, const gptimer_alarm_event_data_t *e, void *ctx)
+{
+    (void)t; (void)e; (void)ctx;
+    if (!s_cur || !s_alarm_armed)
+        return false; /* stale */
+    if (timer_now() < s_next_edge_time) {
+        s_alarm_armed = false;
+        isr_arm_next(); /* early/stale wake: re-arm the same edge */
+        return false;
+    }
+    s_alarm_armed = false;
+    isr_toggle();
+    s_edge_idx++;
+    isr_arm_next();
+    return false;
+}
+
+/* Runs in the SPI ISR immediately before the chunk's transaction starts. */
+static void IRAM_ATTR stream_pre(void *user)
+{
+    struct galvo_chunk *c = (struct galvo_chunk *)user;
+    uint64_t now = timer_now();
+
+    isr_disarm();
+    s_edge_idx = 0;
+    s_chunk_start = now + START_LATENCY_COUNTS;
+    s_gate_state = c->gate_start;
+    laser_io_gate(c->gate_start);
+    s_cur = c;
+    isr_arm_next();
+}
+
+/* Runs in the SPI ISR right after the chunk's transaction completed (and,
+ * if more are queued, just before the next stream_pre()). */
+static void IRAM_ATTR stream_post(void *user)
+{
+    struct galvo_chunk *c = (struct galvo_chunk *)user;
+    BaseType_t hp = pdFALSE;
+    int left;
+
+    isr_disarm();
+    s_cur = NULL;
+    left = atomic_fetch_sub(&s_isr_inflight, 1) - 1;
+    if (left <= 0) {
+        /* Nothing queued behind us: the laser must not stay on. If it was
+         * on, the motion task did not get to close the polyline in time:
+         * that is a real underrun (a visible stop in a mark). */
+        s_isr_drain_lit = s_gate_state || c->gate_end;
+        s_gate_state = false;
+        laser_io_gate(false);
+        s_isr_drained = true;
+    } else {
+        s_gate_state = c->gate_end;
+        laser_io_gate(c->gate_end);
+    }
+    if (s_task) {
+        vTaskNotifyGiveFromISR(s_task, &hp);
+        if (hp == pdTRUE)
+            portYIELD_FROM_ISR();
+    }
+}
+
+/* ---- task-side state ----------------------------------------------------- */
+static SemaphoreHandle_t s_init_sem;
+static SemaphoreHandle_t s_bus_mtx;     /* held for the whole stream session */
+static bool s_init_ok;
+static bool s_session_open;
+static spi_device_handle_t s_dev;
+static struct galvo_chunk *s_next;      /* dequeued, waiting to be started */
+static int s_outstanding;               /* queued minus reaped */
+static int64_t s_idle_since_us;
+static bool s_drained;
+static bool s_arm_failed;
+static bool s_power_warned;
+static DMA_ATTR uint8_t s_last_point[GALVO_BYTES_PER_TICK];
+static DMA_ATTR uint8_t s_final_point[GALVO_BYTES_PER_TICK];
+static spi_transaction_t s_final_trans;
+
+void dac_task_notify(void)
+{
+    if (s_task)
+        xTaskNotifyGive(s_task);
+}
+
+static void recycle(struct galvo_chunk *c)
+{
+    xQueueSend(g_galvo.free_q, &c, 0);
+}
+
+static void complete(struct galvo_chunk *c, bool done)
+{
+    if (done) {
+        memcpy(s_last_point, c->wire + ((size_t)c->n_ticks - 1) * GALVO_BYTES_PER_TICK,
+               GALVO_BYTES_PER_TICK);
+        portENTER_CRITICAL(&g_galvo.pos_lock);
+        g_galvo.pos_x = c->end_x;
+        g_galvo.pos_y = c->end_y;
+        portEXIT_CRITICAL(&g_galvo.pos_lock);
+        atomic_fetch_add(&g_galvo.chunks_done, 1);
+        atomic_fetch_add(&g_galvo.ticks_done, c->n_ticks);
+    }
+    atomic_fetch_sub(&g_galvo.ticks_queued, c->n_ticks);
+    recycle(c);
+}
+
+static void reap(void)
+{
+    spi_transaction_t *t;
+
+    while (s_outstanding > 0 && spi_device_get_trans_result(s_dev, &t, 0) == ESP_OK) {
+        s_outstanding--;
+        complete((struct galvo_chunk *)t->user, true);
+    }
+    if (s_outstanding == 0 && s_isr_drained) {
+        s_isr_drained = false;
+        s_drained = true;
+        s_idle_since_us = esp_timer_get_time();
+        /* A chunk already waiting in s_next means the drain was deliberate
+         * (power/PRR barrier or arming); feed hold is deliberate too. */
+        if (s_isr_drain_lit && !s_next && !atomic_load(&g_galvo.held)) {
+            /* Counted when it happens, not when motion resumes, so the
+             * stats are right even if the job never continues. */
+            atomic_fetch_add(&g_galvo.underruns, 1);
+            ESP_LOGW(TAG, "stream underrun with the laser on (host too slow?)");
+        }
+        s_isr_drain_lit = false;
+    }
+}
+
+static bool session_open(void)
+{
+    float tick_us = galvo_out_tick_us();
+    uint32_t hz = (uint32_t)lroundf(12.0e6f / tick_us);
+    uint32_t actual;
+    int32_t err;
+
+    xSemaphoreTake(s_bus_mtx, portMAX_DELAY);
+    err = ad3552r_board_stream_open(hz);
     if (err) {
-        ESP_LOGE(TAG, "streaming speed test (warmup) failed: %ld", (long)err);
-        free(x);
-        free(y);
-        return;
+        ESP_LOGE(TAG, "stream open failed: %ld", (long)err);
+        xSemaphoreGive(s_bus_mtx);
+        return false;
     }
-
-    /* Second call: identical work, but now the one-time diagnostic logs
-     * are done firing (guarded by static flags), so this measures the
-     * real steady-state cost. */
-    t0 = esp_timer_get_time();
-    err = ad3552r_board_stream_xy(x, y, SPEED_TEST_STREAM_POINTS);
-    t1 = esp_timer_get_time();
-    ad3552r_board_stream_end();
-    free(x);
-    free(y);
-
-    if (err) {
-        ESP_LOGE(TAG, "streaming speed test failed: %ld", (long)err);
-        return;
-    }
-
-    secs = (double)(t1 - t0) / 1e6;
-    ups = SPEED_TEST_STREAM_POINTS / secs;
-    mups = ups / 1e6;
-    ESP_LOGI(TAG, "buffered streaming speed test (steady-state, warmup excluded): "
-             "%d X+Y points in %.4f s = %.1f points/sec = %.5f MUPS "
-             "(quad SPI, no CRC - see ad3552r_board.c for clock rate)",
-             SPEED_TEST_STREAM_POINTS, secs, ups, mups);
-
-    /* Correctness check: the streamed burst should leave the DAC output
-     * registers holding the *last* point's codes. Read them back and
-     * compare against what write_volts() (the already-verified
-     * per-transaction path) computes for the same voltages, to catch a
-     * wrong stream address/order bug rather than just trusting "no SPI
-     * error" as proof the values landed correctly. */
+    actual = ad3552r_board_spi_actual_hz();
+    if (actual == 0)
+        actual = hz;
     {
-        uint16_t ch0_reg = 0, ch1_reg = 0, ch0_expect = 0, ch1_expect = 0;
-        int32_t e1, e2, e3, e4;
-        float last_x = (SPEED_TEST_STREAM_POINTS - 1) & 1 ? 5.0f : -5.0f;
-        float last_y = (SPEED_TEST_STREAM_POINTS - 1) & 1 ? -5.0f : 5.0f;
+        float real_tick_us = 12.0e6f / (float)actual;
 
-        e1 = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_CH_DAC_24B(0), &ch0_reg);
-        e2 = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_CH_DAC_24B(1), &ch1_reg);
-        e3 = ad3552r_board_volts_to_code(0, last_x, &ch0_expect);
-        e4 = ad3552r_board_volts_to_code(1, last_y, &ch1_expect);
-
-        if (e1 || e2 || e3 || e4)
-            ESP_LOGE(TAG, "stream verify: a read/convert call failed (e1=%ld e2=%ld e3=%ld e4=%ld)",
-                     (long)e1, (long)e2, (long)e3, (long)e4);
-        else if (ch0_reg == ch0_expect && ch1_reg == ch1_expect)
-            ESP_LOGI(TAG, "stream verify OK: CH0=0x%04x CH1=0x%04x matches last point (%.1fV,%.1fV)",
-                     ch0_reg, ch1_reg, (double)last_x, (double)last_y);
-        else
-            ESP_LOGE(TAG, "stream verify MISMATCH: CH0=0x%04x (want 0x%04x) CH1=0x%04x (want 0x%04x)",
-                     ch0_reg, ch0_expect, ch1_reg, ch1_expect);
+        if (fabsf(real_tick_us - tick_us) > 0.01f * tick_us)
+            ESP_LOGW(TAG, "SPI clock %lu Hz gives tick %.3f us, producer assumes %.3f us",
+                     (unsigned long)actual, (double)real_tick_us, (double)tick_us);
+        s_tick_q8 = (uint32_t)lroundf(real_tick_us * (float)TIMER_RES_MHZ * 256.0f);
     }
-}
-
-/*
- * A paced burst busy-waits (esp_rom_delay_us) for its whole duration and
- * never blocks, which starves core 0's idle task. Because the idle task is
- * a TWDT subscriber (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0), a burst
- * longer than CONFIG_ESP_TASK_WDT_TIMEOUT_S (5s) would trip the watchdog.
- *
- * The obvious fix - periodically calling vTaskDelay(1) to let idle run -
- * was what this code did, and it was the source of a very visible galvo
- * stutter: CONFIG_FREERTOS_HZ is 100, so one tick is 10ms, not the ~1ms
- * the old comment assumed. On a 100Hz preview loop of a 480-point shape
- * (20us/point) that meant a dead stop roughly twice per revolution, each
- * one about as long as a whole revolution should take. Measured on real
- * hardware: a 19680-point burst that should run 394ms took 2290ms, with
- * 76 x 10ms = 760ms of that spent frozen at a single point.
- *
- * Instead, hand the watchdog duty over for the duration of the burst:
- * unsubscribe core 0's idle task and subscribe this task, which then feeds
- * the watchdog with esp_task_wdt_reset() - a few microseconds, and it
- * never blocks or yields. The burst keeps its real protection (a wedged
- * dac_task still trips the TWDT), and the galvo never stops. Restored on
- * the way out, including the error path.
- *
- * Starving idle on core 0 for the burst is acceptable here: dac_task is
- * the only user task pinned to core 0 (grbl_task and atmega_task are both
- * on core 1, see grbl_task.c/atmega_link.c), no tasks are being deleted
- * during a burst so idle has no cleanup to do, and the busy-wait was
- * already starving it between yields anyway.
- */
-static TaskHandle_t s_idle0;
-
-static bool paced_wdt_begin(void)
-{
-    s_idle0 = xTaskGetIdleTaskHandleForCore(DAC_TASK_CORE);
-    if (!s_idle0)
-        return false;
-    /* Nothing to hand over if idle isn't actually a subscriber (the
-     * CHECK_IDLE_TASK_CPU0 option can be off) - leave the watchdog alone
-     * and let the caller fall back to yielding. */
-    if (esp_task_wdt_status(s_idle0) != ESP_OK)
-        return false;
-    if (esp_task_wdt_add(NULL) != ESP_OK)
-        return false;
-    if (esp_task_wdt_delete(s_idle0) != ESP_OK) {
-        esp_task_wdt_delete(NULL);
-        return false;
-    }
+    s_dev = (spi_device_handle_t)ad3552r_board_spi_dev();
+    s_outstanding = 0;
+    atomic_store(&s_isr_inflight, 0);
+    s_isr_drained = false;
+    s_drained = false;
+    s_session_open = true;
+    s_idle_since_us = esp_timer_get_time();
     return true;
 }
 
-static void paced_wdt_end(bool swapped)
+/* Precondition: nothing outstanding. Deasserts CS with a last transaction
+ * that repeats the last point (the DAC holds its value), then returns the
+ * bus to normal single-lane operation. */
+static void session_close(void)
 {
-    if (!swapped)
+    esp_err_t err;
+
+    if (!s_session_open)
         return;
-    esp_task_wdt_add(s_idle0);
-    esp_task_wdt_delete(NULL);
+    laser_io_gate(false);
+    memcpy(s_final_point, s_last_point, sizeof(s_final_point));
+    memset(&s_final_trans, 0, sizeof(s_final_trans));
+    s_final_trans.flags = SPI_TRANS_MODE_QIO; /* no CS_KEEP_ACTIVE: CS rises */
+    s_final_trans.length = GALVO_BYTES_PER_TICK * 8;
+    s_final_trans.tx_buffer = s_final_point;
+    err = spi_device_transmit(s_dev, &s_final_trans);
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "final stream transaction failed: %s", esp_err_to_name(err));
+    ad3552r_board_stream_close();
+    s_session_open = false;
+    s_drained = false;
+    s_isr_drained = false;
+    xSemaphoreGive(s_bus_mtx);
 }
 
-/*
- * Runs a paced stream with the SPI clock doing the pacing, instead of a
- * write-then-busy-wait loop. See ad3552r_board.h: in streaming mode one
- * X+Y point is 12 quad-mode clock cycles and the DAC updates as they
- * arrive, so setting the clock sets the point rate exactly - uniformly, in
- * hardware, and with this task asleep for the whole burst rather than
- * spinning. That is what makes the requested rate actually achievable:
- * software pacing bottoms out at the ~85us/point the per-transaction path
- * costs, so a 100Hz/480-point preview (20.8us/point) could only ever run
- * at about a quarter speed.
- *
- * Returns true if it ran the stream (engaged or errored), false if the
- * requested rate is out of the clock's range and the caller should
- * software-pace instead.
- */
-static bool run_paced_in_hardware(const struct laser_cmd *cmd)
+/* True if this chunk will open the gate but the ATmega does not hold the
+ * power word it was generated for (e.g. M11 zeroed it after the last job). */
+static bool needs_power(const struct galvo_chunk *c)
 {
-    float achieved_us = 0.0f;
-    uint8_t *rep_buf = NULL, *batch_buf = NULL;
-    size_t bytes_per_rep, batch_reps, k;
-    uint32_t rep = 0;
-    bool forever = (cmd->stream.repeats == 0);
-    int32_t err;
+    struct atmega_status st;
 
-    err = ad3552r_board_paced_begin((float)cmd->stream.point_delay_us, &achieved_us);
-    if (err <= 0)
-        return false; /* out of range, or setup failed - fall back */
+    if (c->power_word < 0 || (!c->gate_start && c->n_edges == 0))
+        return false;
+    atmega_link_get_status(&st);
+    return st.link_ok && st.power != (uint8_t)c->power_word;
+}
 
-    err = ad3552r_board_build_stream_buf(cmd->stream.x_volts, cmd->stream.y_volts,
-                                          cmd->stream.n_points, &rep_buf);
-    if (err || !rep_buf) {
-        ESP_LOGE(TAG, "paced stream: could not build wire buffer: %ld", (long)err);
-        ad3552r_board_paced_end();
-        return true; /* reported; don't also run it the slow way */
+static void apply_power(int16_t pw)
+{
+    atmega_link_set_power((uint8_t)pw);
+    if (!atmega_link_wait_power((uint8_t)pw, POWER_WAIT_MS) && !s_power_warned) {
+        ESP_LOGW(TAG, "ATmega did not confirm power %d within %d ms; continuing",
+                 pw, POWER_WAIT_MS);
+        s_power_warned = true;
     }
+}
 
-    /* Clocking is gapless *within* a transaction but not across one: each
-     * emit costs a bus acquire, a separate instruction/address phase and a
-     * release (~33us total, measured in the boot-time streaming profile),
-     * and the DAC holds its last value throughout. Once per revolution that
-     * is a visible step on whichever axis happens to be on its steep slope
-     * at the shape's start point - found on the scope as a notch in Y while
-     * X, at its peak and naturally flat there, looked clean.
-     *
-     * Batching whole revolutions into one transaction divides how often
-     * that boundary happens, for one memcpy per revolution of extra RAM.
-     * PACED_BATCH_MAX_BYTES is the budget: at a typical 480-point shape
-     * (2880 bytes/rev) it buys 5 revolutions per transaction, so the hold
-     * lands every ~50ms instead of every ~10ms. */
-    bytes_per_rep = cmd->stream.n_points * AD3552R_STREAM_BYTES_PER_POINT;
-    batch_reps = PACED_BATCH_MAX_BYTES / bytes_per_rep;
-    if (batch_reps < 1)
-        batch_reps = 1;
-    if (!forever && batch_reps > cmd->stream.repeats)
-        batch_reps = cmd->stream.repeats;
+static void apply_barrier(struct galvo_chunk *c)
+{
+    if (c->barrier & GALVO_BARRIER_POWER) {
+        apply_power(c->barrier_power);
+    }
+    if (c->barrier & GALVO_BARRIER_PRR)
+        laser_io_set_prr(c->barrier_prr_hz, calib_get(CAL_PRR_DUTY));
+    c->barrier = 0;
+    atomic_fetch_add(&g_galvo.barriers, 1);
+}
 
-    if (batch_reps > 1) {
-        batch_buf = malloc(batch_reps * bytes_per_rep);
-        if (batch_buf) {
-            for (k = 0; k < batch_reps; k++)
-                memcpy(batch_buf + k * bytes_per_rep, rep_buf, bytes_per_rep);
+static bool needs_arm(const struct galvo_chunk *c)
+{
+    struct atmega_status st;
+
+    if (s_arm_failed || calib_get(CAL_AUTO_ARM) == 0.0f)
+        return false;
+    if (!c->gate_start && c->n_edges == 0)
+        return false;
+    atmega_link_get_status(&st);
+    return !st.ready;
+}
+
+static void do_arm(void)
+{
+    uint32_t tmo = (uint32_t)calib_get(CAL_ARM_TIMEOUT_MS);
+
+    /* Arming can take seconds: do not sit with CS low. */
+    session_close();
+    atmega_link_set_armed(true);
+    if (!atmega_link_wait_ready(tmo)) {
+        ESP_LOGE(TAG, "laser not ready after %lu ms; continuing without waiting again this session",
+                 (unsigned long)tmo);
+        s_arm_failed = true;
+    }
+}
+
+/* Returns 0 when the chunk was consumed (queued or dropped), 1 if it must
+ * wait (kept in s_next). */
+static int try_start(struct galvo_chunk *c)
+{
+    spi_transaction_t *t;
+    esp_err_t err;
+
+    if (c->barrier) {
+        if (s_outstanding)
+            return 1;
+        apply_barrier(c);
+    }
+    if (c->n_ticks == 0) {
+        recycle(c);
+        return 0;
+    }
+    if (needs_arm(c)) {
+        if (s_outstanding)
+            return 1;
+        do_arm();
+    }
+    if (needs_power(c)) {
+        if (s_outstanding)
+            return 1;               /* drain first: the gate goes off */
+        apply_power(c->power_word);
+        atomic_fetch_add(&g_galvo.barriers, 1);
+    }
+    if (!s_session_open && !session_open()) {
+        complete(c, false); /* drop */
+        return 0;
+    }
+    if (s_outstanding >= MAX_INFLIGHT)
+        return 1;
+
+    s_drained = false;
+
+    t = &c->trans;
+    memset(t, 0, sizeof(*t));
+    t->flags = SPI_TRANS_MODE_QIO | SPI_TRANS_CS_KEEP_ACTIVE;
+    t->length = (size_t)c->n_ticks * GALVO_BYTES_PER_TICK * 8;
+    t->tx_buffer = c->wire;
+    t->user = c;
+
+    atomic_fetch_add(&s_isr_inflight, 1);
+    err = spi_device_queue_trans(s_dev, t, 0);
+    if (err != ESP_OK) {
+        atomic_fetch_sub(&s_isr_inflight, 1);
+        ESP_LOGE(TAG, "queue_trans failed: %s", esp_err_to_name(err));
+        complete(c, false);
+        return 0;
+    }
+    s_outstanding++;
+    return 0;
+}
+
+static void do_abort(void)
+{
+    spi_transaction_t *t;
+    struct galvo_chunk *c;
+    int timeouts = 0;
+
+    if (s_next) {
+        complete(s_next, false);
+        s_next = NULL;
+    }
+    /* In-flight DMA transfers cannot be cancelled: let them finish (the
+     * producer killed the gate, so nothing fires). */
+    while (s_outstanding > 0 && timeouts < 20) {
+        if (spi_device_get_trans_result(s_dev, &t, pdMS_TO_TICKS(50)) == ESP_OK) {
+            s_outstanding--;
+            complete((struct galvo_chunk *)t->user, true);
         } else {
-            /* Not fatal - fall back to one revolution per transaction. */
-            batch_reps = 1;
+            timeouts++;
         }
     }
+    if (s_outstanding > 0)
+        ESP_LOGE(TAG, "abort: %d transactions did not complete", s_outstanding);
+    while (xQueueReceive(g_galvo.ready_q, &c, 0) == pdTRUE)
+        complete(c, false);
+    laser_io_gate(false);
+    if (s_session_open && s_outstanding == 0)
+        session_close();
+    s_arm_failed = false;
+    s_drained = false;
+    atomic_store(&g_galvo.abort_go, false);
+    xSemaphoreGive(g_galvo.abort_done);
+}
 
-    while (forever || rep < cmd->stream.repeats) {
-        const uint8_t *src = batch_buf ? batch_buf : rep_buf;
-        size_t this_reps = batch_reps;
+/* One pass of the scheduler; returns how long to sleep for a notification. */
+static TickType_t service(void)
+{
+    bool held;
 
-        /* Don't overrun a finite request: the batch buffer is just N
-         * identical copies, so a short final batch is simply a prefix of
-         * it. Without this, asking for 7 revolutions with a batch of 5
-         * would emit 10. */
-        if (!forever && (size_t)(cmd->stream.repeats - rep) < this_reps)
-            this_reps = cmd->stream.repeats - rep;
+    if (!atomic_load(&g_galvo.ready))
+        return pdMS_TO_TICKS(50);
 
-        err = ad3552r_board_paced_emit(src, cmd->stream.n_points * this_reps);
-        if (err) {
-            ESP_LOGE(TAG, "paced stream emit failed at rep %lu: %ld",
-                     (unsigned long)rep, (long)err);
-            break;
-        }
-        rep += this_reps;
-        /* Same rule as the software path: only ever stop between whole
-         * repetitions, so an interrupted preview ends on a closed shape. */
-        if (laser_ctrl_pending())
-            break;
+    if (s_session_open)
+        reap();
+
+    if (atomic_load(&g_galvo.abort)) {
+        if (atomic_load(&g_galvo.abort_go))
+            do_abort();
+        return pdMS_TO_TICKS(5);
     }
 
-    ad3552r_board_paced_end();
-    free(rep_buf);
-    free(batch_buf);
+    held = atomic_load(&g_galvo.held);
+    while (!held) {
+        if (!s_next && xQueueReceive(g_galvo.ready_q, &s_next, 0) != pdTRUE) {
+            s_next = NULL;
+            break;
+        }
+        if (try_start(s_next))
+            break;
+        s_next = NULL;
+    }
 
-    ESP_LOGI(TAG, "hardware-paced run: %u points x %lu reps (%u rev/transaction) "
-             "at %.2fus/point (requested %luus) = %.1fHz",
-             (unsigned)cmd->stream.n_points, (unsigned long)rep,
-             (unsigned)batch_reps, (double)achieved_us,
-             (unsigned long)cmd->stream.point_delay_us,
-             (double)(achieved_us > 0.0f
-                      ? 1.0e6f / (achieved_us * (float)cmd->stream.n_points) : 0.0f));
+    if (s_session_open && s_outstanding == 0 && (!s_next || held)) {
+        int64_t idle = esp_timer_get_time() - s_idle_since_us;
+        bool more = uxQueueMessagesWaiting(g_galvo.ready_q) > 0 && !held;
 
+        if (!more) {
+            if (idle >= IDLE_CLOSE_US) {
+                session_close();
+                s_arm_failed = false;
+                return portMAX_DELAY;
+            }
+            return pdMS_TO_TICKS((IDLE_CLOSE_US - idle) / 1000 + 1);
+        }
+    }
+    if (s_outstanding > 0)
+        return pdMS_TO_TICKS(5); /* safety net; completions notify us */
+    return s_session_open ? pdMS_TO_TICKS(5) : portMAX_DELAY;
+}
+
+/* ---- boot --------------------------------------------------------------- */
+
+static void boot_self_test(void)
+{
+    uint16_t want0 = 0, want1 = 0, got0 = 0, got1 = 0, zero0 = 0, zero1 = 0;
+    int32_t e;
+
+    e = ad3552r_board_write_volts(0, 2.5f);
+    e |= ad3552r_board_write_volts(1, -2.5f);
+    e |= ad3552r_board_volts_to_code(0, 2.5f, &want0);
+    e |= ad3552r_board_volts_to_code(1, -2.5f, &want1);
+    e |= ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_CH_DAC_24B(0), &got0);
+    e |= ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_CH_DAC_24B(1), &got1);
+    if (e)
+        ESP_LOGE(TAG, "self-test: SPI/convert error %ld", (long)e);
+    else if (got0 == want0 && got1 == want1)
+        ESP_LOGI(TAG, "self-test OK: CH0=0x%04x CH1=0x%04x", got0, got1);
+    else
+        ESP_LOGE(TAG, "self-test MISMATCH: CH0=0x%04x (want 0x%04x) CH1=0x%04x (want 0x%04x)",
+                 got0, want0, got1, want1);
+
+    /* Park at 0 V and remember the 0 V point for the stream's closing hold. */
+    ad3552r_board_write_volts(0, 0.0f);
+    ad3552r_board_write_volts(1, 0.0f);
+    ad3552r_board_volts_to_code(0, 0.0f, &zero0);
+    ad3552r_board_volts_to_code(1, 0.0f, &zero1);
+    s_last_point[0] = (uint8_t)(zero1 >> 8);
+    s_last_point[1] = (uint8_t)zero1;
+    s_last_point[2] = 0;
+    s_last_point[3] = (uint8_t)(zero0 >> 8);
+    s_last_point[4] = (uint8_t)zero0;
+    s_last_point[5] = 0;
+}
+
+static bool timer_setup(void)
+{
+    gptimer_config_t cfg = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = TIMER_RES_HZ,
+        .intr_priority = 3, /* above the SPI ISR so gate edges are not delayed by it */
+    };
+    gptimer_event_callbacks_t cbs = { .on_alarm = on_alarm };
+
+    if (gptimer_new_timer(&cfg, &s_timer) != ESP_OK ||
+        gptimer_register_event_callbacks(s_timer, &cbs, NULL) != ESP_OK ||
+        gptimer_enable(s_timer) != ESP_OK ||
+        gptimer_start(s_timer) != ESP_OK) {
+        ESP_LOGE(TAG, "gate timer setup failed");
+        return false;
+    }
     return true;
 }
 
-uint32_t dac_task_us_per_point(void)
+static void dac_task(void *arg)
 {
-    /* Two single-channel writes (X then Y) per streamed point. Rounded up
-     * so callers' duration estimates never come out optimistic. */
-    return (uint32_t)(2.0f * s_write_us + 0.999f);
-}
+    (void)arg;
+    s_task = xTaskGetCurrentTaskHandle();
+    laser_io_gate(false);
 
-static void dac_task_fn(void *arg)
-{
-    struct laser_cmd cmd;
-    uint32_t moves = 0;
-    int32_t err;
-    /* Mirrors grbl_task's engrave state, tracked independently here so
-     * this task knows whether to apply jump_delay or mark/polygon_delay
-     * after a MOVE without needing a round trip back to grbl_task. Always
-     * kept in sync by the LASER_CMD_ENGRAVE case below, which is always
-     * queued (and thus always processed) before any MOVE/STREAM that
-     * depends on the new state, since both go through the same FIFO. */
-    bool engrave_on = false;
-
-    ESP_LOGI(TAG, "DAC task running on core %d", xPortGetCoreID());
-
-    run_dac_speed_test();
+    /* Everything bus-related is initialised on this (core 0) task. */
+    if (!ad3552r_board_init() || !timer_setup()) {
+        s_init_ok = false;
+        xSemaphoreGive(s_init_sem);
+        vTaskDelete(NULL);
+        return;
+    }
+    ad3552r_esp32_spi_set_stream_cbs(stream_pre, stream_post);
+    boot_self_test();
+    ad3552r_board_guard_snapshot();     /* reference for the config guard */
+    s_init_ok = true;
+    xSemaphoreGive(s_init_sem);
 
     for (;;) {
-        if (!laser_ctrl_next(&cmd, 1000))
-            continue;
+        TickType_t wait = service();
 
-        switch (cmd.type) {
-        case LASER_CMD_MOVE:
-            if (cmd.gate_on_power) {
-                /* This line also carried an S-word; grbl_task fired the
-                 * power change async and moved on (see grbl_task.c /
-                 * atmega_link.h). This is the one place that actually
-                 * waits, matching the ATMEGA link's own ACK timeout (see
-                 * atmega_link.c) so a slow/missing ATMEGA delays only
-                 * this pixel's DAC write, never the serial line reader. */
-                if (!atmega_link_wait_power_settled(300))
-                    ESP_LOGW(TAG, "power not confirmed before this move - "
-                             "position/power may be out of sync for this pixel");
-            }
-            err = ad3552r_board_write_volts(0, cmd.move.x_volts);
-            if (err)
-                ESP_LOGE(TAG, "X write failed: %ld", (long)err);
-            err = ad3552r_board_write_volts(1, cmd.move.y_volts);
-            if (err)
-                ESP_LOGE(TAG, "Y write failed: %ld", (long)err);
-            moves++;
-            if (moves % 100 == 0)
-                ESP_LOGI(TAG, "moves=%lu last=(%.3fV,%.3fV)",
-                         (unsigned long)moves, cmd.move.x_volts, cmd.move.y_volts);
-            /* Settle time before the next queued command executes: jump
-             * (non-marking) moves get jump_delay; marking moves get
-             * mark_delay plus polygon_delay (applied uniformly per vertex,
-             * not angle-aware - see calib.h). This task has nothing else
-             * to stay responsive to, so a plain busy-wait is fine, same
-             * reasoning as the ATMEGA power-settle wait above. */
-            {
-                uint32_t delay_us = engrave_on
-                    ? (uint32_t)(calib_mark_delay_us() + calib_polygon_delay_us())
-                    : (uint32_t)calib_jump_delay_us();
-                if (delay_us)
-                    esp_rom_delay_us(delay_us);
-            }
-            break;
-        case LASER_CMD_ENGRAVE:
-            engrave_gpio_set(cmd.engrave_on);
-            engrave_on = cmd.engrave_on;
-            ESP_LOGI(TAG, "engrave %s", cmd.engrave_on ? "ON" : "off");
-            /* Give the laser time to physically respond before the next
-             * queued command (typically the first point of a mark, or the
-             * next jump) executes. */
-            {
-                uint32_t delay_us = (uint32_t)(cmd.engrave_on
-                    ? calib_laser_on_delay_us() : calib_laser_off_delay_us());
-                if (delay_us)
-                    esp_rom_delay_us(delay_us);
-            }
-            break;
-        case LASER_CMD_PRR:
-            prr_pwm_set_hz(cmd.prr_hz);
-            ESP_LOGI(TAG, "prr = %.1f Hz", cmd.prr_hz);
-            break;
-        case LASER_CMD_STREAM:
-            if (cmd.stream.paced && run_paced_in_hardware(&cmd)) {
-                /* Handled entirely by run_paced_in_hardware() - the SPI
-                 * clock did the pacing. */
-            } else if (cmd.stream.paced) {
-                /* Software-paced fallback, for target rates the clock
-                 * divider cannot reach (see ad3552r_board_paced_begin()).
-                 * Writes points one at a time via the per-transaction path
-                 * with a real busy-wait between them. This is
-                 * constant-velocity pacing only - no accel/decel ramp or
-                 * junction-deviation planning, see STATUS.md. */
-                size_t i;
-                /* The two SPI register writes are themselves part of the
-                 * period, so the wait is the remainder, not the whole
-                 * thing. Sleeping the full period on top of the write cost
-                 * ran every software-paced stream slow by that cost -
-                 * measured 273us/point against a 208us request before this
-                 * subtraction. dac_task_us_per_point() is the boot-measured
-                 * figure, so this self-corrects rather than assuming. */
-                uint32_t overhead_us = dac_task_us_per_point();
-                uint32_t wait_us = cmd.stream.point_delay_us > overhead_us
-                    ? cmd.stream.point_delay_us - overhead_us : 0;
-                bool stream_err = false;
-                /* Replay the same buffer repeats times back-to-back, or
-                 * indefinitely when repeats == 0 (M68's preview loop - see
-                 * laser_ctrl.h). Looping here rather than having the
-                 * producer build the repeated path keeps the shape's heap
-                 * cost to one repetition, and leaves no gap between
-                 * repetitions for the galvo to park in. */
-                uint32_t rep = 0;
-                bool forever = (cmd.stream.repeats == 0);
-                /* See paced_wdt_begin() above: keeps the task watchdog fed
-                 * without ever stalling the galvo. */
-                bool wdt_swapped = paced_wdt_begin();
-
-                while (!stream_err && (forever || rep < cmd.stream.repeats)) {
-                    for (i = 0; i < cmd.stream.n_points; i++) {
-                        err = ad3552r_board_write_volts(0, cmd.stream.x_volts[i]);
-                        if (!err)
-                            err = ad3552r_board_write_volts(1, cmd.stream.y_volts[i]);
-                        if (err) {
-                            ESP_LOGE(TAG, "paced stream write failed at point %u: %ld",
-                                     (unsigned)i, (long)err);
-                            stream_err = true;
-                            break;
-                        }
-                        if (wait_us)
-                            esp_rom_delay_us(wait_us);
-                        /* Feed the watchdog every 256 points. When the swap
-                         * above succeeded this is a non-blocking reset costing
-                         * a few microseconds, so the pacing stays smooth; if it
-                         * failed we fall back to the old tick yield, which
-                         * stutters but at least keeps the watchdog quiet. */
-                        if ((i & 0xFFu) == 0xFFu) {
-                            if (wdt_swapped)
-                                esp_task_wdt_reset();
-                            else
-                                vTaskDelay(1);
-                        }
-                    }
-                    rep++;
-                    /* Only ever break between whole repetitions, so an
-                     * interrupted preview still ends on a closed shape
-                     * rather than partway round it. Any newly queued
-                     * command ends the loop - including the ENGRAVE that
-                     * Ctrl-X's soft reset submits (grbl_task.c), which is
-                     * what makes an indefinite preview abortable.
-                     *
-                     * Abort latency is therefore up to one repetition:
-                     * ~41ms for a typical preview shape, and bounded at
-                     * ~2.7s for the largest/slowest one M68 will build
-                     * (PREVIEW_MAX_POINTS at its 1Hz floor). Acceptable
-                     * because the marking laser is forced off for the
-                     * whole of preview mode - nothing is being cut while
-                     * this waits to notice. */
-                    if (laser_ctrl_pending())
-                        break;
-                }
-                paced_wdt_end(wdt_swapped);
-                if (!stream_err)
-                    ESP_LOGI(TAG, "paced run: %u points x %lu reps at ~%luus/point",
-                             (unsigned)cmd.stream.n_points,
-                             (unsigned long)rep,
-                             (unsigned long)cmd.stream.point_delay_us);
-            } else {
-                err = ad3552r_board_stream_xy(cmd.stream.x_volts, cmd.stream.y_volts,
-                                              cmd.stream.n_points);
-                ad3552r_board_stream_end();
-                if (err)
-                    ESP_LOGE(TAG, "stream write failed: %ld", (long)err);
-                else
-                    ESP_LOGI(TAG, "streamed %u points", (unsigned)cmd.stream.n_points);
-            }
-            free(cmd.stream.x_volts);
-            free(cmd.stream.y_volts);
-            break;
-        }
+        ulTaskNotifyTake(pdTRUE, wait);
     }
 }
 
 bool dac_task_start(void)
 {
-    if (!ad3552r_board_init())
+    s_init_sem = xSemaphoreCreateBinary();
+    s_bus_mtx = xSemaphoreCreateMutex();
+    if (!s_init_sem || !s_bus_mtx)
         return false;
+    if (xTaskCreatePinnedToCore(dac_task, "dac_task", DAC_TASK_STACK, NULL,
+                                DAC_TASK_PRIORITY, NULL, DAC_TASK_CORE) != pdPASS)
+        return false;
+    if (xSemaphoreTake(s_init_sem, pdMS_TO_TICKS(10000)) != pdTRUE)
+        return false;
+    return s_init_ok;
+}
 
-    engrave_gpio_init();
-    prr_pwm_init();
+bool dac_task_readback(uint16_t *code_x, uint16_t *code_y)
+{
+    int32_t e;
 
-    return xTaskCreatePinnedToCore(dac_task_fn, "dac_task", DAC_TASK_STACK_SIZE,
-                                    NULL, DAC_TASK_PRIORITY, NULL,
-                                    DAC_TASK_CORE) == pdPASS;
+    if (!s_init_ok || xSemaphoreTake(s_bus_mtx, 0) != pdTRUE)
+        return false; /* stream open (or not ready) */
+    e = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_CH_DAC_24B(0), code_x);
+    e |= ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_CH_DAC_24B(1), code_y);
+    xSemaphoreGive(s_bus_mtx);
+    return e == 0;
+}
+
+int dac_task_regdump(const uint8_t **addrs, uint16_t *vals, size_t max)
+{
+    int n;
+
+    if (!s_init_ok || xSemaphoreTake(s_bus_mtx, 0) != pdTRUE)
+        return -1; /* stream open (or not ready) */
+    n = (int)ad3552r_board_dump_regs(addrs, vals, max);
+    xSemaphoreGive(s_bus_mtx);
+    return n;
 }
