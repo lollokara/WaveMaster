@@ -307,15 +307,32 @@ static void session_close(void)
     xSemaphoreGive(s_bus_mtx);
 }
 
+/* True if this chunk will open the gate but the ATmega does not hold the
+ * power word it was generated for (e.g. M11 zeroed it after the last job). */
+static bool needs_power(const struct galvo_chunk *c)
+{
+    struct atmega_status st;
+
+    if (c->power_word < 0 || (!c->gate_start && c->n_edges == 0))
+        return false;
+    atmega_link_get_status(&st);
+    return st.link_ok && st.power != (uint8_t)c->power_word;
+}
+
+static void apply_power(int16_t pw)
+{
+    atmega_link_set_power((uint8_t)pw);
+    if (!atmega_link_wait_power((uint8_t)pw, POWER_WAIT_MS) && !s_power_warned) {
+        ESP_LOGW(TAG, "ATmega did not confirm power %d within %d ms; continuing",
+                 pw, POWER_WAIT_MS);
+        s_power_warned = true;
+    }
+}
+
 static void apply_barrier(struct galvo_chunk *c)
 {
     if (c->barrier & GALVO_BARRIER_POWER) {
-        atmega_link_set_power(c->barrier_power);
-        if (!atmega_link_wait_power(c->barrier_power, POWER_WAIT_MS) && !s_power_warned) {
-            ESP_LOGW(TAG, "ATmega did not confirm power %u within %d ms; continuing",
-                     c->barrier_power, POWER_WAIT_MS);
-            s_power_warned = true;
-        }
+        apply_power(c->barrier_power);
     }
     if (c->barrier & GALVO_BARRIER_PRR)
         laser_io_set_prr(c->barrier_prr_hz, calib_get(CAL_PRR_DUTY));
@@ -369,6 +386,12 @@ static int try_start(struct galvo_chunk *c)
         if (s_outstanding)
             return 1;
         do_arm();
+    }
+    if (needs_power(c)) {
+        if (s_outstanding)
+            return 1;               /* drain first: the gate goes off */
+        apply_power(c->power_word);
+        atomic_fetch_add(&g_galvo.barriers, 1);
     }
     if (!s_session_open && !session_open()) {
         complete(c, false); /* drop */

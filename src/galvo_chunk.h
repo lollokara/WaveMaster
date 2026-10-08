@@ -44,6 +44,11 @@ struct galvo_chunk {
     uint8_t barrier;               /* GALVO_BARRIER_* */
     uint8_t barrier_power;
     float barrier_prr_hz;
+    /* Power word this chunk's gate-on ticks need on the ATmega (-1: none
+     * requested yet). dac_task checks it against the ATmega's actual
+     * state before starting the chunk, because a disarm (M11), a heartbeat
+     * trip or an ATmega reset zeroes the power behind the producer's back. */
+    int16_t power_word;
     float end_x, end_y;            /* machine mm after the last tick */
     uint16_t edge_tick[GALVO_CHUNK_MAX_EDGES];
 };

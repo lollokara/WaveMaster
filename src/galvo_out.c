@@ -234,6 +234,7 @@ static bool open_chunk(bool gate)
     c->barrier = s_pend_flags;
     c->barrier_power = s_pend_power;
     c->barrier_prr_hz = s_pend_prr;
+    c->power_word = (int16_t)s_atmega_power;
     s_pend_flags = 0;
     s_cur = c;
     s_cur_gate = gate;
@@ -247,7 +248,11 @@ static void request_barrier(uint8_t flag, uint8_t power, float prr_hz)
     if (s_cur && s_cur->n_ticks > 0)
         submit_cur();
     if (flag & GALVO_BARRIER_POWER) {
-        if (s_cur) { s_cur->barrier |= GALVO_BARRIER_POWER; s_cur->barrier_power = power; }
+        if (s_cur) {
+            s_cur->barrier |= GALVO_BARRIER_POWER;
+            s_cur->barrier_power = power;
+            s_cur->power_word = power;
+        }
         else { s_pend_flags |= GALVO_BARRIER_POWER; s_pend_power = power; }
     }
     if (flag & GALVO_BARRIER_PRR) {
