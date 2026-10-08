@@ -118,8 +118,11 @@ struct motion_gen {
     struct motion_seg pending;
     /* MARK polyline state */
     bool in_polyline;
-    float carry_mm;             /* distance into the current segment already covered */
+    float carry_t;              /* fraction (0..1) of a tick already elapsed since the
+                                   last emitted sample, at the current vertex */
     float path_s_mm;            /* distance along the polyline (wobble phase) */
+    float vx, vy;               /* current polyline vertex (end of last emitted mark) */
+    float tail_x, tail_y;       /* end point of the most recently pushed segment */
     float last_ux, last_uy;     /* direction of the previous mark segment */
     uint8_t last_power;
     uint64_t ticks_emitted;     /* statistics */
