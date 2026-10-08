@@ -98,7 +98,7 @@ transcript). Settings backups can be restored with
 - **Power modes:** analog power word over the ATmega link (`$223=0`), or pulse-density modulation at fixed power (`$223=1`).
 - **GRBL 1.1 over USB** with character counting, 1024-byte RX window, realtime `?` `!` `~` Ctrl-X and jog cancel.
 - **ATmega protocol v2:** CRC-8 framed, with a heartbeat. The ATmega disarms within 1 s if the ESP32 goes silent.
-- **Stream statistics:** `$S` reports underruns, barriers and ATmega link state. `$RB` reads back the DAC registers when idle.
+- **Stream statistics:** `$S` reports underruns, barriers and ATmega link state. `$RB` reads back the DAC registers when idle. `$GT` and `$LT` test the gate line and the laser without motion.
 
 ---
 

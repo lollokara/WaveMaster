@@ -93,6 +93,8 @@ Send these from the Rayforge console.
 |:---|:---|
 | `$S` | Stream statistics: `[MSG:galvo chunks=... underruns=... barriers=... ticks=... tick_us=...]`, and the ATmega link state: `[MSG:atmega link=... armed=... ready=... ...]`. |
 | `$RB` | DAC output register readback, `[MSG:RB X=0x.... Y=0x....]`. Only valid while idle. |
+| `$GT=<ms>` | Gate wiring test: drives EMISSION MODULATION (GPIO4 → DB25 pin 19) active for up to 5000 ms so you can check the level at the connector with a meter or scope. Refused while the laser is armed (no MO → no emission). |
+| `$LT=<ms>,<S>` | Static laser test: sets the power for `S`, then opens the gate for up to 2000 ms with the galvo standing still (burns one spot). Refused unless armed **and** ready (`M10`, wait ~2 s). Ctrl-X stops it. |
 | `$$` | All settings. |
 | `$I` | Version and the RX buffer size. |
 | `$#` | Work offsets and G92. |

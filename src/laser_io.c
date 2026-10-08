@@ -19,11 +19,15 @@ static const char *TAG = "laser_io";
 static atomic_bool s_active_low;
 static atomic_bool s_kill;
 static bool s_prr_running;
+static uint32_t s_prr_hz;
+static volatile bool s_gate_on;     /* logical state as last driven */
 
 static inline void IRAM_ATTR gate_write_level(bool active)
 {
     bool low = atomic_load(&s_active_low);
     bool lvl = active ? !low : low;
+
+    s_gate_on = active;
 
     gpio_ll_set_level(&GPIO, LASER_IO_PIN_GATE, lvl ? 1 : 0);
 }
@@ -81,6 +85,7 @@ void laser_io_set_prr(float hz, float duty_pct)
         if (s_prr_running)
             ledc_stop(PRR_MODE, PRR_CHANNEL, 0);
         s_prr_running = false;
+        s_prr_hz = 0;
         gpio_set_level(LASER_IO_PIN_SYNC, 0);
         return;
     }
@@ -134,4 +139,13 @@ void laser_io_set_prr(float hz, float duty_pct)
         return;
     }
     s_prr_running = true;
+    s_prr_hz = ledc_get_freq(PRR_MODE, PRR_TIMER);
+}
+
+void laser_io_get_state(struct laser_io_state *out)
+{
+    out->gate_on = s_gate_on;
+    out->killed = atomic_load(&s_kill);
+    out->active_low = atomic_load(&s_active_low);
+    out->prr_hz = s_prr_running ? s_prr_hz : 0;
 }

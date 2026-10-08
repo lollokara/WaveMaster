@@ -44,6 +44,7 @@
 #include "galvo_out.h"
 #include "gcode_parse.h"
 #include "host_serial.h"
+#include "laser_io.h"
 #include "motion.h"
 #include "motion_task.h"
 
@@ -527,6 +528,13 @@ static void print_stats(void)
                 (unsigned)as.stat_bits, (unsigned)as.vdetect_mv, (unsigned)as.errors);
     host_printf("[MSG:host rx_dropped=%u clamped=%u]\r\n", (unsigned)host_rx_dropped(),
                 (unsigned)s_clamp_count);
+    {
+        struct laser_io_state io;
+
+        laser_io_get_state(&io);
+        host_printf("[MSG:io gate=%d kill=%d gate_active_low=%d sync_hz=%lu]\r\n",
+                    io.gate_on, io.killed, io.active_low, (unsigned long)io.prr_hz);
+    }
 }
 
 static int dollar_setting(const char *line)
@@ -575,6 +583,96 @@ static int exec_jog(const char *payload)
     return e;
 }
 
+/* Holds the gate on for ms with the galvo standing still, polling for a soft
+ * reset. Only called while the stream is closed (nothing else drives the
+ * gate then); Ctrl-X also kills the gate through motion_abort(). */
+static void gate_pulse(uint32_t ms)
+{
+    uint32_t gen = s_reset_gen;
+
+    laser_io_gate(true);
+    for (uint32_t t = 0; t < ms && s_reset_gen == gen; t++)
+        vTaskDelay(1);
+    laser_io_gate(false);
+}
+
+static bool parse_args(const char *p, float *v, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (gcode_parse_number(&p, &v[i]))
+            return false;
+        while (*p == ' ')
+            p++;
+        if (i + 1 < n) {
+            if (*p != ',')
+                return false;
+            p++;
+        }
+    }
+    return *p == '\0';
+}
+
+/*
+ * $GT=<ms>  gate wiring test: drives EMISSION MODULATION (GPIO4, DB25 pin 19)
+ *           active for up to 5 s so it can be checked with a meter/scope.
+ *           Refused unless the laser is DISARMED (no MO, so no emission).
+ * $LT=<ms>,<S>  static laser test: sets the power for S, then opens the gate
+ *           for up to 2 s with the galvo standing still. Refused unless the
+ *           laser is armed AND ready; burns one spot.
+ */
+static int laser_test(const char *p, bool fire)
+{
+    struct atmega_status st;
+    float v[2] = { 0.0f, 0.0f };
+
+    if (!parse_args(p, v, fire ? 2 : 1) || v[0] < 1.0f)
+        return 3;
+    if (s_fault || motion_busy() || galvo_out_busy()) {
+        host_puts("[MSG:test refused: motion in progress]\r\n");
+        return 0;
+    }
+    atmega_link_get_status(&st);
+    if (!fire) {
+        uint32_t ms = v[0] > 5000.0f ? 5000u : (uint32_t)v[0];
+
+        if (st.armed) {
+            host_puts("[MSG:GT refused: laser is armed - send M11 first]\r\n");
+            return 0;
+        }
+        host_printf("[MSG:GT gate (GPIO4 / DB25 pin 19) active for %lu ms]\r\n", (unsigned long)ms);
+        gate_pulse(ms);
+        host_puts("[MSG:GT done, gate inactive]\r\n");
+        return 0;
+    }
+    {
+        uint32_t ms = v[0] > 2000.0f ? 2000u : (uint32_t)v[0];
+        uint8_t pw = gcode_power_byte(v[1], calib_get(CAL_S_MAX), calib_get(CAL_POWER_MIN),
+                                      calib_get(CAL_POWER_MAX));
+        struct laser_io_state io;
+
+        if (!st.link_ok || !st.armed || !st.ready) {
+            host_printf("[MSG:LT refused: link=%d armed=%d ready=%d (M10, then wait ~2 s)]\r\n",
+                        st.link_ok, st.armed, st.ready);
+            return 0;
+        }
+        if (pw == 0) {
+            host_puts("[MSG:LT refused: S maps to power 0]\r\n");
+            return 0;
+        }
+        atmega_link_set_power(pw);
+        if (!atmega_link_wait_power(pw, 200)) {
+            host_printf("[MSG:LT refused: ATmega did not confirm power %u]\r\n", pw);
+            return 0;
+        }
+        laser_io_get_state(&io);
+        host_printf("[MSG:LT power=%u sync_hz=%lu gate %lu ms]\r\n", pw,
+                    (unsigned long)io.prr_hz, (unsigned long)ms);
+        gate_pulse(ms);
+        host_puts("[MSG:LT done, gate inactive]\r\n");
+        return 0;
+    }
+}
+
 static int exec_dollar(char *line)
 {
     char *p = line;
@@ -587,7 +685,7 @@ static int exec_dollar(char *line)
         p[--len] = '\0';
 
     if (len == 1) {
-        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H ~ ! ? ctrl-x]\r\n");
+        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $GT=ms $LT=ms,S ~ ! ? ctrl-x]\r\n");
         return 0;
     }
     if (strcmp(p, "$$") == 0) {
@@ -627,6 +725,10 @@ static int exec_dollar(char *line)
             host_printf("[MSG:RB X=0x%04X Y=0x%04X]\r\n", cx, cy);
         return 0;
     }
+    if (strncmp(p, "$GT=", 4) == 0)
+        return laser_test(p + 4, false);
+    if (strncmp(p, "$LT=", 4) == 0)
+        return laser_test(p + 4, true);
     if (strcmp(p, "$S") == 0) {
         print_stats();
         return 0;

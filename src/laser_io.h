@@ -39,4 +39,14 @@ void laser_io_gate(bool on);
  * held inactive. Used by abort / feed hold / preview. */
 void laser_io_gate_kill(bool kill);
 
+/* Diagnostics: logical gate state as last driven (true = laser enabled),
+ * kill switch, and the SYNC frequency actually running (0 = stopped). */
+struct laser_io_state {
+    bool gate_on;
+    bool killed;
+    bool active_low;
+    uint32_t prr_hz;
+};
+void laser_io_get_state(struct laser_io_state *out);
+
 #endif /* LASER_IO_H_ */
