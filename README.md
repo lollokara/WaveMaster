@@ -10,6 +10,85 @@ A companion ATmega328P owns the slow laser lines (power word, arm, guide, status
 
 ---
 
+## 🚦 Onboarding: from a fresh clone to the first mark
+
+Follow the phases in order. Each one ends with a check; don't move on until it passes.
+Commands assume macOS and the repo at `~/…/WaveMaster`; on Linux use `/dev/ttyACM0`-style
+ports and set up the venv by hand (see [tools/README_FLASHING.md](tools/README_FLASHING.md)).
+Below, `ESP` is the ESP32-S3 port, e.g. `/dev/cu.usbmodem1101`.
+
+**0. Safety first.** Laser in its enclosure, interlock working, eye protection at hand. Until
+phase 7 the marking laser never fires: every tool below runs in guide-laser preview
+(`M66`) unless you explicitly pass `--fire` and type `FIRE`.
+
+**1. Install the tools** (once)
+```bash
+git clone https://github.com/lollokara/WaveMaster.git && cd WaveMaster
+bash tools/setup_mac.sh        # Homebrew/Python check, Rosetta 2 on Apple Silicon, .venv with PlatformIO
+```
+✔ Ends with "Setup complete" and lists your serial ports.
+
+**2. Wire it** (laser powered off, DB25 unplugged). Read [docs/WIRING.md](docs/WIRING.md):
+DB25 pins 19 (gate) and 20 (SYNC/PRR) go to ESP32 GPIO4/GPIO3 with 10 kΩ pull-downs; power
+bits D0/D1 move from Arduino A7/A6 to D2/D4; pin 23 (E-stop) through a real interlock.
+✔ Every row of the DB25 table checked with a multimeter (continuity, no shorts to 5 V).
+
+**3. Flash both boards**
+```bash
+.venv/bin/python tools/flash_boards.py      # detect → build → ATmega first → ESP32 → verify
+```
+✔ `verify` passes: `[VER:1.1h.WaveMaster:]`, `[OPT:V,512,1024]`, `atmega link=1`,
+`$RB` readback, and the boot log shows `self-test OK`. It also saves a `$$` backup in
+`tools/backups/`. If anything fails, the wizard prints the fix; see the troubleshooting
+table in [tools/README_FLASHING.md](tools/README_FLASHING.md).
+
+**4. First contact, no laser**
+```bash
+.venv/bin/python tools/rftest/run_tests.py --mock smoke   # rehearsal against a simulated board
+.venv/bin/python tools/rftest/run_tests.py ESP smoke       # handshake, $$, $S, $RB, a guide square, cancel test
+```
+✔ `RESULT: PASS`, cancel returns to Idle within 2 s. Reports land in `tools/rftest/runs/`.
+
+**5. Watch the galvo move with the guide laser**
+```bash
+.venv/bin/python tools/rftest/run_tests.py ESP all-guide   # shapes, frame, raster, 2000-segment stress
+```
+✔ Smooth, evenly bright red traces (no bright corners, no dots along lines), `underruns 0`
+in the report. If the shapes are mirrored or rotated, the next phase fixes it. Optional but
+recommended once: put the scope on DB25 pin 19 vs. the DAC output and on SCLK/CS (see the
+bring-up checklist in [STATUS.md](STATUS.md)).
+
+**6. Calibrate geometry** (guide laser on paper is enough to start)
+```bash
+.venv/bin/python tools/calibrate.py ESP                   # field size, orientation, scale, distortion, offset
+```
+✔ A drawn 20 mm square measures 20.0 mm on both axes and the crosshair lands on your
+reference. Procedure and measuring tips: [tools/CALIBRATION.md](tools/CALIBRATION.md).
+
+**7. First real marks** (test card in the field, enclosure closed, low power)
+```bash
+.venv/bin/python tools/calibrate.py ESP --fire --max-power 300 --step delays --step power --step speed
+.venv/bin/python tools/rftest/run_tests.py ESP fire-power-ladder --fire --max-power 300
+```
+Each fire run frames the job with the guide laser and asks you to confirm before it arms.
+✔ Line starts and ends are clean (laser on/off delays tuned), the power ladder shows where
+marking starts and saturates. Then re-run `calibrate.py ESP --fire --step scale --step distortion`
+on a marked card for the best accuracy.
+
+**8. Connect Rayforge.** Follow [docs/RAYFORGE.md](docs/RAYFORGE.md): driver "GRBL (Serial)",
+dialect `grbl` for vectors or `grbl_raster` for engraving, work area = `$130`×`$131`,
+max power = `$30`, homing off. Close Rayforge before using the scripts again (one program per
+serial port).
+✔ A small vector job from Rayforge marks at the expected size and speed, and `$S` (Rayforge
+console) shows `underruns=0`.
+
+**When something goes wrong:** `$S` (stream and ATmega status), `$RB` (DAC readback when
+idle), and the logs in `tools/rftest/runs/<run>/` (`session.log` is the full byte-level
+transcript). Settings backups can be restored with
+`tools/flash_boards.py restore <file>` or `tools/calibrate.py ESP --restore <file>`.
+
+---
+
 ## ✨ Features
 
 - **Constant-speed trajectory:** arc-length interpolation at a fixed tick (`$200`, default 10 us). The beam keeps its speed through corners. `$215` adds a hold at sharp turns.

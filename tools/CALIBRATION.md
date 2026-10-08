@@ -191,15 +191,14 @@ result stops the search and the last clean value is proposed. `$201` is restored
 unless you accept the new one. Without `--fire` the jump test traces with the guide laser, which
 only shows gross ringing.
 
-## The `$$` display limit, and `last_values.json`
+## The `$$` display precision, and `last_values.json`
 
-The firmware prints settings with 4 decimals (`%.4f`). So `$$` shows a k1 of `-0.0000102` as
-`0.0000` and rounds a scale of 0.098765 to 0.0988. The wizard therefore keeps the exact values
-it wrote in `tools/calibrate/last_values.json` and uses them as long as the `$$` readback still agrees within 5e-5.
-The backup `settings_before.json` stores both the readback (`settings`) and these exact values
-(`exact`); `--restore` uses `exact` when present. A write is verified with a tolerance of 5e-5
-for the same reason. If you changed settings by hand in the meantime the readback no longer
-agrees, and the readback value (rounded) is used.
+Firmware older than commit `0737950` printed settings with 4 decimals (`%.4f`), so `$$`
+showed a k1 of `-0.0000102` as `0.0000`. Current firmware prints about 7 significant digits.
+The wizard still keeps the exact values it wrote in `tools/calibrate/last_values.json` and
+uses them while the `$$` readback agrees within 5e-5, so it works with either firmware. The
+backup `settings_before.json` stores both the readback (`settings`) and these exact values
+(`exact`); `--restore` uses `exact` when present.
 
 ## Files
 
