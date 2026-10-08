@@ -28,3 +28,7 @@ CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 # Logs share the host link; keep runtime chatter low (raise with esp_log
 # level calls when debugging).
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Gate-edge timer ISR must keep running during flash writes (NVS on a $ setting),
+# otherwise a laser-off edge could be delayed by a flash operation.
+CONFIG_GPTIMER_ISR_CACHE_SAFE=y

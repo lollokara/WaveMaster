@@ -18,6 +18,10 @@ void app_main(void)
 
     laser_io_early_init();               /* gate inactive before anything else */
     calib_init();
+    /* Apply the stored gate polarity at once: with an active-low gate the
+     * early-init level (low) would otherwise mean "laser on" until the
+     * output stage starts. */
+    laser_io_set_gate_active_low(calib_get(CAL_GATE_ACTIVE_LOW) != 0.0f);
     atmega_link_init();
     if (!host_serial_init())             /* from here on logs are [MSG:...] lines */
         ESP_LOGE(TAG, "host serial init failed");

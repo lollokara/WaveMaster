@@ -4,7 +4,6 @@
 #include "no_os_delay.h"
 #include "no_os_util.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include <stdlib.h>
 #include <errno.h>
 #include <stdint.h>
@@ -72,7 +71,7 @@ struct ad3552r_desc *ad3552r_board_init(void)
             /* Datasheet max fSCLK is 66MHz; 60MHz confirmed clean on real
              * hardware (init + scratchpad/product-ID checks pass, and
              * streamed quad-SPI writes verified correct via register
-             * readback - see ad3552r_board_stream_xy()). */
+             * readback - see the stream path). */
             .max_speed_hz = 60000000,
             .bit_order = NO_OS_SPI_BIT_ORDER_MSB_FIRST,
             .extra = &s_pins,
@@ -190,281 +189,99 @@ int32_t ad3552r_board_write_volts(uint8_t ch, float volts)
      * Fix: write the DAC output register directly, bypassing the broken
      * abstraction entirely - the exact same register (and function)
      * ad3552r_board_read_code() reads back from, and the same one
-     * ad3552r_board_stream_xy()'s raw ad3552r_transfer() calls already
+     * the stream path's raw ad3552r_transfer() calls already
      * targeted correctly all along. */
     return ad3552r_write_reg(g_dac, AD3552R_REG_ADDR_CH_DAC_24B(ch), code);
 }
 
-/* [CH1 code hi,lo,pad] + [CH0 code hi,lo,pad] - declared in the header so
- * callers can size stream buffers. */
+/*
+ * Streaming session (used by dac_task.c). See ad3552r_board.h.
+ *
+ * The AD3552R's STREAM_MODE length auto-resets after the first streaming
+ * transaction, so the config must be applied immediately before the stream
+ * and with nothing else in between: the config is attached to an
+ * ad3552r_transfer() carrying the write instruction, and the shim is armed
+ * to send only that instruction (CS kept low, bus left acquired) instead of
+ * the data message.
+ */
 #define STREAM_BYTES_PER_POINT AD3552R_STREAM_BYTES_PER_POINT
 
 static bool s_stream_mode_configured = false;
+static uint32_t s_stream_saved_clock_hz = 0;
+static uint8_t s_stream_marker[1];
 
-/*
- * Buffers a whole precomputed X/Y path and clocks it out as ONE continuous
- * SPI burst, instead of one transaction per point. Per-transaction driver
- * overhead (measured at several microseconds fixed cost regardless of
- * payload size - see the speed-test discussion in STATUS.md) is paid once
- * for the entire buffer rather than once per point, which is what lets
- * this get close to the DAC's own bit-rate ceiling instead of being
- * dominated by call overhead.
- *
- * Mechanism: the AD3552R's STREAM_MODE register makes its internal
- * register-address pointer loop every N bytes within one continuous
- * CS-low burst (datasheet "Streaming Mode" section). Configured here for
- * N=6 (one X+Y point: CH1's 3-byte register then CH0's, the two channel
- * registers are adjacent and 3 bytes apart), with descending address
- * order (the driver's post-reset default) starting from CH1 - so the
- * pointer walks CH1,CH0,CH1,CH0,... automatically as more bytes are
- * clocked, needing only one instruction+address phase for the whole
- * transfer.
- */
-static inline uint16_t fast_volts_to_code(float volts, float inv_scale_mv, float offset_code)
-{
-    float code_f = volts * 1000.0f * inv_scale_mv - offset_code;
-
-    if (code_f < 0.0f)
-        code_f = 0.0f;
-    if (code_f > 65535.0f)
-        code_f = 65535.0f;
-
-    return (uint16_t)(code_f + 0.5f);
-}
-
-int32_t ad3552r_board_build_stream_buf(const float *x_volts, const float *y_volts,
-                                        size_t n_points, uint8_t **out_buf)
-{
-    uint8_t *buf;
-    int32_t err0, err1, s0i, s0d, o0i, o0d, s1i, s1d, o1i, o1d;
-    float inv_scale0, offset0, inv_scale1, offset1;
-    size_t i;
-
-    *out_buf = NULL;
-    if (n_points == 0)
-        return 0;
-
-    /* Scale/offset are per-channel constants (only change when the output
-     * range is reconfigured), identical for every point in this buffer -
-     * looking them up once here instead of twice per point (as the
-     * general-purpose volts_to_code() does) removes 2*n_points redundant
-     * getter calls and divisions from the hot loop below. */
-    err0 = ad3552r_get_scale(g_dac, 0, &s0i, &s0d);
-    if (!err0)
-        err0 = ad3552r_get_offset(g_dac, 0, &o0i, &o0d);
-    err1 = ad3552r_get_scale(g_dac, 1, &s1i, &s1d);
-    if (!err1)
-        err1 = ad3552r_get_offset(g_dac, 1, &o1i, &o1d);
-    if (err0)
-        return err0;
-    if (err1)
-        return err1;
-
-    inv_scale0 = 1.0f / (s0i + s0d / 1000000.0f);
-    offset0 = o0i + o0d / 1000000.0f;
-    inv_scale1 = 1.0f / (s1i + s1d / 1000000.0f);
-    offset1 = o1i + o1d / 1000000.0f;
-
-    buf = malloc(n_points * STREAM_BYTES_PER_POINT);
-    if (!buf)
-        return -ENOMEM;
-
-    for (i = 0; i < n_points; i++) {
-        uint16_t code0 = fast_volts_to_code(x_volts[i], inv_scale0, offset0);
-        uint16_t code1 = fast_volts_to_code(y_volts[i], inv_scale1, offset1);
-        uint8_t *p = buf + i * STREAM_BYTES_PER_POINT;
-
-        no_os_put_unaligned_be16(code1, p);
-        p[2] = 0;
-        no_os_put_unaligned_be16(code0, p + 3);
-        p[5] = 0;
-    }
-
-    *out_buf = buf;
-    return 0;
-}
-
-int32_t ad3552r_board_stream_xy(const float *x_volts, const float *y_volts,
-                                 size_t n_points)
+int32_t ad3552r_board_stream_open(uint32_t clock_hz)
 {
     struct ad3552_transfer_config stream_cfg = {0};
     struct ad3552_transfer_data xfer = {0};
-    uint8_t *buf;
-    int32_t err0;
-
-    if (n_points == 0)
-        return 0;
-
-    {
-        int64_t t_build0 = esp_timer_get_time();
-
-        err0 = ad3552r_board_build_stream_buf(x_volts, y_volts, n_points, &buf);
-        if (err0)
-            return err0;
-
-        if (n_points > 100)
-            ESP_LOGI(TAG, "stream buffer build: %u points in %lld us (%.2f us/point)",
-                     (unsigned)n_points, (long long)(esp_timer_get_time() - t_build0),
-                     (double)(esp_timer_get_time() - t_build0) / (double)n_points);
-    }
-
-    /* single_instr=0 + stream_mode_length=6 switches the device from its
-     * normal "one register per CS-low burst" mode into looping mode; only
-     * needs writing once (subsequent streamed transfers reuse it, since
-     * ad3552r_transfer() only re-applies spi_cfg fields that changed from
-     * desc->spi_cfg - see _update_spi_cfg() in ad3552r.c). */
-    stream_cfg.single_instr = 0;
-    stream_cfg.stream_mode_length = STREAM_BYTES_PER_POINT;
-    stream_cfg.addr_asc = 0;
-    xfer.spi_cfg = &stream_cfg;
-    s_stream_mode_configured = true;
-
-    xfer.addr = AD3552R_REG_ADDR_CH_DAC_24B(1); /* CH1, the higher address */
-    xfer.data = buf;
-    xfer.len = n_points * STREAM_BYTES_PER_POINT;
-    xfer.is_read = 0;
-
-    /* Quad SPI is a hardware mode (the AD3552R's QSPI pin, not settable by
-     * register - datasheet Table 14), engaged only for this bulk transfer
-     * and reverted immediately after so other single-lane operations
-     * (register reads, per-point writes) keep working normally. Both the
-     * instruction and data phases go out across all 4 lines for a
-     * quad-mode write (matches datasheet Figure 9's Quad SPI Write
-     * timing), which is why this only needs setting once here rather
-     * than per phase - do_transaction() applies it via active_lines. */
-    set_qspi_pin(true);
-    ad3552r_esp32_spi_set_lines(g_dac->spi, 4);
-
-    err0 = ad3552r_transfer(g_dac, &xfer);
-
-    ad3552r_esp32_spi_set_lines(g_dac->spi, 1);
-    set_qspi_pin(false);
-
-    free(buf);
-    return err0;
-}
-
-/*
- * Hardware-paced streaming - see the header comment in ad3552r_board.h for
- * why the SPI clock is the pacing mechanism.
- *
- * One X+Y point is STREAM_BYTES_PER_POINT bytes; in quad mode 4 bits go out
- * per clock, so a point costs (6 * 8 / 4) = 12 clock cycles. To space
- * points T microseconds apart the clock must therefore be 12/T MHz.
- *
- * The reachable window is set at one end by the DAC's own maximum fSCLK and
- * at the other by how slowly the ESP32's divider will run. Outside it the
- * caller software-paces instead, which is accurate anyway once the target
- * period is well above the ~85us/point cost of the per-transaction path.
- */
-#define PACED_CLOCKS_PER_POINT 12u
-#define PACED_MAX_CLOCK_HZ     60000000u /* the bus's normal clock; datasheet max is 66MHz */
-
-/* How far below the requested period the hardware may land before this
- * refuses the job. The check matters in the "too fast" direction only, and
- * it is not theoretical: the ESP32's SPI divider bottoms out around 78kHz
- * (~154us/point), so a slow request like 416us/point silently came out at
- * 154us/point - the shape drawn 2.7x too fast - back when this trusted a
- * guessed minimum-clock constant instead of checking. Measuring what the
- * divider actually produced removes the guess entirely; anything it cannot
- * reach is handed back to the caller to software-pace, which is accurate
- * in exactly that slow regime anyway. Clock quantisation in the rates the
- * hardware *can* hit is well under 1% (measured 19.97us for a 20us
- * request), so 5% is a generous band. */
-#define PACED_RATE_TOLERANCE 0.95f
-
-static bool s_paced_active = false;
-static uint32_t s_paced_saved_clock_hz = 0;
-
-int32_t ad3552r_board_paced_begin(float target_us_per_point, float *out_us_per_point)
-{
-    uint32_t want_hz, actual_hz;
-    float achieved_us;
     int32_t err;
 
-    if (out_us_per_point)
-        *out_us_per_point = 0.0f;
-    if (target_us_per_point <= 0.0f)
-        return 0;
-
-    want_hz = (uint32_t)((float)PACED_CLOCKS_PER_POINT * 1.0e6f / target_us_per_point);
-    if (want_hz > PACED_MAX_CLOCK_HZ)
-        return 0; /* faster than the bus runs - caller software-paces */
-
-    s_paced_saved_clock_hz = g_dac->spi->clock_hz;
-    err = ad3552r_esp32_spi_set_clock(g_dac->spi, want_hz);
+    s_stream_saved_clock_hz = g_dac->spi->clock_hz;
+    err = ad3552r_esp32_spi_set_clock(g_dac->spi, clock_hz);
     if (err)
         return err;
 
-    /* What the divider actually produced, which is the only figure worth
-     * trusting - see PACED_RATE_TOLERANCE. */
-    actual_hz = ad3552r_esp32_spi_actual_hz(g_dac->spi);
-    if (actual_hz == 0)
-        actual_hz = want_hz;
-    achieved_us = (float)PACED_CLOCKS_PER_POINT * 1.0e6f / (float)actual_hz;
-
-    if (achieved_us < target_us_per_point * PACED_RATE_TOLERANCE) {
-        ESP_LOGI(TAG, "paced: %.1fus/point requested but the clock floors at "
-                 "%.1fus/point (%luHz) - leaving it to software pacing",
-                 (double)target_us_per_point, (double)achieved_us,
-                 (unsigned long)actual_hz);
-        ad3552r_esp32_spi_set_clock(g_dac->spi, s_paced_saved_clock_hz);
-        return 0;
-    }
-
-    if (out_us_per_point)
-        *out_us_per_point = achieved_us;
-
-    /* The streaming-mode config (address pointer looping every 6 bytes so
-     * CH1/CH0 alternate automatically) is attached to each emit's transfer
-     * rather than applied here - ad3552r_transfer() only re-sends the
-     * fields that changed, so carrying it on the real data transfers costs
-     * nothing and avoids needing a separate dummy transaction. */
-
     set_qspi_pin(true);
     ad3552r_esp32_spi_set_lines(g_dac->spi, 4);
-    s_paced_active = true;
-    s_stream_mode_configured = true;
-
-    return 1;
-}
-
-int32_t ad3552r_board_paced_emit(const uint8_t *buf, size_t n_points)
-{
-    struct ad3552_transfer_config stream_cfg = {0};
-    struct ad3552_transfer_data xfer = {0};
-
-    if (!s_paced_active)
-        return -EINVAL;
-    if (n_points == 0)
-        return 0;
 
     stream_cfg.single_instr = 0;
     stream_cfg.stream_mode_length = STREAM_BYTES_PER_POINT;
     stream_cfg.addr_asc = 0;
     xfer.spi_cfg = &stream_cfg;
-
     xfer.addr = AD3552R_REG_ADDR_CH_DAC_24B(1); /* CH1, the higher address */
-    xfer.data = (uint8_t *)buf;
-    xfer.len = n_points * STREAM_BYTES_PER_POINT;
+    xfer.data = s_stream_marker;
+    xfer.len = 1;
     xfer.is_read = 0;
+    s_stream_mode_configured = true;
 
-    return ad3552r_transfer(g_dac, &xfer);
+    ad3552r_esp32_spi_stream_arm(s_stream_marker);
+    err = ad3552r_transfer(g_dac, &xfer);
+    ad3552r_esp32_spi_stream_arm(NULL);
+    if (err) {
+        ad3552r_esp32_spi_set_lines(g_dac->spi, 1);
+        set_qspi_pin(false);
+        ad3552r_esp32_spi_set_clock(g_dac->spi, s_stream_saved_clock_hz);
+        ad3552r_board_stream_end();
+    }
+    return err;
 }
 
-void ad3552r_board_paced_end(void)
+void ad3552r_board_stream_close(void)
 {
-    if (!s_paced_active)
-        return;
-
+    ad3552r_esp32_spi_stream_release(g_dac->spi);
     ad3552r_esp32_spi_set_lines(g_dac->spi, 1);
     set_qspi_pin(false);
-    s_paced_active = false;
-
-    /* Restore the fast clock before stream_end()'s scratchpad read, so that
-     * (and every later register access) runs at the normal rate. */
-    ad3552r_esp32_spi_set_clock(g_dac->spi, s_paced_saved_clock_hz);
+    ad3552r_esp32_spi_set_clock(g_dac->spi, s_stream_saved_clock_hz);
     ad3552r_board_stream_end();
+}
+
+void *ad3552r_board_spi_dev(void)
+{
+    return ad3552r_esp32_spi_dev(g_dac->spi);
+}
+
+uint32_t ad3552r_board_spi_actual_hz(void)
+{
+    return ad3552r_esp32_spi_actual_hz(g_dac->spi);
+}
+
+uint32_t ad3552r_board_quantize_clock(uint32_t hz)
+{
+    return ad3552r_esp32_spi_quantize_hz(hz);
+}
+
+int32_t ad3552r_board_code_map(uint8_t ch, float *inv_scale_mv, float *offset_code)
+{
+    int32_t si, sd, oi, od, err;
+
+    err = ad3552r_get_scale(g_dac, ch, &si, &sd);
+    if (!err)
+        err = ad3552r_get_offset(g_dac, ch, &oi, &od);
+    if (err)
+        return err;
+    *inv_scale_mv = 1.0f / (si + sd / 1000000.0f);
+    *offset_code = oi + od / 1000000.0f;
+    return 0;
 }
 
 /* Restores normal (non-streaming) single-instruction mode after a

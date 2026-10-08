@@ -5,6 +5,10 @@
 #include <errno.h>
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "hal/gpio_ll.h"
+#include "hal/spi_hal.h"
+#include "soc/gpio_struct.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -16,10 +20,37 @@ static const char *TAG = "no_os_spi_esp32";
 static int s_dir_gpio = -1;
 static volatile int s_host_drives = 1;
 
+/* Stream hooks (see no_os_spi.h). Both run in the SPI ISR. */
+static ad3552r_spi_stream_cb_t s_stream_pre;
+static ad3552r_spi_stream_cb_t s_stream_post;
+/* Marker data pointer identifying the "open the stream and hold the bus"
+ * transfer (see ad3552r_esp32_spi_stream_arm()). */
+static const uint8_t *s_hold_marker;
+
+#define SPI_QUEUE_DEPTH 4
+
 static void IRAM_ATTR pre_transfer_cb(spi_transaction_t *t)
 {
-    if (s_dir_gpio >= 0)
-        gpio_set_level((gpio_num_t)s_dir_gpio, s_host_drives ? 1 : 0);
+    if (s_dir_gpio >= 0) {
+        /* Chunk transactions are always host-driven writes. */
+        int lvl = (t->user || s_host_drives) ? 1 : 0;
+        gpio_ll_set_level(&GPIO, (uint32_t)s_dir_gpio, (uint32_t)lvl);
+    }
+    if (t->user && s_stream_pre)
+        s_stream_pre(t->user);
+}
+
+static void IRAM_ATTR post_transfer_cb(spi_transaction_t *t)
+{
+    if (t->user && s_stream_post)
+        s_stream_post(t->user);
+}
+
+void ad3552r_esp32_spi_set_stream_cbs(ad3552r_spi_stream_cb_t pre,
+                                       ad3552r_spi_stream_cb_t post)
+{
+    s_stream_pre = pre;
+    s_stream_post = post;
 }
 
 int32_t no_os_spi_init(struct no_os_spi_desc **desc,
@@ -57,6 +88,10 @@ int32_t no_os_spi_init(struct no_os_spi_desc **desc,
          * ad3552r_board_stream_xy()), which pack a whole precomputed path
          * into one SPI burst instead of one transaction per point. */
         .max_transfer_sz = 32768,
+        /* Pin the bus ISR to core 0 (the stream core) and keep it alive
+         * while the flash cache is off (NVS writes happen on core 1). */
+        .isr_cpu_id = ESP_INTR_CPU_AFFINITY_0,
+        .intr_flags = ESP_INTR_FLAG_IRAM,
     };
     err = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -68,9 +103,10 @@ int32_t no_os_spi_init(struct no_os_spi_desc **desc,
         .clock_speed_hz = (int)param->max_speed_hz,
         .mode = (uint8_t)param->mode,
         .spics_io_num = pins->cs,
-        .queue_size = 1,
+        .queue_size = SPI_QUEUE_DEPTH,
         .flags = SPI_DEVICE_HALFDUPLEX,
         .pre_cb = pre_transfer_cb,
+        .post_cb = post_transfer_cb,
     };
     ESP_LOGI(TAG, "requesting clock_speed_hz=%d", dev_cfg.clock_speed_hz);
     err = spi_bus_add_device(SPI2_HOST, &dev_cfg, (spi_device_handle_t *)&d->spi_dev);
@@ -116,9 +152,10 @@ int32_t ad3552r_esp32_spi_set_clock(struct no_os_spi_desc *desc, uint32_t hz)
         .clock_speed_hz = (int)hz,
         .mode = (uint8_t)desc->init.mode,
         .spics_io_num = desc->pins.cs,
-        .queue_size = 1,
+        .queue_size = SPI_QUEUE_DEPTH,
         .flags = SPI_DEVICE_HALFDUPLEX,
         .pre_cb = pre_transfer_cb,
+        .post_cb = post_transfer_cb,
     };
     spi_device_handle_t dev = NULL;
     esp_err_t err;
@@ -158,6 +195,27 @@ int32_t ad3552r_esp32_spi_set_clock(struct no_os_spi_desc *desc, uint32_t hz)
     desc->clock_hz = hz;
 
     return 0;
+}
+
+uint32_t ad3552r_esp32_spi_quantize_hz(uint32_t hz)
+{
+    /* Same calculation spi_bus_add_device() performs (APB source on S3). */
+    return (uint32_t)spi_hal_master_cal_clock(80000000, (int)hz, 128);
+}
+
+void *ad3552r_esp32_spi_dev(struct no_os_spi_desc *desc)
+{
+    return desc->spi_dev;
+}
+
+void ad3552r_esp32_spi_stream_arm(const uint8_t *marker)
+{
+    s_hold_marker = marker;
+}
+
+void ad3552r_esp32_spi_stream_release(struct no_os_spi_desc *desc)
+{
+    spi_device_release_bus((spi_device_handle_t)desc->spi_dev);
 }
 
 uint32_t ad3552r_esp32_spi_actual_hz(struct no_os_spi_desc *desc)
@@ -309,6 +367,20 @@ int32_t no_os_spi_transfer(struct no_os_spi_desc *desc,
     int32_t err;
     bool coalesced;
     bool profile = false;
+
+    /* Stream-open request: send only the instruction message, with CS held
+     * and the bus left acquired; the caller then queues data transactions
+     * itself and finally releases the bus. */
+    if (s_hold_marker && len == 2 && msgs[1].tx_buff == s_hold_marker) {
+        s_hold_marker = NULL;
+        err = spi_device_acquire_bus((spi_device_handle_t)desc->spi_dev, portMAX_DELAY);
+        if (err != ESP_OK)
+            return -EIO;
+        err = do_transaction(desc, msgs[0].tx_buff, NULL, msgs[0].bytes_number, 1);
+        if (err)
+            spi_device_release_bus((spi_device_handle_t)desc->spi_dev);
+        return err;
+    }
     static bool profile_logged = false;
     int64_t ts[PROF_MAX_STAGES];
     const char *labels[PROF_MAX_STAGES];
