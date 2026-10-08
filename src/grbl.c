@@ -695,7 +695,7 @@ static int exec_dollar(char *line)
         p[--len] = '\0';
 
     if (len == 1) {
-        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $RD $GT=ms $LT=ms,S ~ ! ? ctrl-x]\r\n");
+        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $RD $PW=word $GT=ms $LT=ms,S ~ ! ? ctrl-x]\r\n");
         return 0;
     }
     if (strcmp(p, "$$") == 0) {
@@ -733,6 +733,32 @@ static int exec_dollar(char *line)
             host_puts("[MSG:RB unavailable (busy or SPI error)]\r\n");
         else
             host_printf("[MSG:RB X=0x%04X Y=0x%04X]\r\n", cx, cy);
+        return 0;
+    }
+    if (strncmp(p, "$PW=", 4) == 0) {
+        /* Power-word wiring test: latch a raw 0-255 word on DB25 pins 1-8
+         * (via the ATmega) without motion or gate, so the bits can be
+         * checked with a meter. The next job re-applies its own power. */
+        const char *q = p + 4;
+        float v;
+
+        if (gcode_parse_number(&q, &v) || *q || v < 0.0f || v > 255.0f)
+            return 3;
+        if (s_fault || motion_busy() || galvo_out_busy()) {
+            host_puts("[MSG:PW refused: motion in progress]\r\n");
+            return 0;
+        }
+        {
+            uint8_t w = (uint8_t)(v + 0.5f);
+            bool ok;
+
+            atmega_link_set_power(w);
+            ok = atmega_link_wait_power(w, 300);
+            host_printf("[MSG:PW word=%u (0x%02X) bits D7..D0=%u%u%u%u%u%u%u%u %s]\r\n", w, w,
+                        (w >> 7) & 1, (w >> 6) & 1, (w >> 5) & 1, (w >> 4) & 1,
+                        (w >> 3) & 1, (w >> 2) & 1, (w >> 1) & 1, w & 1,
+                        ok ? "latched" : "NOT confirmed by the ATmega");
+        }
         return 0;
     }
     if (strncmp(p, "$GT=", 4) == 0)
