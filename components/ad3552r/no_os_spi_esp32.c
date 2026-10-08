@@ -258,7 +258,7 @@ static bool try_coalesced_write(struct no_os_spi_desc *desc,
                                  struct no_os_spi_msg *msgs, uint32_t len,
                                  int32_t *out_err)
 {
-    uint8_t buf[COALESCE_BUF_MAX];
+    uint8_t buf[COALESCE_BUF_MAX] = {0};
     uint32_t total = 0, i;
     static bool logged = false;
 
