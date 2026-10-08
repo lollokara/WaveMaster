@@ -1,0 +1,44 @@
+# Rayforge device profile (api_version 1), for the wizard's "Import from File"
+# button. Zip it with:  cd docs/rayforge/wavemaster.rfdevice && zip -r ../WaveMaster_Galvo.rfdevice.zip .
+# A profile carries no port and no user macros (see docs/RAYFORGE.md).
+api_version: 1
+device:
+  name: WaveMaster Galvo
+  vendor: WaveMaster
+  model: Galvo fiber-laser controller
+  description: ESP32-S3 + AD3552R galvo controller, GRBL 1.1 subset over USB.
+  usb_ids:
+  - 303a:1001
+machine:
+  driver: GrblSerialDriver
+  driver_args:
+    baudrate: 115200
+    rx_buffer_size_override: 1024
+  driver_config:
+    rx_buffer_size: 1024
+    firmware_version: 1.1h.WaveMaster
+    arc_tolerance: 0.01
+  gcode_precision: 3
+  supports_arcs: true
+  supports_curves: false
+  axis_extents: [100, 100]
+  origin: bottom_left
+  panel_orientation: native
+  has_z: false
+  max_travel_speed: 180000
+  max_cut_speed: 60000
+  acceleration: 2000000
+  home_on_start: false
+  single_axis_homing_enabled: false
+  unit_system: metric
+  heads:
+  - type: LaserHead
+    name: Fiber laser
+    tool_number: 0
+    max_power: 1000
+    frame_power_percent: 0
+    frame_speed: 60000
+    frame_repeat_count: 20
+    spot_size_mm: [0.05, 0.05]
+    laser_type: fiber
+    wavelength_nm: 1064.0
