@@ -554,6 +554,8 @@ class Bench:
             return "y" if self.fire else "n"
         if k == "mark_power":
             return "100"
+        if k == "geom_feed":
+            return ""          # accept the default (--geom-feed, 1200 mm/min)
         if k == "card_full":
             return ""
         if k in ("field_w", "field_h"):

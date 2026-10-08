@@ -201,6 +201,10 @@ both axes move.
 
 ### scale (`$100`, `$101`)
 
+The measurement marks of `scale`, `distortion` and `offset` are made slowly, at
+`--geom-feed` (default 1200 mm/min = 20 mm/s, asked once per run), so the lines are
+clean and easy to measure. The other fire steps keep using `--feed`.
+
 A square of side S (default 20 mm) centred in the field, with a small cross at the centre. Measure
 the **X side** (top and bottom) and the **Y side** (left and right). The new value is
 `old * S / measured`; for a swapped machine the wizard applies the X measurement to `$101` and

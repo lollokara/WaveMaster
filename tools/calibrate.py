@@ -628,6 +628,15 @@ class Wizard:
             return self.a.guide_feed, 0.0
         return (self.a.feed if feed is None else feed), (self.mark_power if self.mark_power is not None else 0.0)
 
+    def geom_feed(self) -> float:
+        """Marking speed for the geometry steps (scale, distortion, offset), asked once."""
+        if getattr(self, "_geom_feed", None) is None:
+            self._geom_feed = self.ask_nums(
+                "geom_feed", "Marking speed for the measurement marks, mm/min (slow = clean lines)",
+                default=self.a.geom_feed, lo=60, hi=max(60.0, self.a.feed))[0]
+            self.say(f"  geometry marks at F{self._geom_feed:g} mm/min ({self._geom_feed / 60:g} mm/s)")
+        return self._geom_feed
+
     def use_fire(self, what: str) -> bool:
         if not self.a.fire:
             self.say("  (no --fire: using the guide laser on paper)")
@@ -1138,7 +1147,7 @@ class Wizard:
         S = self.ask_nums("scale_side", "Square side in mm", default=min(20.0, smax), lo=5, hi=smax)[0]
         rounds = []
         for rnd in range(1, 6):
-            feed, power = self.style(fire)
+            feed, power = self.style(fire, self.geom_feed() if fire else None)
             c = self.geometry()["centre"]
             pat = pat_square_cross(c, S, feed, power)
             self.draw(pat, fire)
@@ -1172,7 +1181,7 @@ class Wizard:
                  "run 'scale' first.")
         rounds = []
         for rnd in range(1, 5):
-            feed, power = self.style(fire)
+            feed, power = self.style(fire, self.geom_feed() if fire else None)
             c = self.geometry()["centre"]
             self.draw(pat_distortion(c, R, feed, power), fire)
             self.instruct_measure(fire, "the cross arms and the four square sides")
@@ -1224,7 +1233,7 @@ class Wizard:
                  "centreline, ...): dx = + when it is right of the reference, dy = + when it is further away from you.")
         rounds = []
         for rnd in range(1, 5):
-            feed, power = self.style(fire)
+            feed, power = self.style(fire, self.geom_feed() if fire else None)
             c = self.geometry()["centre"]
             self.draw(pat_crosshair(c, min(6.0, 0.1 * min(g["W"], g["H"])), feed, power), fire)
             dx, dy = self.ask_nums("offset_dxdy", "dx dy in mm (two numbers; 0 0 if it is dead on)", 2, 2, lo=-50, hi=50)
@@ -1621,6 +1630,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--restore", metavar="FILE", help="write a backed-up settings file back and exit")
     p.add_argument("--keep-armed", action="store_true", help="stay armed between patterns and at the end")
     p.add_argument("--feed", type=float, default=12000.0, help="marking speed for fire patterns, mm/min (default 12000)")
+    p.add_argument("--geom-feed", type=float, default=1200.0,
+                   help="marking speed for the scale/distortion/offset marks, mm/min (default 1200 = 20 mm/s; "
+                        "slow so the lines are clean and easy to measure)")
     p.add_argument("--guide-feed", type=float, default=6000.0, help="guide-laser trace speed, mm/min (default 6000)")
     p.add_argument("--guide-seconds", type=float, default=3.0, help="how long a guide pattern is traced (default 3)")
     p.add_argument("--card", type=parse_card, default=(60.0, 60.0), help="test card size WxH in mm (default 60x60)")
