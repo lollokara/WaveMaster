@@ -159,6 +159,19 @@ Read-only GRBL values (`$0`, `$1`, `$2`, `$4`-`$6`, `$10`, `$11`, `$20`-`$27`, `
 
 ---
 
+## Flashing (macOS)
+
+Guided setup and flashing for both boards (ATmega companion first, then ESP32-S3):
+
+```bash
+bash tools/setup_mac.sh
+.venv/bin/python tools/flash_boards.py
+```
+
+See [tools/README_FLASHING.md](tools/README_FLASHING.md) for safety steps, subcommands and troubleshooting.
+
+---
+
 ## 🚀 Build and flash
 
 Requires [PlatformIO](https://platformio.org/). The platform is pinned to

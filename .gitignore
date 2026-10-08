@@ -8,3 +8,5 @@
 .DS_Store
 sdkconfig.esp32-s3-devkitc-1
 .claude/worktrees/
+.venv/
+tools/backups/
