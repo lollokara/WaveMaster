@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c" "host_serial.c" "grbl.c" "calib.c"
+    SRCS "main.c" "host_serial.c" "grbl.c" "gcode_parse.c" "calib.c"
          "motion.c" "motion_task.c" "galvo_out.c" "dac_task.c"
          "laser_io.c" "ad3552r_board.c" "atmega_link.c"
     INCLUDE_DIRS "."
