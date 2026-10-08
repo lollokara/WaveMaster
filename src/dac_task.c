@@ -66,6 +66,7 @@ static volatile bool s_gate_state;
 static uint32_t s_tick_q8;              /* timer counts per tick * 256 */
 static atomic_int s_isr_inflight;       /* queued and not yet completed */
 static volatile bool s_isr_drained;     /* inflight reached 0 */
+static volatile bool s_isr_drain_lit;   /* ...while the gate was on */
 
 static uint64_t IRAM_ATTR timer_now(void)
 {
@@ -161,7 +162,10 @@ static void IRAM_ATTR stream_post(void *user)
     s_cur = NULL;
     left = atomic_fetch_sub(&s_isr_inflight, 1) - 1;
     if (left <= 0) {
-        /* Nothing queued behind us: the laser must not stay on. */
+        /* Nothing queued behind us: the laser must not stay on. If it was
+         * on, the motion task did not get to close the polyline in time:
+         * that is a real underrun (a visible stop in a mark). */
+        s_isr_drain_lit = s_gate_state || c->gate_end;
         s_gate_state = false;
         laser_io_gate(false);
         s_isr_drained = true;
@@ -186,7 +190,6 @@ static struct galvo_chunk *s_next;      /* dequeued, waiting to be started */
 static int s_outstanding;               /* queued minus reaped */
 static int64_t s_idle_since_us;
 static bool s_drained;
-static bool s_gap_expected;
 static bool s_arm_failed;
 static bool s_power_warned;
 static DMA_ATTR uint8_t s_last_point[GALVO_BYTES_PER_TICK];
@@ -232,6 +235,15 @@ static void reap(void)
         s_isr_drained = false;
         s_drained = true;
         s_idle_since_us = esp_timer_get_time();
+        /* A chunk already waiting in s_next means the drain was deliberate
+         * (power/PRR barrier or arming); feed hold is deliberate too. */
+        if (s_isr_drain_lit && !s_next && !atomic_load(&g_galvo.held)) {
+            /* Counted when it happens, not when motion resumes, so the
+             * stats are right even if the job never continues. */
+            atomic_fetch_add(&g_galvo.underruns, 1);
+            ESP_LOGW(TAG, "stream underrun with the laser on (host too slow?)");
+        }
+        s_isr_drain_lit = false;
     }
 }
 
@@ -309,7 +321,6 @@ static void apply_barrier(struct galvo_chunk *c)
         laser_io_set_prr(c->barrier_prr_hz, calib_get(CAL_PRR_DUTY));
     c->barrier = 0;
     atomic_fetch_add(&g_galvo.barriers, 1);
-    s_gap_expected = true;
 }
 
 static bool needs_arm(const struct galvo_chunk *c)
@@ -336,7 +347,6 @@ static void do_arm(void)
                  (unsigned long)tmo);
         s_arm_failed = true;
     }
-    s_gap_expected = true;
 }
 
 /* Returns 0 when the chunk was consumed (queued or dropped), 1 if it must
@@ -367,12 +377,7 @@ static int try_start(struct galvo_chunk *c)
     if (s_outstanding >= MAX_INFLIGHT)
         return 1;
 
-    if (s_drained && !s_gap_expected) {
-        atomic_fetch_add(&g_galvo.underruns, 1);
-        ESP_LOGW(TAG, "stream underrun");
-    }
     s_drained = false;
-    s_gap_expected = false;
 
     t = &c->trans;
     memset(t, 0, sizeof(*t));
@@ -422,7 +427,6 @@ static void do_abort(void)
         session_close();
     s_arm_failed = false;
     s_drained = false;
-    s_gap_expected = false;
     atomic_store(&g_galvo.abort_go, false);
     xSemaphoreGive(g_galvo.abort_done);
 }
@@ -445,8 +449,6 @@ static TickType_t service(void)
     }
 
     held = atomic_load(&g_galvo.held);
-    if (held)
-        s_gap_expected = true;
     while (!held) {
         if (!s_next && xQueueReceive(g_galvo.ready_q, &s_next, 0) != pdTRUE) {
             s_next = NULL;
@@ -465,7 +467,6 @@ static TickType_t service(void)
             if (idle >= IDLE_CLOSE_US) {
                 session_close();
                 s_arm_failed = false;
-                s_gap_expected = false;
                 return portMAX_DELAY;
             }
             return pdMS_TO_TICKS((IDLE_CLOSE_US - idle) / 1000 + 1);

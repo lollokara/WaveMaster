@@ -493,8 +493,14 @@ class Session:
 
     def preview_on(self) -> bool:
         self.c.command_ok("M66")
-        guide = self.c.stats_s().get("atmega", {}).get("guide")
-        return guide == "1"
+        # M66 is acknowledged before the ATmega has switched the guide laser
+        # (the link is asynchronous, ~1 ms round trip), so poll briefly.
+        deadline = time.monotonic() + 1.0
+        while True:
+            guide = self.c.stats_s().get("atmega", {}).get("guide")
+            if guide == "1" or time.monotonic() >= deadline:
+                return guide == "1"
+            time.sleep(0.05)
 
     def preview_off(self) -> None:
         self.c.command("M67")
@@ -706,7 +712,11 @@ class Session:
         pt.join(1.0)
         idle_t = next((s.t for s in self.log.statuses if s.t > cr.t_tx and s.state == "Idle"), None)
         to_idle = None if idle_t is None else idle_t - cr.t_tx
+        deadline = time.monotonic() + 1.0       # async ATmega link: poll briefly
         guide = c.stats_s().get("atmega", {}).get("guide")
+        while guide != "0" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            guide = c.stats_s().get("atmega", {}).get("guide")
         self.rep.cancel = {
             "state_before_cancel": st_before.state if st_before else None,
             "banner_latency_s": cr.reset_latency, "cancel_to_idle_s": to_idle,

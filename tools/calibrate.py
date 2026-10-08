@@ -481,8 +481,13 @@ class Wizard:
     def preview_on(self) -> None:
         self.c.command_ok("M66")
         self.preview = True
-        if self.c.stats_s().get("atmega", {}).get("guide") != "1":
-            raise SafetyError("M66 sent but $S does not report guide=1")
+        # The ATmega link is asynchronous: M66 is acknowledged ~1 ms before
+        # the guide laser is confirmed, so poll briefly.
+        deadline = time.monotonic() + 1.0
+        while self.c.stats_s().get("atmega", {}).get("guide") != "1":
+            if time.monotonic() >= deadline:
+                raise SafetyError("M66 sent but $S does not report guide=1")
+            time.sleep(0.05)
 
     def preview_off(self) -> None:
         self.c.command("M67")
