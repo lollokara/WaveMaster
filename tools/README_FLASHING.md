@@ -61,6 +61,7 @@ one arrives (only visible if the board resets while connected).
 | Symptom | Cause / fix |
 |:---|:---|
 | `Bad CPU type in executable` / `Unknown system error -86` (Apple Silicon) | Intel-only PlatformIO tools (avr-gcc, ninja) need Rosetta 2: `softwareupdate --install-rosetta --agree-to-license`, then rerun. `setup_mac.sh` now checks and offers this. |
+| `ModuleNotFoundError: No module named 'intelhex'` at the end of the ESP32 build | esptool runs with the venv Python: `.venv/bin/pip install intelhex bitstring reedsolo ecdsa pyyaml cryptography` (`setup_mac.sh` now installs these). |
 | Port not found | Try another cable (charge-only cables have no data), replug, run `detect`. ESP32: `/dev/cu.usbmodem*`; Arduino: `/dev/cu.usbserial-*` or `/dev/cu.wchusbserial*`. |
 | CH340 not showing up | macOS 10.15+/Big Sur and later include a CH34x driver. If missing, install WCH's driver, allow the extension in System Settings > Privacy & Security, replug. |
 | `avrdude: stk500_getsync(): not in sync` | Wrong port or board, or bootloader speed. New-bootloader Nano clones need 115200: in `ArduinoCompanion/platformio.ini` set `upload_speed = 115200` (default 57600). Also check the monitor is closed and the cable carries data. |

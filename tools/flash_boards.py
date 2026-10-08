@@ -175,6 +175,7 @@ def run_pio(args: list[str], cwd: Path, label: str) -> tuple[int, str]:
     out = "".join(buf)
     if rc != 0:
         rosetta_hint(out)
+        module_hint(out, pio)
     return rc, out
 
 
@@ -187,6 +188,17 @@ def rosetta_missing() -> bool:
                               capture_output=True).returncode != 0
     except OSError:
         return True
+
+
+def module_hint(output: str, pio: str) -> None:
+    m = re.search(r"No module named '([\w.]+)'", output)
+    if not m:
+        return
+    py = Path(pio).with_name("python")
+    py_cmd = str(py) if py.exists() else sys.executable
+    warn(f"A Python module PlatformIO's tools need is missing ({m.group(1)}). Install esptool's\n"
+         f"      dependencies into the Python that runs PlatformIO, then retry:\n"
+         f"          {py_cmd} -m pip install intelhex bitstring reedsolo ecdsa pyyaml cryptography")
 
 
 def rosetta_hint(output: str) -> None:

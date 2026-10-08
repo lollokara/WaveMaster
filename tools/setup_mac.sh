@@ -91,6 +91,11 @@ fi
 say "Installing platformio and pyserial"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
 "$VENV/bin/python" -m pip install --quiet --upgrade 'platformio>=6.1.16' pyserial
+# PlatformIO runs esptool (tool-esptoolpy) with this venv's Python, so its
+# dependencies must live here too - otherwise the ESP32 build fails at the
+# very end with "ModuleNotFoundError: No module named 'intelhex'".
+say "Installing esptool dependencies into the venv"
+"$VENV/bin/python" -m pip install --quiet --upgrade intelhex bitstring reedsolo ecdsa pyyaml cryptography
 good "PlatformIO: $("$VENV/bin/pio" --version)"
 
 # ---- .gitignore -------------------------------------------------------------
