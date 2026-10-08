@@ -46,6 +46,10 @@ struct no_os_spi_desc {
                             tx+rx (e.g. CRC-framed transfers) */
     int dir_gpio;
     uint8_t active_lines; /* 1, 2, or 4 */
+    uint32_t clock_hz;    /* clock the device is currently configured for */
+    struct ad3552r_esp32_spi_pins pins; /* kept so the device can be re-added
+                                          at a different clock - see
+                                          ad3552r_esp32_spi_set_clock() */
 };
 
 struct no_os_spi_msg {
@@ -65,5 +69,30 @@ int32_t no_os_spi_transfer(struct no_os_spi_desc *desc,
 void ad3552r_esp32_spi_set_lines(struct no_os_spi_desc *desc, uint8_t lines);
 int32_t ad3552r_esp32_spi_raw(struct no_os_spi_desc *desc, const uint8_t *tx,
                                uint8_t *rx, uint32_t len, uint8_t host_drives);
+
+/*
+ * Reconfigure the bus clock by removing and re-adding the SPI device (the
+ * ESP-IDF master driver fixes the clock per device, and offers no
+ * per-transaction override).
+ *
+ * Exists because in the AD3552R's streaming mode the SPI clock *is* the
+ * output pacing: the device's address pointer loops every 6 bytes, so one
+ * point costs 12 quad-mode clock cycles and the DAC updates as the bytes
+ * arrive. Choosing the clock therefore sets the point rate exactly, in
+ * hardware, with no per-point CPU involvement - see
+ * ad3552r_board_paced_begin().
+ *
+ * Only a single device is ever configured on this bus at a time: adding a
+ * second one was previously found to break the first one's transfers even
+ * while unused (see no_os_spi_init()), so this swaps rather than adds.
+ * Returns 0 on success.
+ */
+int32_t ad3552r_esp32_spi_set_clock(struct no_os_spi_desc *desc, uint32_t hz);
+
+/* The clock the hardware actually settled on for the current device, which
+ * is the requested value rounded to an achievable divider. Callers pacing
+ * off the clock must use this, not what they asked for. Returns 0 if it
+ * cannot be determined. */
+uint32_t ad3552r_esp32_spi_actual_hz(struct no_os_spi_desc *desc);
 
 #endif /* NO_OS_SPI_H_ */

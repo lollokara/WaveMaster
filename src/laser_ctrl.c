@@ -41,6 +41,11 @@ bool laser_ctrl_next(struct laser_cmd *cmd, uint32_t timeout_ms)
     return xQueueReceive(s_cmd_queue, cmd, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
+bool laser_ctrl_pending(void)
+{
+    return uxQueueMessagesWaiting(s_cmd_queue) > 0;
+}
+
 static float clamp_volts(float v)
 {
     if (v > GALVO_MAX_VOLTS)

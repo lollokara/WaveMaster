@@ -476,6 +476,171 @@ draining, one newly allocated) can itself exceed this board's ~300KB
 heap - found the same way, via a real "out of memory" failure on
 hardware when re-issuing too early.
 
+**That `vTaskDelay(1)` yield was itself the cause of a very visible
+galvo stutter, found later on the oscilloscope and now fixed**: the
+"small amount of pacing jitter" above was wrong by an order of
+magnitude. `CONFIG_FREERTOS_HZ` is 100, so one tick is **10ms**, not the
+~1ms the fix assumed. On the default `M68` circle preview (24 vertices x
+20 subdivisions = 480 points/rep, 20us/point) that is a dead stop
+roughly twice per revolution, each one about as long as a whole
+revolution should take - clearly visible on CH1/CH2 of the scope as flat
+segments in the X/Y sine, and as the laser visibly jumping. Measured on
+hardware: a 19680-point burst that should run 394ms took **2290ms**,
+with 76 x 10ms = 760ms of that frozen at a single point.
+
+Fixed by removing the scheduler yield from the pacing loop entirely and
+handing the watchdog duty over for the duration of the burst instead:
+`paced_wdt_begin()` unsubscribes core 0's idle task from the TWDT and
+subscribes `dac_task`, which then feeds it with `esp_task_wdt_reset()` -
+a few microseconds, never blocks. Real watchdog protection is retained
+(a wedged `dac_task` still trips it) and the galvo never stops. Safe
+because `dac_task` is the only user task pinned to core 0 (`grbl_task`
+and `atmega_task` are both on core 1). Verified on hardware: the same
+burst now takes 1670ms with a clean, continuous sine on the scope, and a
+deliberately slow `--hz 5` run produces 9.46s bursts - nearly 2x the 5s
+TWDT timeout - with no watchdog trip.
+
+The same investigation showed the burst-duration figure `M68` logs was
+badly wrong, which had a second visible effect. It was computed from the
+commanded per-point delay only, ignoring the two SPI register writes per
+point that actually dominate at these rates, and printed in truncated
+whole seconds - so a burst that really ran 2.3s was logged as `~0s`.
+`tools/square_loop.py` parses exactly that number to decide when the
+point buffer has been freed, so its wait collapsed to 1.5s and most
+re-issues hit "M68: out of memory" and were dropped outright, parking
+the galvo for whole revolutions at a time (4 of 6 bursts lost in one
+observed 30s window). Fixed by reporting the duration in **ms** and
+including `dac_task_us_per_point()`, which is derived from the
+per-transaction throughput the boot speed test already measures rather
+than assumed. The estimate now tracks reality to within a few ms
+(predicted 1672ms vs actual 1670ms; predicted 9466ms vs actual 9460ms)
+and the out-of-memory drops are gone.
+
+Note the corollary: `M68 P<hz>` is an *upper bound* the hardware may not
+reach. The ~65us/point of SPI cost means the default `P100` really runs
+at about 25Hz. `M68` now logs both, e.g. `requested 100.0Hz, actual
+~24.5Hz (85us/point)`, rather than only the number that was asked for.
+
+**`M68` now loops on-device indefinitely instead of one burst per call,
+which removed both the remaining dead time and the out-of-memory class
+entirely.** Even with the duration estimate fixed, the host still had to
+re-issue `M68` for each burst, and the galvo parked for the whole
+round trip - measured at 1670ms of drawing followed by 1730ms of
+nothing, roughly a 50% duty cycle. The cause was that `M68` pre-built
+the *repeated* path: one repetition memcpy'd ~41 times into a single
+~160KB buffer, which is also why two coexisting bursts could exhaust the
+~300KB heap.
+
+Fixed by moving the repetition into `dac_task`: `laser_cmd.stream` gained
+a `repeats` field (0 = replay until another command is queued), so `M68`
+now builds exactly one revolution (~4KB, a 40x reduction) and
+`dac_task` replays it back-to-back with no gap. `tools/square_loop.py`
+correspondingly sends one `M68` and stops guessing at burst durations.
+The loop ends on the next queued command of any kind, checked between
+whole repetitions so an interrupted preview still finishes on a closed
+shape; abort latency is one repetition (~41ms typical, ~2.7s worst case
+for the largest/slowest shape `M68` will build). Verified on hardware:
+all three stop paths (a plain `G0`, `Ctrl-X`, `M63`/`M67`) end the loop
+and leave the board responsive, and one uninterrupted preview ran **2547
+consecutive revolutions (~104s)** with no watchdog trip and no memory
+growth.
+
+### Hardware-paced streaming: the requested rate is now actually achieved
+
+With the stutter and the gaps gone, what was left was that `M68 P100` still
+only ran at ~25Hz. Software pacing writes a point then busy-waits, so its
+floor is the cost of the write itself: measured at boot, **32.3us per
+single-channel register write, i.e. ~85us/point** for X+Y. A 100Hz preview
+of a 480-point shape needs 20.8us/point, four times faster than that path
+can ever go, no matter what delay is requested.
+
+The fix removes the CPU from the pacing loop entirely. In the AD3552R's
+streaming mode the address pointer loops every 6 bytes and the DAC updates
+its outputs as the bytes arrive, so one X+Y point is exactly **12 quad-mode
+SPI clock cycles** - which means *the SPI clock is the point rate*. Setting
+the clock to 12/T MHz makes the hardware emit points T microseconds apart,
+perfectly uniformly, with no per-point work at all. Bursts this long now go
+through the interrupt-driven SPI path (`IRQ_XFER_MIN_BYTES` in
+`no_os_spi_esp32.c`) rather than the polling one, so `dac_task` sleeps for
+the whole revolution instead of spinning - which also means the idle task
+runs normally and the watchdog needs no special handling on this path.
+
+ESP-IDF fixes the clock per device and offers no per-transaction override,
+so `ad3552r_esp32_spi_set_clock()` swaps the device (remove then re-add -
+never two at once, which is the configuration previously found to corrupt
+transfers). Measured on hardware:
+
+| requested | pacing | achieved |
+|---|---|---|
+| `P200` (10us/pt) | hardware | 9.90us/pt = **210.4Hz** |
+| `P100` (20us/pt) | hardware | 19.97us/pt = **104.3Hz** |
+| `P50` (41us/pt) | hardware | 40.96us/pt = 50.9Hz |
+| `P20` (104us/pt) | hardware | 104.35us/pt = 20.0Hz |
+| `P10` (208us/pt) | software | 208us/pt |
+| `P5` (416us/pt) | software | 417us/pt |
+| `P2` (1041us/pt) | software | 1041us/pt |
+
+Two bugs were found and fixed while measuring this, both worth recording:
+
+**Trusting a guessed minimum clock.** The first version rejected rates
+using a hand-picked `PACED_MIN_CLOCK_HZ` of 25kHz. The ESP32's divider
+actually bottoms out near **78kHz** (~154us/point), so `P5` engaged
+hardware pacing, got clamped, and silently drew the shape at 13.5Hz instead
+of 5 - **2.7x too fast**, with nothing reporting it. Replaced with an
+empirical check: set the clock, ask the driver what it actually produced
+(`spi_device_get_actual_freq`), and hand the job back for software pacing
+if it is more than 5% fast. No guessed constant, and it self-corrects on
+any other silicon.
+
+**Software pacing waited the full period on top of the write cost.** It
+slept `point_delay_us` *after* already spending ~65us writing, so every
+software-paced stream ran slow by that much - 273us/point against a 208us
+request. Now it waits the remainder (`point_delay_us -
+dac_task_us_per_point()`), which brought `P10`/`P5`/`P2` to 208/417/1041us
+against requests of 208/416/1041.
+
+**The remaining artefact, and why revolutions are batched.** Clocking is
+gapless *within* one transaction but not across one: each emit costs a bus
+acquire, a separate instruction/address phase and a release - ~33us in the
+boot-time streaming profile - during which the DAC holds its last value.
+Once per revolution that is a real step, and it was spotted on the scope as
+a notch in Y while X looked clean, purely because X happened to be at its
+peak (naturally flat) at the shape's start point while Y was on its steepest
+slope. Batching whole revolutions into one transaction
+(`PACED_BATCH_MAX_BYTES`, 16KB) divides how often it happens - 5
+revolutions per transaction for a typical 480-point shape, so every ~50ms
+instead of every ~10ms. Eliminating it entirely would need the transactions
+chained with CS held low so the stream never breaks; not done.
+
+### The X/Y "offset" on the scope is not a firmware bug
+
+Worth recording, since it looks alarming and was investigated: with both
+probes set to 10x, a 4mm circle shows both channels centred near **+1.4V**
+rather than 0V. Measured DC transfer function on X (`$100=0.4` V/mm,
+`$110=0` offset):
+
+| commanded | measured |
+|---|---|
+| -5 mm (-2.0 V) | 0.35 V |
+| 0 mm ( 0.0 V) | 1.40 V |
+| +5 mm (+2.0 V) | 2.35 V |
+| +25 mm (clamped +10 V) | +6.4 V |
+| -25 mm (clamped -10 V) | -3.7 V |
+
+That is exactly `Vout = 0.5 x Vcmd + 1.375` across the full +-10V command
+range, with no clipping - a clean linear transform, i.e. a 2:1 divider
+referenced to about +2.75V somewhere between the AD3552R and the test
+point. The DAC is genuinely in +-10V bipolar mode and the firmware's
+volts->code math is correct (0V -> code 32768, midscale).
+
+Critically it is **identical on both axes**: commanding `G0 X5 Y5` puts
+both channels on the same voltage, traces exactly overlapping. So there
+is no X-vs-Y offset. What looks like one on a circle is the 90 degree
+phase between X=cos and Y=sin, which is what a circle is. If the physical
+output needs to be centred on 0V for the galvo driver, that is a
+calibration job for `$110`/`$111` (and `$100`/`$101` for the 0.5x gain),
+not a code change.
+
 ### What's still not covered (honest gaps after this batch)
 
 - **Arcs don't go through the wobble/skywrite/pacing/motion-planner

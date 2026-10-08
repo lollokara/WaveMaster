@@ -78,6 +78,8 @@ int32_t no_os_spi_init(struct no_os_spi_desc **desc,
         free(d);
         return -EIO;
     }
+    d->clock_hz = param->max_speed_hz;
+    d->pins = *pins;
 
     /* A second (full-duplex) device on this bus was tried here to support
      * CRC-framed simultaneous tx+rx transfers, but merely having a second
@@ -108,6 +110,68 @@ void ad3552r_esp32_spi_set_lines(struct no_os_spi_desc *desc, uint8_t lines)
     desc->active_lines = lines;
 }
 
+int32_t ad3552r_esp32_spi_set_clock(struct no_os_spi_desc *desc, uint32_t hz)
+{
+    spi_device_interface_config_t dev_cfg = {
+        .clock_speed_hz = (int)hz,
+        .mode = (uint8_t)desc->init.mode,
+        .spics_io_num = desc->pins.cs,
+        .queue_size = 1,
+        .flags = SPI_DEVICE_HALFDUPLEX,
+        .pre_cb = pre_transfer_cb,
+    };
+    spi_device_handle_t dev = NULL;
+    esp_err_t err;
+
+    if (hz == 0 || hz == desc->clock_hz)
+        return 0;
+
+    /* Add the replacement only after dropping the old one: two devices
+     * coexisting on this bus is exactly the configuration that was found to
+     * corrupt transfers (see no_os_spi_init()). */
+    if (desc->spi_dev) {
+        err = spi_bus_remove_device((spi_device_handle_t)desc->spi_dev);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "spi_bus_remove_device failed: %s", esp_err_to_name(err));
+            return -EIO;
+        }
+        desc->spi_dev = NULL;
+    }
+
+    err = spi_bus_add_device(SPI2_HOST, &dev_cfg, &dev);
+    if (err != ESP_OK) {
+        /* Put the previous clock back rather than leaving the bus with no
+         * device at all - every later transfer would fail otherwise. */
+        ESP_LOGE(TAG, "spi_bus_add_device(%lu Hz) failed: %s, restoring %lu Hz",
+                 (unsigned long)hz, esp_err_to_name(err),
+                 (unsigned long)desc->clock_hz);
+        dev_cfg.clock_speed_hz = (int)desc->clock_hz;
+        if (spi_bus_add_device(SPI2_HOST, &dev_cfg, &dev) != ESP_OK) {
+            ESP_LOGE(TAG, "restoring the previous clock failed too - SPI is now unusable");
+            return -EIO;
+        }
+        desc->spi_dev = dev;
+        return -EIO;
+    }
+
+    desc->spi_dev = dev;
+    desc->clock_hz = hz;
+
+    return 0;
+}
+
+uint32_t ad3552r_esp32_spi_actual_hz(struct no_os_spi_desc *desc)
+{
+    int khz = 0;
+
+    if (!desc->spi_dev)
+        return 0;
+    if (spi_device_get_actual_freq((spi_device_handle_t)desc->spi_dev, &khz) != ESP_OK)
+        return 0;
+
+    return (uint32_t)khz * 1000u;
+}
+
 static uint32_t line_flags(uint8_t lines)
 {
     if (lines == 4)
@@ -127,7 +191,17 @@ static uint32_t line_flags(uint8_t lines)
  * dac_task has nothing else useful to do while a write is in flight
  * anyway. Measured effect on real hardware: see dac_task.c's boot-time
  * speed test result in the boot log.
+ *
+ * That tradeoff inverts once a transfer is long. A hardware-paced preview
+ * burst (ad3552r_board_paced_begin()) deliberately runs the clock slow
+ * enough that one transaction lasts a whole revolution - tens of
+ * milliseconds - and busy-waiting through that would starve every other
+ * task on this core and the idle-task watchdog with it. Above
+ * IRQ_XFER_MIN_BYTES the fixed ISR/semaphore cost is negligible next to
+ * the transfer itself, so those go through the interrupt-driven path and
+ * the task actually sleeps while the DAC is being clocked.
  */
+#define IRQ_XFER_MIN_BYTES 1024
 static int32_t do_transaction(struct no_os_spi_desc *desc, const uint8_t *tx,
                                uint8_t *rx, uint32_t len, uint8_t keep_cs)
 {
@@ -153,9 +227,12 @@ static int32_t do_transaction(struct no_os_spi_desc *desc, const uint8_t *tx,
     if (keep_cs)
         t.flags |= SPI_TRANS_CS_KEEP_ACTIVE;
 
-    err = spi_device_polling_transmit(dev, &t);
+    if (len >= IRQ_XFER_MIN_BYTES)
+        err = spi_device_transmit(dev, &t);
+    else
+        err = spi_device_polling_transmit(dev, &t);
     if (err != ESP_OK)
-        ESP_LOGE(TAG, "spi_device_polling_transmit failed: %s (len=%lu, flags=0x%lx)",
+        ESP_LOGE(TAG, "spi transmit failed: %s (len=%lu, flags=0x%lx)",
                  esp_err_to_name(err), (unsigned long)len, (unsigned long)t.flags);
     /* Always leave DIR back in host-drive state once the bus is idle,
      * so instruction phases of the *next* transfer always start correctly. */

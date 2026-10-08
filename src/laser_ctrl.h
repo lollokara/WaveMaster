@@ -57,6 +57,19 @@ struct laser_cmd {
              * which have no feed-rate target and want max speed instead. */
             bool paced;
             uint32_t point_delay_us;
+            /* How many times to replay this point buffer back-to-back
+             * (paced streams only; 1 for every other producer). 0 means
+             * "keep replaying until another command is queued" - what M68's
+             * preview loop uses.
+             *
+             * This exists so a repeating shape costs one repetition's worth
+             * of heap instead of the whole repeated path: M68 used to
+             * memcpy its outline ~41 times into a single ~160KB buffer, and
+             * two of those coexisting (one still draining, one just built)
+             * overflowed this board's ~300KB heap. Looping on this side
+             * also removes the dead time the host spent re-issuing M68
+             * between bursts, during which the galvo simply parked. */
+            uint32_t repeats;
         } stream;
     };
 };
@@ -73,6 +86,12 @@ bool laser_ctrl_submit(const struct laser_cmd *cmd);
 /* Called by the DAC task (core 0) to receive the next queued command,
  * blocking up to timeout_ms. Returns false on timeout. */
 bool laser_ctrl_next(struct laser_cmd *cmd, uint32_t timeout_ms);
+
+/* True if at least one command is waiting to be picked up. Lets a
+ * long-running command on the DAC task (an indefinitely repeating paced
+ * stream - see stream.repeats) notice that something newer has arrived and
+ * stop, without having to dequeue it first. */
+bool laser_ctrl_pending(void);
 
 /* Convert a machine-space coordinate (mm) to DAC output (volts) for both
  * axes together, applying (in order): the radial (F-theta field)

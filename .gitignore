@@ -1,3 +1,8 @@
 .pio
-build/
-managed_components/
+
+# Local MCP server config (e.g. rigol-mcp for the bench oscilloscope) -
+# machine-specific tooling, not part of the firmware.
+.mcp.json
+
+._*
+.DS_Store

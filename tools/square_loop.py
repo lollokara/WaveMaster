@@ -25,7 +25,6 @@ terminal, or a one-off pyserial script) before re-running this tool.
 """
 import argparse
 import math
-import re
 import sys
 import time
 
@@ -111,41 +110,25 @@ def main():
     for (x, y) in pts:
         send('G0 X%.4f Y%.4f' % (x, y))
 
+    # A single M68 loops indefinitely on-device: dac_task replays the
+    # outline buffer until another command is queued, so there is nothing
+    # to re-issue and no gap between revolutions. This used to be a
+    # re-issue loop that guessed from the logged burst duration when the
+    # point buffer had been freed; guessing wrong either dropped bursts
+    # with "out of memory" or left the galvo parked between them.
     print('Looping %s%s - Ctrl-C to stop.'
           % (args.shape, '' if args.seconds <= 0 else ' for ~%.0fs' % args.seconds))
+    print(send('M68 P%.1f' % args.hz, 0.5).strip())
+
     t_start = time.time()
     try:
-        while True:
-            resp = send('M68 P%.1f' % args.hz, 0.3)
-            print(resp.strip())
-
-            if args.seconds > 0 and (time.time() - t_start) >= args.seconds:
-                break
-
-            # M68 is bounded to one burst per call (see STATUS.md's "known
-            # limitation") - parse the logged duration and wait for it to
-            # actually finish before re-issuing. The log line fires as
-            # soon as the burst is *queued*, not once dac_task has
-            # actually drained it (~160KB for a 20000-point buffer) - re-
-            # issuing too early leaves the previous burst's buffer still
-            # allocated when the next one is built, and two of them
-            # together can exceed this board's ~300KB heap ("out of
-            # memory" - found the hard way). Wait a bit *longer* than the
-            # logged duration, not shorter, to be sure it's freed first.
-            # Generous margin: the logged duration doesn't account for
-            # dac_task's periodic scheduler-yield pauses during a paced
-            # burst (added to avoid starving the idle-task watchdog on
-            # long bursts - see dac_task.c), which can push the real
-            # duration well past the estimate.
-            m = re.search(r'~(\d+)s\)', resp)
-            burst_s = float(m.group(1)) if m else 2.0
-            time.sleep(burst_s * 1.5 + 1.5)
-
-            if args.seconds > 0 and (time.time() - t_start) >= args.seconds:
-                break
+        while args.seconds <= 0 or (time.time() - t_start) < args.seconds:
+            time.sleep(0.2)
     except KeyboardInterrupt:
         pass
     finally:
+        # Any command ends the on-device loop; these are also what restores
+        # the laser state, so no separate stop command is needed.
         print('\nStopping: guide laser off, preview mode off.')
         send('M63')
         send('M67')

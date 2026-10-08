@@ -1,6 +1,7 @@
 #include "grbl_task.h"
 #include "laser_ctrl.h"
 #include "laser_fill.h"
+#include "dac_task.h"
 #include "motion_planner.h"
 #include "calib.h"
 #include "atmega_link.h"
@@ -201,8 +202,10 @@ static void apply_engrave_intent(bool on)
  * LASER_CMD_STREAM. Takes ownership of xv/yv (frees them on the
  * single-point path; the queue consumer frees them on the stream path -
  * see dac_task.c). */
+/* repeats applies to paced streams only (see laser_ctrl.h): 1 for a normal
+ * one-shot run, 0 to loop the buffer until another command is queued. */
 static void submit_points(float *xv, float *yv, size_t n, bool gate_on_power,
-                           bool paced, uint32_t point_delay_us)
+                           bool paced, uint32_t point_delay_us, uint32_t repeats)
 {
     struct laser_cmd cmd;
 
@@ -225,6 +228,7 @@ static void submit_points(float *xv, float *yv, size_t n, bool gate_on_power,
     cmd.stream.n_points = n;
     cmd.stream.paced = paced;
     cmd.stream.point_delay_us = point_delay_us;
+    cmd.stream.repeats = repeats;
     if (!laser_ctrl_submit(&cmd)) {
         ESP_LOGW(TAG, "stream command dropped, queue full");
         free(xv);
@@ -314,7 +318,7 @@ static void submit_run(float x0, float y0, float x1, float y1, bool gate_on_powe
         float total_ms = (len / feed_mm_per_min) * 60000.0f;
         point_delay_us = (uint32_t)((total_ms * 1000.0f) / (float)n);
     }
-    submit_points(xv, yv, n, gate_on_power, paced, point_delay_us);
+    submit_points(xv, yv, n, gate_on_power, paced, point_delay_us, 1);
 }
 
 /*
@@ -432,7 +436,7 @@ static void motion_block_execute_cb(const struct motion_block_result *blk)
 
         if (pxv && pyv) {
             laser_ctrl_mm_to_volts(blk->x1_mm, blk->y1_mm, pxv, pyv);
-            submit_points(pxv, pyv, 1, blk->gate_on_power, false, 0);
+            submit_points(pxv, pyv, 1, blk->gate_on_power, false, 0, 1);
         } else {
             free(pxv);
             free(pyv);
@@ -532,7 +536,7 @@ static void motion_block_execute_cb(const struct motion_block_result *blk)
                 free(ys);
 
                 point_delay_us = (uint32_t)((total_time * 1.0e6f) / (float)n);
-                submit_points(xv, yv, n, blk->gate_on_power, true, point_delay_us);
+                submit_points(xv, yv, n, blk->gate_on_power, true, point_delay_us, 1);
             }
         }
     }
@@ -665,7 +669,7 @@ static void apply_arc(bool cw, bool have_x, float x, bool have_y, float y,
         s_pos_x_mm = target_x;
         s_pos_y_mm = target_y;
 
-        submit_points(xv, yv, (size_t)segments, false, false, 0);
+        submit_points(xv, yv, (size_t)segments, false, false, 0, 1);
     }
 }
 
@@ -753,18 +757,23 @@ static void generate_hatch_and_outline(void)
  * firmware's serial protocol is one G-code line per point, waiting for
  * "ok" each time (~5 moves/sec measured - see STATUS.md's "Serial
  * bandwidth" section) - nowhere near fast enough for a live preview
- * refresh rate. Pre-building the whole repeated-outline path as one big
- * point burst and pacing it entirely on-device (dac_task's existing
- * paced-stream mechanism, added earlier this session for feed-rate
- * pacing) sidesteps the serial bottleneck completely for this one
- * narrow use case. A general character-counting streaming protocol
- * would be the real, general-purpose fix (still not implemented - see
- * STATUS.md); this is a much smaller, immediately-useful one.
+ * refresh rate. Building the outline once and pacing it entirely
+ * on-device (dac_task's existing paced-stream mechanism, added earlier
+ * this session for feed-rate pacing) sidesteps the serial bottleneck
+ * completely for this one narrow use case. A general character-counting
+ * streaming protocol would be the real, general-purpose fix (still not
+ * implemented - see STATUS.md); this is a much smaller, immediately-
+ * useful one.
  *
- * Bounded to PREVIEW_MAX_POINTS total points per call - for a small
- * shape (e.g. a 4-corner square) at a reasonable refresh rate, that's
- * comfortably tens of seconds of looping in one burst; call M68 again
- * for another burst once it finishes.
+ * One call loops indefinitely: dac_task replays the buffer until another
+ * command is queued (see laser_ctrl.h's stream.repeats), so the preview
+ * is continuous and needs no host round-trip per revolution. It ends on
+ * the next command of any kind - a new G0, M63/M67, or Ctrl-X.
+ *
+ * PREVIEW_MAX_POINTS now bounds a single revolution rather than a whole
+ * burst, which is a far looser constraint: the heap cost is one
+ * repetition (~4KB for a typical shape), not the ~160KB the repeated
+ * path used to take.
  */
 static void preview_loop_outline(float hz)
 {
@@ -780,24 +789,25 @@ static void preview_loop_outline(float hz)
      * mirror's slew rate and this board's mechanics weren't characterized
      * ahead of time - raise it until the motion looks continuous. */
     size_t subdivisions = (size_t)calib_preview_edge_subdivisions();
-    size_t pts_per_rep;
-    size_t reps, n, i, k;
+    size_t n, i;
     float *xs, *ys;
     uint32_t point_delay_us;
 
     if (subdivisions < 1)
         subdivisions = 1;
-    pts_per_rep = s_fill_n * subdivisions;
+    n = s_fill_n * subdivisions;
 
     if (hz < 1.0f)
         hz = 1.0f;
     if (hz > 2000.0f)
         hz = 2000.0f;
 
-    reps = PREVIEW_MAX_POINTS / pts_per_rep;
-    if (reps < 1)
-        reps = 1;
-    n = reps * pts_per_rep;
+    if (n > PREVIEW_MAX_POINTS) {
+        ESP_LOGE(TAG, "M68: shape needs %u points (%u edges x %u subdivisions), "
+                 "over the %u limit - lower $190", (unsigned)n, (unsigned)s_fill_n,
+                 (unsigned)subdivisions, (unsigned)PREVIEW_MAX_POINTS);
+        return;
+    }
 
     xs = malloc(n * sizeof(float));
     ys = malloc(n * sizeof(float));
@@ -808,8 +818,12 @@ static void preview_loop_outline(float hz)
         return;
     }
 
-    /* Build one repetition's template (each edge linearly subdivided),
-     * then duplicate it `reps` times to fill the burst. */
+    /* Just one repetition of the outline (each edge linearly subdivided).
+     * dac_task replays this buffer itself - see laser_ctrl.h's
+     * stream.repeats. This used to memcpy the same points ~41 times into
+     * one ~160KB buffer, which both wasted heap (two coexisting bursts
+     * overflowed it) and forced the host to keep re-issuing M68, parking
+     * the galvo in the gap each time. */
     {
         size_t p = 0, j;
 
@@ -826,10 +840,6 @@ static void preview_loop_outline(float hz)
             }
         }
     }
-    for (k = 1; k < reps; k++) {
-        memcpy(&xs[k * pts_per_rep], xs, pts_per_rep * sizeof(float));
-        memcpy(&ys[k * pts_per_rep], ys, pts_per_rep * sizeof(float));
-    }
 
     /* Convert mm -> volts in place (xs[i]/ys[i]'s mm values are passed by
      * value into laser_ctrl_mm_to_volts() before it writes the volts
@@ -839,13 +849,25 @@ static void preview_loop_outline(float hz)
     for (i = 0; i < n; i++)
         laser_ctrl_mm_to_volts(xs[i], ys[i], &xs[i], &ys[i]);
 
-    point_delay_us = (uint32_t)((1.0e6f / hz) / (float)pts_per_rep);
-    submit_points(xs, ys, n, false, true, point_delay_us);
+    point_delay_us = (uint32_t)((1.0e6f / hz) / (float)n);
+
+    /* repeats = 0: dac_task replays this outline until another command is
+     * queued, so the preview runs continuously with no host round-trip and
+     * no gap between revolutions. It ends on the next command of any kind -
+     * a new G0, M63/M67, or Ctrl-X. */
+    submit_points(xs, ys, n, false, true, point_delay_us, 0);
+
+    /* Only what this side knows: the shape and what was asked for. Whether
+     * the request is actually achievable depends on which pacing path
+     * dac_task takes - the SPI clock paces it exactly when the rate is
+     * within the divider's range, otherwise it software-paces and bottoms
+     * out around dac_task_us_per_point(). dac_task logs the rate it really
+     * achieved once the run starts; guessing at it here would just risk
+     * printing a second, disagreeing number. */
     ESP_LOGI(TAG, "M68: looping a %u-point (%u edges x %u subdivisions) shape "
-             "%u times at %.1fHz (%u total points, ~%lus)",
-             (unsigned)pts_per_rep, (unsigned)s_fill_n,
-             (unsigned)subdivisions, (unsigned)reps, (double)hz,
-             (unsigned)n, (unsigned long)((uint64_t)n * point_delay_us / 1000000u));
+             "continuously at a requested %.1fHz (%luus/point)",
+             (unsigned)n, (unsigned)s_fill_n, (unsigned)subdivisions,
+             (double)hz, (unsigned long)point_delay_us);
 }
 
 /* Parses one G-code line (already NUL-terminated, no trailing CR/LF) and
