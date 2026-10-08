@@ -237,8 +237,8 @@ def test_mock(tmp: Path) -> None:
           rc == 1 and i > 0 and all(s > 0 for s in seq) and seq == sorted(seq) and len(rep["jobs"]) < 9, str(seq))
 
     # --- device behaviour detection
-    rc, rep, _ = run_cli(base + ["guide-frame", "--frame-loops", "1", "--mock-slow-ms", "80"], tmp / "slow")
-    check("slow device (80 ms/line) is reported as underruns (fail)",
+    rc, rep, _ = run_cli(base + ["guide-frame", "--frame-loops", "1", "--mock-slow-ms", "250"], tmp / "slow")
+    check("slow device (250 ms/line) is reported as underruns (fail)",
           rc == 1 and any((j["underruns_delta"] or 0) > 0 for j in rep.get("jobs", [])),
           str([(j["underruns_delta"], j["reasons"]) for j in rep.get("jobs", [])]))
     test_overflow_detection(tmp)

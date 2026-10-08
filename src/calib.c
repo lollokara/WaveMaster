@@ -176,13 +176,37 @@ int calib_set_param(int number, float value)
 
 static void fmt_value(char *buf, size_t len, int number, float v)
 {
-    /* Integral values print without decimals (GRBL style), others with up
-     * to 4 significant decimals - always plain numbers, since senders parse
-     * with \$(\d+)=([\d\.-]+). */
-    if (v == (float)(long)v && v < 1e9f && v > -1e9f)
+    /* Integral values print without decimals (GRBL style). Always plain
+     * numbers, never exponent form: senders parse \$(\d+)=([\d\.-]+). */
+    if (v == (float)(long)v && v < 1e9f && v > -1e9f) {
         snprintf(buf, len, "$%d=%ld\r\n", number, (long)v);
-    else
-        snprintf(buf, len, "$%d=%.4f\r\n", number, (double)v);
+    } else {
+        /* ~7 significant digits (what a float holds), trailing zeros
+         * trimmed. A fixed %.4f printed small values such as the radial k1
+         * (~1e-6) as 0.0000, losing the calibration on readback. */
+        float a = v < 0.0f ? -v : v;
+        int dec = 6;
+        char *p;
+        int n;
+
+        while (a >= 10.0f && dec > 0) {
+            a /= 10.0f;
+            dec--;
+        }
+        while (a < 1.0f && a > 0.0f && dec < 12) {
+            a *= 10.0f;
+            dec++;
+        }
+        n = snprintf(buf, len, "$%d=%.*f", number, dec, (double)v);
+        if (n > 0 && (size_t)n < len && dec > 0) {
+            p = buf + n - 1;
+            while (*p == '0')
+                *p-- = '\0';
+            if (*p == '.')
+                *p = '\0';
+        }
+        strncat(buf, "\r\n", len - strlen(buf) - 1);
+    }
 }
 
 void calib_dump(void (*write_line)(const char *line))

@@ -616,7 +616,12 @@ class RayforgeClient:
                     res.aborted, res.abort_reason = True, text
                     break
                 elif text.startswith("Grbl "):
-                    res.aborted, res.abort_reason = True, "device reset during job (banner)"
+                    # After our own 0x18 the banner is the expected answer;
+                    # the cancel thread may not have been seen yet by this
+                    # loop, so check the flag here too.
+                    reason = ("cancelled" if self._cancel_flag.is_set()
+                              else "device reset during job (banner)")
+                    res.aborted, res.abort_reason = True, reason
                     break
         finally:
             self.stop_polling()

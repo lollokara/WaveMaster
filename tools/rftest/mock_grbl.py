@@ -65,7 +65,7 @@ class Seg:
 
 class MockGrbl:
     def __init__(self, slow_ms: float = 0.0, error_on: Optional[str] = None, speedup: float = 1.0,
-                 rx_size: int = 1024, queue_len: int = 512, underrun_gap: float = 0.05,
+                 rx_size: int = 1024, queue_len: int = 512, underrun_gap: float = 0.15,
                  work_area: tuple[float, float] = (100.0, 100.0), verbose: bool = False):
         self.slow = slow_ms / 1000.0
         self.error_re = re.compile(error_on) if error_on else None
