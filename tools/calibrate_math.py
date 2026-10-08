@@ -348,6 +348,155 @@ def offset_update(s: Mapping[int, float], dx: float, dy: float) -> dict[int, flo
     return out
 
 
+# ------------------------------------------------------------ galvo range ----
+
+RANGE_LEVELS: tuple = (0.2, 0.4, 0.6, 0.7, 0.8, 0.9, 1.0)
+RANGE_FLOOR = 0.05          # a failed axis that never passed is drawn at this level (never a zero-width square)
+FULL_SCALE_V = 10.0
+
+
+def volts_to_mm(s: Mapping[int, float], v0: float, v1: float) -> tuple[float, float]:
+    """Inverse of galvo_transform() for k1 = 0, without the +-10 V clamp: DAC volts on channel 0 / 1 ->
+    machine mm.  mm = (V - offset) / scale, then undo swap, invert and origin (the forward order is
+    origin, invert, swap, scale, offset)."""
+    s0, s1 = s.get(100, 0.1), s.get(101, 0.1)
+    if s0 == 0 or s1 == 0:
+        raise CalibError("$100 / $101 must not be zero to convert volts to mm")
+    xp = (v0 - s.get(140, 0.0)) / s0
+    yp = (v1 - s.get(141, 0.0)) / s1
+    x, y = (yp, xp) if s.get(143, 0.0) else (xp, yp)           # undo the swap
+    inv = int(s.get(3, 0))
+    w, h = s.get(130, 100.0), s.get(131, 100.0)
+    ox, oy = (0.0, 0.0) if s.get(144, 0.0) else (w * 0.5, h * 0.5)
+    return x * (-1.0 if inv & 1 else 1.0) + ox, y * (-1.0 if inv & 2 else 1.0) + oy
+
+
+def axis_volts_to_mm(s: Mapping[int, float], axis: str, v: float) -> float:
+    """Commanded mm on `axis` ('x' / 'y') that puts voltage v on the DAC channel driving that axis ($143)."""
+    ch = channel_for_axis(axis, s.get(143, 0.0))
+    X, Y = volts_to_mm(s, v, 0.0) if ch == 0 else volts_to_mm(s, 0.0, v)
+    return X if axis == "x" else Y
+
+
+def parse_levels(text: str) -> tuple:
+    """"0.2,0.5,1" -> (0.2, 0.5, 1.0): fractions of full scale in (0, 1], sorted, unique."""
+    toks = [t for t in re.split(r"[,;\s]+", text.strip()) if t]
+    try:
+        vals = [float(t) for t in toks]
+    except ValueError:
+        vals = []
+    if not vals or any(not (0.0 < v <= 1.0) for v in vals):
+        raise CalibError("range levels must be fractions of full scale in (0, 1], e.g. 0.2,0.5,0.8,1.0")
+    return tuple(sorted(set(round(v, 6) for v in vals)))
+
+
+@dataclass
+class RangeSquare:
+    """A (rectangular) test pattern whose extreme corners sit at +-fx*10 V on the channel of axis X and
+    +-fy*10 V on the channel of axis Y.  corner_volts are the volts the transform really produces
+    (axis-x channel, axis-y channel) after the work-area clamp, so `limited` means the requested level
+    could not be reached with the current $130/$131."""
+    fx: float
+    fy: float
+    target: tuple[float, float]
+    corners_mm: list
+    corner_volts: list
+    centre_mm: tuple[float, float]
+    tick_mm: tuple
+    limited: bool = False
+
+    @property
+    def actual(self) -> tuple[float, float]:
+        return (max(abs(v[0]) for v in self.corner_volts), max(abs(v[1]) for v in self.corner_volts))
+
+
+def range_square(s: Mapping[int, float], fx: float, fy: float, tick_frac: float = 0.85) -> RangeSquare:
+    """Corners (-,-), (+,-), (+,+), (-,+) of the rectangle at +-fx*10 V (axis X) and +-fy*10 V (axis Y),
+    centred on the electrical centre (V = 0 on both channels, i.e. the offset is part of the position).
+    The mm come from volts_to_mm() and are clamped to the work area, as grbl.c does; the volts that result
+    are recomputed with the forward transform with k1 = 0 (the wizard sets $142 = 0 for this test).
+    `tick_mm` is a short mark from the middle of the +X side towards the centre: it tells the operator
+    which pair of sides is X, whatever the (not yet calibrated) orientation is."""
+    swap = s.get(143, 0.0)
+    cx, cy = channel_for_axis("x", swap), channel_for_axis("y", swap)
+    vx, vy = round(fx * FULL_SCALE_V, 9), round(fy * FULL_SCALE_V, 9)
+    x0, x1, y0, y1 = work_limits(s)
+
+    def X(v: float) -> float:
+        return clamp(axis_volts_to_mm(s, "x", v), x0, x1)
+
+    def Y(v: float) -> float:
+        return clamp(axis_volts_to_mm(s, "y", v), y0, y1)
+
+    corners = [(X(-vx), Y(-vy)), (X(vx), Y(-vy)), (X(vx), Y(vy)), (X(-vx), Y(vy))]
+    forward = dict(s)
+    forward[142] = 0.0
+    volts = []
+    for mx, my in corners:
+        v = galvo_transform(forward, mx, my, clamp_volts=False)
+        volts.append((v[cx], v[cy]))
+    sq = RangeSquare(fx, fy, (vx, vy), corners, volts, (X(0.0), Y(0.0)),
+                     ((X(vx), Y(0.0)), (X(tick_frac * vx), Y(0.0))))
+    ax, ay = sq.actual
+    sq.limited = ax < vx - 0.01 or ay < vy - 0.01
+    return sq
+
+
+class RangeLadder:
+    """Pure logic of the range search.  Each round draws a rectangle with the level of the ladder for
+    every axis that is still passing and the last good level for an axis that already failed.  Answers:
+    'ok' (all good), 'x' / 'y' (that axis' sides are wrong), 'both'.  A failed axis stays at its last
+    good level; the other one carries on up the ladder until it fails too or the ladder ends."""
+
+    def __init__(self, levels: Sequence[float] = RANGE_LEVELS, floor: float = RANGE_FLOOR):
+        self.levels = tuple(sorted(set(levels)))
+        self.floor = floor
+        self.i = 0
+        self.good = {"x": 0.0, "y": 0.0}
+        self.active = {"x": True, "y": True}
+        self.history: list[dict] = []
+
+    @property
+    def done(self) -> bool:
+        return self.i >= len(self.levels) or not any(self.active.values())
+
+    def next_test(self) -> tuple[float, float]:
+        f = self.levels[self.i]
+        return tuple(f if self.active[a] else max(self.good[a], self.floor) for a in ("x", "y"))  # type: ignore
+
+    def answer(self, ans: str) -> None:
+        if ans not in ("ok", "x", "y", "both"):
+            raise CalibError(f"unknown range answer {ans!r}")
+        fx, fy = self.next_test()
+        failing = {"x": ans in ("x", "both"), "y": ans in ("y", "both")}
+        for a, f in (("x", fx), ("y", fy)):
+            if self.active[a]:
+                if failing[a]:
+                    self.active[a] = False
+                else:
+                    self.good[a] = f
+        self.history.append({"level": self.levels[self.i], "fx": fx, "fy": fy, "answer": ans})
+        self.i += 1
+
+
+def suggest_work_area(vx: float, vy: float, scale_x: float, scale_y: float, margin_v: float = 0.5,
+                      offset_x: float = 0.0, offset_y: float = 0.0) -> tuple[float, float]:
+    """Work area (W, H) in mm for usable half-ranges vx / vy (volts on the channels driving physical X / Y):
+    W = 2 (vx - margin - |offset_x|) / |scale_x|.  The offset takes part because the mirror limit is on the
+    absolute DAC voltage while the field is centred on the offset.  Rounded DOWN to 0.1 mm and kept inside
+    the firmware range of $130 / $131."""
+    if scale_x == 0 or scale_y == 0:
+        raise CalibError("the scale must not be zero")
+
+    def one(v: float, sc: float, off: float) -> float:
+        half_v = v - margin_v - abs(off)
+        if half_v <= 0:
+            raise CalibError(f"usable range {v:g} V is not larger than margin + offset ({margin_v:g} + {abs(off):g} V)")
+        return clamp(math.floor(2.0 * half_v / abs(sc) * 10.0 + 1e-6) / 10.0, RANGES[130][0], RANGES[130][1])
+
+    return one(vx, scale_x, offset_x), one(vy, scale_y, offset_y)
+
+
 # ----------------------------------------------------------------- delays ---
 
 @dataclass

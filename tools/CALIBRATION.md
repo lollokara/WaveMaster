@@ -8,7 +8,9 @@ error went away. This document is the procedure behind it.
 ```bash
 pip install pyserial
 python3 tools/calibrate.py /dev/ttyACM0                   # guide laser only: safe, no emission
-python3 tools/calibrate.py /dev/ttyACM0 --fire --max-power 300   # also the real-laser steps
+python3 tools/calibrate.py /dev/ttyACM0 --fire --max-power 300   # also the real-laser steps (starts with focus)
+python3 tools/calibrate.py /dev/ttyACM0 --fire --step focus --focus-radius 5 --focus-power 150   # focal distance only
+python3 tools/calibrate.py /dev/ttyACM0 --step range --range-levels 0.5,0.8,1.0   # galvo range only (guide laser)
 python3 tools/calibrate.py /dev/ttyACM0 --step scale --step offset   # selected steps only
 python3 tools/calibrate.py /dev/ttyACM0 --restore tools/calibrate/runs/<ts>/settings_before.json
 python3 tools/calibrate.py --mock                          # rehearse offline (tools/rftest/mock_grbl.py)
@@ -38,14 +40,18 @@ if you change the lens or the distance.
 
 ## Safety
 
-* Only steps `delays` and `power` need `--fire`. For `scale`, `distortion`, `offset` and the
+* Only steps `focus`, `delays` and `power` need `--fire`. For `scale`, `distortion`, `offset` and the
   jump-speed part of `speed`, `--fire` lets you mark with the real laser; without it the same
   patterns are traced with the red guide laser (M66 preview, S0).
 * The same rules as `tools/rftest/run_tests.py`: `--fire` is required, `FIRE` must be typed
   once per session (`--yes` skips it and the frame question), every pattern is framed with the
   guide laser first, `M10` arms and `$S` must show `armed=1`, every `S` is capped at
   `--max-power` (default 300 of 1000), Ctrl-C or any error sends `0x18`, `M5`, `M9`, `M11`.
-* The laser is disarmed (`M11`) after every pattern so you can open the enclosure to look at the
+* `range` never fires: it uses the guide laser (`M66` preview, S0) only, and it changes `$130`, `$131` and
+  `$142` temporarily (see below); they are restored in a `finally` block, also after Ctrl-C.
+* `focus` arms once (`M10`) for the whole step and stays armed between bursts (nothing emits, `M5`)
+  so that you can change the height: keep hands out of the beam path; it disarms at the end.
+* Otherwise the laser is disarmed (`M11`) after every pattern so you can open the enclosure to look at the
   card. `--keep-armed` keeps it armed between patterns and at the end. Do not use it with the
   enclosure open.
 * Start with low `S`. The wizard asks for the mark power once (default `S100`). Use a power that
@@ -55,25 +61,37 @@ if you change the lens or the distance.
 ## Order of the steps, and why
 
 1. **connect** reads `$I`, `$$` and `$S`, and saves the backup. Nothing is changed.
-2. **field** sets the lens field (`$130`/`$131`), the origin mode (`$144`) and the laser PRR
-   (`$220`/`$221`). Everything after uses the field size to keep patterns inside the work area.
-3. **orientation** must come first. Scale, distortion and offset are computed per physical axis
+2. **focus** (needs `--fire`) comes first because everything optical depends on the working
+   height: the scale (V/mm), the distortion, the offset and the width of every mark are only valid
+   at the height where the laser is in focus. Change the height later and you must redo
+   `scale`, `distortion` and `offset`. It finds the focal distance; the result is a number for you
+   (a note in the report), not a firmware setting. Without `--fire` the step is skipped with a note.
+3. **range** (guide laser only) measures how far the galvos can deflect before the picture is
+   clipped, in volts per axis. It comes before `field` so that the field size can start from a value
+   the hardware really supports.
+4. **field** sets the lens field (`$130`/`$131`), the origin mode (`$144`) and the laser PRR
+   (`$220`/`$221`). If `range` has run (now or in an earlier run, from the state file) the
+   range-derived size is the default of the prompt. Everything after uses the field size to keep
+   patterns inside the work area.
+5. **orientation** must come before the geometry. Scale, distortion and offset are computed per physical axis
    (X to your right, Y away from you); they only make sense once commanded +X really moves the
    beam right and +Y away. It sets `$143` (swap) and `$3` (invert).
-4. **scale** next: a small square so that lens distortion is negligible, sets `$100`/`$101`.
-5. **distortion** needs the right scale, and fits the radial term `$142` (k1) plus the residual
-   centre scales. It uses a large square.
-6. **offset** last of the geometry: it only moves the whole picture, and it is measured at the
+6. **scale** next: a small square so that lens distortion is negligible, sets `$100`/`$101`.
+   When the range is known, the wizard then offers the matching `$130`/`$131` (the field in mm
+   changes with the scale).
+7. **distortion** needs the right scale, and fits the radial term `$142` (k1) plus the residual
+   centre scales. It uses a large square. It rescales too, so the work area is offered again.
+8. **offset** last of the geometry: it only moves the whole picture, and it is measured at the
    centre where distortion does not matter. A large offset error (more than about 1 mm) slightly
    biases the distortion fit, so after a big offset correction run `distortion` once more (its
    first pass should then already be within tolerance).
-7. **delays** after the geometry is right, because the marks are judged by eye on corners and
+9. **delays** after the geometry is right, because the marks are judged by eye on corners and
    short lines: `$210` laser-on, `$211` laser-off, `$212` jump, `$213` jump per mm, `$214` mark,
    `$215` polygon.
-8. **power** maps `S` onto the useful part of the laser power range (`$224`/`$225`).
-9. **speed** finds the highest marking speed with clean corners (`$110`) and the highest clean
-   jump speed (`$201`).
-10. **summary** lists all changes and the final `$$`.
+10. **power** maps `S` onto the useful part of the laser power range (`$224`/`$225`).
+11. **speed** finds the highest marking speed with clean corners (`$110`) and the highest clean
+    jump speed (`$201`).
+12. **summary** lists all changes and the final `$$`.
 
 ## Measuring: general rules
 
@@ -90,6 +108,83 @@ if you change the lens or the distance.
   correction, so a 0.05 mm reading error does not accumulate.
 
 ## Step by step
+
+### focus (real laser, `--fire`)
+
+Put a test card (anodized aluminium works best) on the work surface. The wizard asks:
+
+* circle radius in mm (default 5, `--focus-radius`);
+* `S` (default from `--focus-power`, otherwise the normal mark-power prompt; always capped at
+  `--max-power`; use a power that just marks the card, not one that burns it);
+* laps per burst (default 10): the same circle is marked that many times, which makes the line
+  width and brightness easy to judge;
+* marking speed (default `--feed`).
+
+It frames the circle's bounding box with the guide laser (confirm that it is on the card), arms once, and
+marks a burst. After each burst you decide:
+
+| Answer | Effect |
+|:---|:---|
+| Enter | mark another burst at the same spot (change the height first) |
+| `n` | next free spot on the card (circles never overlap; a full card asks you to swap it); it is framed again |
+| `h 162.5` | record the height you just used for this spot (any unit; `h` does not mark) |
+| `done` | end the loop |
+
+Typical use: set the head to a height, mark; `h <height>`; `n`; change the height by a fixed step (for
+example 0.5 mm); mark; and so on over a range of about +-5 mm around the lens's nominal focal distance.
+Then look at the circles with a loupe and say which spot looked best.
+
+**How to judge focus.** The best focus is the **thinnest** line and the **brightest** (cleanest, highest
+contrast) mark at the same power, with the **same width all the way around** the circle. Out of focus the line
+is wide and faint. A circle whose width differs between left/right or top/bottom points at a tilted card or
+head, not at the height. The width is smallest in a narrow band; take the middle of the band if two neighbouring
+spots look equal. The wizard stores spot, position, height label, power, radius and laps for every spot, and
+the best one as "best height" in `calibration_report.md` and in the state file (`focus_best_height`).
+
+Set the head to the best height and leave it there before `scale`.
+
+### range (guide laser only)
+
+Purpose: the **maximum deflection** the galvos can show correctly, as DAC volts per axis. The DAC gives
++-10 V (full scale); the galvo driver and mirror may follow less, for example if the driver input is limited
+or a mirror runs into its mechanical stop. The result bounds the field you can use.
+
+**Volts, not mm.** The mm scale (`$100`/`$101`, V per mm) is not calibrated yet at this point, and it does not
+matter here: the wizard converts each wanted voltage to the mm it has to command with the inverse of the
+firmware transform (`mm = (V - offset) / scale`, undoing swap, invert and origin), so the picture is
+defined by volts and the result does not depend on the scale. The firmware clamps targets to the work area, so
+the wizard temporarily sets `$130`/`$131` to `2 (10 V + |offset|) / |scale| + 2` mm (max 1000) and `$142` to 0 (no
+radial correction); the originals are written back at the end, also after Ctrl-C, and checked with a `$$`
+readback. The temporary values do not appear in the "settings changed" table.
+
+The wizard traces a rectangle centred on the electrical centre (0 V on both channels, i.e. the offset is part of the
+position) whose corners reach +-f x 10 V on each axis, for the levels f = 0.2, 0.4, 0.6, 0.7, 0.8, 0.9, 1.0
+(`--range-levels`). It prints the commanded corners and the actual corner voltages (they differ from the wish
+only when the work area cannot get big enough). A short **tick** is drawn from the middle of one side towards
+the centre: that side and its opposite are the **X sides**, the other pair the **Y sides**, whatever the (not
+yet calibrated) orientation is. The prompt:
+
+* `ok`: complete rectangle, straight edges, sharp corners;
+* `x`: the X sides are wrong; `y`: the Y sides; `both`; `again`: draw it again.
+
+**How to judge range.** Failure looks like: a **corner cut off or rounded** (the beam stops short, both sides
+meeting there are flattened), a **side flattened** into a bulge or squashed against a limit, lines bunched up
+at an edge, or a **mirror buzzing, chattering or hitting its stop** (listen). Do not accept a rectangle just
+because it is big; check that the sides are straight and the corners meet.
+
+An axis that fails stops increasing and keeps its last good level; the other axis goes on with
+rectangles. When f = 1.0 passes on an axis the wizard warns that the DAC, not the galvo, limits the range.
+Result: `V_x = f_x x 10`, `V_y = f_y x 10` (half-range, each belonging to the DAC channel that drives that axis
+under `$143`), stored in the state file (`range_volts_x`, `range_volts_y`, and per channel with the `$143` in
+force) and in the report. Then the suggested work area is shown and you can apply it:
+
+    W = 2 (V_x - margin - |offset_x|) / |scale_x|,   H = 2 (V_y - margin - |offset_y|) / |scale_y|
+
+with the margin `--range-margin-v` (default 0.5 V), rounded down to 0.1 mm. The scale is whatever is
+set now, so after `scale` and `distortion` the wizard offers the recomputed `$130`/`$131` ("the field in mm
+changed because the scale changed"). If you run `range` after `orientation` the axis labels are the real
+ones; before it, the tick tells you which side pair is which, and the channel that clipped is what is
+remembered, so a later change of `$143` does not mix the two axes up.
 
 ### orientation (guide laser)
 
@@ -229,6 +324,11 @@ decimals. Answering `q` during a run also offers the restore.
 | `link=0` warning | ATmega not answering: UART0 (GPIO 44 TX / 43 RX), level shifter, 250000 baud, companion firmware. Guide steps still work. |
 | Guide pattern is not visible | Guide laser off or misaligned: `M62` then `M63` from a console; check `$S guide=1` while tracing. Wait until the paper is at focal height. |
 | "M66 sent but $S does not report guide=1" | The ATmega did not switch the guide laser. See above. |
+| Focus circles are wide everywhere | Not in focus at any tested height: widen the height range, or check the lens and the power (too much power widens the mark). |
+| Focus circles differ in width around the circle | The card or the head is tilted; level the card first. |
+| Range: the first level (0.2) already fails | Galvo driver not enabled or its input range is tiny; check the driver and the DAC wiring, run `$RB`. |
+| Range: "limited by the work area" | The scale is very small (V/mm), the rectangle would need more than 1000 mm; set `$100`/`$101` closer to the truth first, then repeat. |
+| Range: "COULD NOT RESTORE" | The link broke during the step. Type the printed `$130=... $131=... $142=...` lines or use `--restore`. |
 | Orientation says "same axis" | Both arrows moved along one line: one galvo channel is dead or both DAC channels drive one mirror. Test with `$RB` and `tools/jog.py`. |
 | Scale will not converge below 0.1 % | Card not flat or not at the focal plane; marks too wide (lower power, better focus); lens distortion (run `distortion`). |
 | Distortion rounds keep alternating sign | Measurement noise: use the loupe and measure centres; or the square is bigger than the usable field. |

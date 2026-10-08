@@ -7,12 +7,16 @@ Offline self-test for the calibration wizard (no hardware, no pytest).
 Part 1  pure math (tools/calibrate_math.py): parsing, orientation solve for all 8 axis combinations
         (x 8 hidden galvo wirings x scale signs) round-tripped through a Python reimplementation of
         galvo_out.c, offset sign derivation, scale/distortion fits, delay bisection, card allocator.
+        Also: volts -> mm inversion (round trip through the forward transform), the range ladder, the
+        work-area suggestion from the galvo range.
 Part 2  pattern builders stay inside the work area (both origin modes).
 Part 3  scripted end-to-end runs of the real wizard against tools/rftest/mock_grbl.py.  A fake
         physical system (hidden true scale error, galvo wiring, F-theta distortion, mirror offset,
         laser/jump delay optima, power threshold, speed limits) computes what an operator would
         measure from the pattern the wizard just drew, using the mock's CURRENT $ settings, so
         convergence of the real loop is tested.
+        The `range` and `focus` steps run against a simulated galvo with a range limit per DAC channel
+        (X channel clips above 7.3 V, Y above 8.6 V) and check the temporary $130/$131/$142 are restored.
 Exit status 0 = everything passed.
 """
 from __future__ import annotations
@@ -64,8 +68,10 @@ class Hidden:
     mm, F-theta distortion d (physical = pos (1 + d |pos|^2)) and the voltage of the reference
     mark (mirror offset)."""
 
-    def __init__(self, axes=("x", "y"), signs=(1, 1), T=(0.1, 0.1), d=0.0, v0=(0.0, 0.0)):
+    def __init__(self, axes=("x", "y"), signs=(1, 1), T=(0.1, 0.1), d=0.0, v0=(0.0, 0.0),
+                 limit_v=(math.inf, math.inf)):
         self.axes, self.signs, self.T, self.d, self.v0 = axes, signs, T, d, v0
+        self.limit_v = limit_v            # |V| above which DAC channel 0 / 1 clips (galvo range)
 
     def phys(self, settings, x: float, y: float) -> tuple[float, float]:
         v = cm.galvo_transform(settings, x, y)
@@ -308,6 +314,102 @@ def test_delays_misc() -> None:
     check("transform: invert, then swap, then scale, then offset", abs(v[0] - 4.5) < 1e-9 and abs(v[1] + 1.5) < 1e-9, str(v))
 
 
+def test_range_math() -> None:
+    print("volts -> mm inversion, range ladder, work-area suggestion")
+    rng = random.Random(11)
+    worst = 0.0
+    n = 0
+    for swap in (0, 1):
+        for inv in range(4):
+            for origin in (0, 1):
+                for sg in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
+                    s = base_settings({143: swap, 3: inv, 144: origin, 130: 137.0, 131: 91.5,
+                                       100: 0.0987 * sg[0], 101: 0.0813 * sg[1],
+                                       140: rng.uniform(-0.6, 0.6), 141: rng.uniform(-0.6, 0.6)})
+                    for _ in range(5):
+                        v = (rng.uniform(-10, 10), rng.uniform(-10, 10))
+                        X, Y = cm.volts_to_mm(s, *v)
+                        back = cm.galvo_transform(s, X, Y, clamp_volts=False)
+                        worst = max(worst, abs(back[0] - v[0]), abs(back[1] - v[1]))
+                        n += 1
+                        for axis in ("x", "y"):
+                            ch = cm.channel_for_axis(axis, swap)
+                            m = cm.axis_volts_to_mm(s, axis, v[ch])
+                            other = rng.uniform(0, 100)
+                            got = cm.galvo_transform(s, m if axis == "x" else other, other if axis == "x" else m,
+                                                     clamp_volts=False)[ch]
+                            worst = max(worst, abs(got - v[ch]))
+    check(f"{n} round trips (8 swap/invert combos x both origins x scale signs, offsets != 0)", worst < 1e-9 and n == 8 * 2 * 4 * 5,
+          f"worst={worst:.2e}")
+    check("zero scale rejected", raises(lambda: cm.volts_to_mm({100: 0.0, 101: 0.1}, 1, 1)))
+
+    # rectangle corners hit +-f*10 V on the channel of each axis, centred on V = 0
+    ok = True
+    for swap in (0, 1):
+        for inv in range(4):
+            for origin in (0, 1):
+                s = base_settings({143: swap, 3: inv, 144: origin, 130: 300.0, 131: 300.0, 100: -0.1, 101: 0.12,
+                                   140: 0.3, 141: -0.2})
+                sq = cm.range_square(s, 0.7, 0.4)
+                cx = cm.channel_for_axis("x", swap)
+                good = [(abs(abs(a) - 7.0) < 1e-9 and abs(abs(b) - 4.0) < 1e-9) for a, b in sq.corner_volts]
+                cv = cm.galvo_transform(s, *sq.centre_mm, clamp_volts=False)
+                ok &= all(good) and abs(cv[0]) < 1e-9 and abs(cv[1]) < 1e-9 and not sq.limited
+                # sign pattern (-,-),(+,-),(+,+),(-,+) on (axis-x channel, axis-y channel)
+                ok &= [(a > 0, b > 0) for a, b in sq.corner_volts] == [(False, False), (True, False), (True, True), (False, True)]
+                ok &= cx == (1 if swap else 0)
+    check("range_square: corners at +-7 V (X channel) / +-4 V (Y channel), centre at 0 V, all swap/invert/origin combos", ok)
+    s = base_settings({130: 100.0, 131: 100.0, 144: 0, 140: 0.4})
+    sq = cm.range_square(s, 1.0, 1.0)
+    ax, ay = sq.actual
+    check("range_square: work-area clamp reduces the reached volts and is reported (limited)",
+          sq.limited and ax < 10.0 and abs(ay - 5.0) < 1e-9 and all(0 <= m[0] <= 100 and 0 <= m[1] <= 100 for m in sq.corners_mm),
+          f"actual={sq.actual}")
+    check("range levels parsing", cm.parse_levels("0.5, 1;0.25") == (0.25, 0.5, 1.0) and raises(lambda: cm.parse_levels("1.2"))
+          and raises(lambda: cm.parse_levels("0")) and raises(lambda: cm.parse_levels("a,b")) and raises(lambda: cm.parse_levels("")))
+
+    # ladder: per-axis stop and rectangle continuation
+    def run_ladder(lim_x: float, lim_y: float, levels=cm.RANGE_LEVELS):
+        lad = cm.RangeLadder(levels)
+        asked = []
+        while not lad.done:
+            fx, fy = lad.next_test()
+            asked.append((fx, fy))
+            bx, by = fx * 10 > lim_x + 1e-9, fy * 10 > lim_y + 1e-9
+            lad.answer("both" if bx and by else "x" if bx else "y" if by else "ok")
+        return lad, asked
+    lad, asked = run_ladder(7.3, 8.6)
+    check("ladder: X stops at 0.7, Y at 0.8", lad.good == {"x": 0.7, "y": 0.8}, str(lad.good))
+    check("ladder: after X failed at 0.8 the rectangle keeps X at 0.7 and Y goes on to 0.9",
+          asked[-2:] == [(0.8, 0.8), (0.7, 0.9)] and len(asked) == 6, str(asked))
+    lad, asked = run_ladder(99, 99)
+    check("ladder: nothing fails -> 1.0 on both, every level tested once", lad.good == {"x": 1.0, "y": 1.0} and len(asked) == 7
+          and lad.done)
+    lad, asked = run_ladder(7.3, 99)
+    check("ladder: only X fails -> Y runs to 1.0 with a rectangle", lad.good == {"x": 0.7, "y": 1.0} and asked[-1] == (0.7, 1.0))
+    lad, asked = run_ladder(1.0, 99)
+    check("ladder: X fails at the first level -> good 0, drawn at the floor, Y goes on",
+          lad.good["x"] == 0.0 and lad.good["y"] == 1.0 and asked[1][0] == cm.RANGE_FLOOR, str(asked[:2]))
+    lad, asked = run_ladder(1.0, 1.0)
+    check("ladder: both fail at once -> stops after one round", lad.good == {"x": 0.0, "y": 0.0} and len(asked) == 1)
+    lad, _ = run_ladder(6.2, 4.4, (0.5, 1.0))
+    check("ladder: custom levels", lad.good == {"x": 0.5, "y": 0.0}, str(lad.good))
+    check("ladder rejects unknown answers", raises(lambda: cm.RangeLadder().answer("maybe")))
+
+    # work area from the range
+    check("suggest: 2 (V - 0.5) / |scale|: 7 V -> 130 mm, 8 V -> 150 mm at 0.1 V/mm",
+          cm.suggest_work_area(7.0, 8.0, 0.1, 0.1) == (130.0, 150.0), str(cm.suggest_work_area(7.0, 8.0, 0.1, 0.1)))
+    check("suggest: negative scale and own margin", cm.suggest_work_area(7.0, 8.0, -0.1, -0.1, 1.0) == (120.0, 140.0))
+    check("suggest: the offset takes part", cm.suggest_work_area(7.0, 8.0, 0.1, 0.1, 0.5, 0.3, -0.2) == (124.0, 146.0),
+          str(cm.suggest_work_area(7.0, 8.0, 0.1, 0.1, 0.5, 0.3, -0.2)))
+    check("suggest: rounded down to 0.1 mm, capped at 1000", cm.suggest_work_area(10, 10, 0.0957, 0.0001) == (198.5, 1000.0)
+          and raises(lambda: cm.suggest_work_area(0.4, 8, 0.1, 0.1)) and raises(lambda: cm.suggest_work_area(7, 8, 0, 0.1)))
+    w0 = cm.suggest_work_area(7.0, 8.0, 0.1, 0.1)
+    w1 = cm.suggest_work_area(7.0, 8.0, 0.0957, 0.1043)
+    check("post-scale re-suggestion follows the new scale (smaller scale -> bigger field)",
+          w1 == (135.8, 143.8) and w1[0] > w0[0] and w1[1] < w0[1], str(w1))
+
+
 # ------------------------------------------------------------------ part 2
 
 def test_patterns() -> None:
@@ -354,6 +456,7 @@ class FwMock(MockGrbl):
     link = 1
     ever_armed = False
     ever_fired = False
+    arm_count = 0
 
     def _dollar(self, line, gen):
         if line.rstrip() == "$$":
@@ -364,7 +467,17 @@ class FwMock(MockGrbl):
     def _mcode(self, m):
         if m == 10:
             self.ever_armed = True
+            self.arm_count += 1
         super()._mcode(m)
+
+    def _clamp(self, x, y):
+        """grbl.c: targets are clamped to the work area of the CURRENT $130/$131/$144 (the base mock keeps
+        the work area it was created with)."""
+        x0, x1, y0, y1 = cm.work_limits(self.settings)
+        cx, cy = min(max(x, x0), x1), min(max(y, y0), y1)
+        if (cx, cy) != (x, y):
+            self.clamped += 1
+        return cx, cy
 
     def _stats_text(self):
         return super()._stats_text().replace("link=1", f"link={self.link}")
@@ -380,7 +493,9 @@ class Bench:
 
     def __init__(self, mock: FwMock, hidden: Hidden, quant: float = 0.01, true_delays=None, true_power=(12.0, 45.0),
                  max_clean_feed_mm_s: float = 1000.0, max_clean_jump: float = 5000.0, fire: bool = True,
-                 inject: dict | None = None, raise_on: dict | None = None):
+                 inject: dict | None = None, raise_on: dict | None = None, raise_nth: dict | None = None,
+                 apply_range: bool = False, focus_script: list | None = None, focus_best: str = "1",
+                 field_blank: bool = False):
         self.mock, self.h, self.quant = mock, hidden, quant
         self.true = true_delays or {210: 150.0, 211: 60.0, 212: 500.0, 213: 3.0, 214: 140.0, 215: 40.0}
         self.tol = 15.0
@@ -389,7 +504,14 @@ class Bench:
         self.fire = fire
         self.inject = inject or {}            # key -> list of canned answers served first
         self.raise_on = raise_on or {}        # key -> exception class
+        self.raise_nth = raise_nth or {}      # key -> (n, exception class): raised on the n-th question with that key
+        self.apply_range = apply_range
+        self.focus_script = list(focus_script) if focus_script is not None else None
+        self.focus_best = focus_best
+        self.field_blank = field_blank
         self.log: list[tuple[str, str]] = []
+        self.defaults: dict[str, str | None] = {}
+        self.clamp_seen = 0
         self.count = 0
 
     def S(self):
@@ -404,6 +526,9 @@ class Bench:
         return (f"{v:.2f}".replace(".", ",")) if self.count % 3 == 0 else f"{v:.2f}"
 
     def ask(self, q: cal.Question) -> str:
+        self.defaults[q.key] = q.default
+        if q.key != "range_ok":
+            self.clamp_seen = self.mock.clamped
         ans = self._answer(q)
         self.log.append((q.key, ans))
         return ans
@@ -412,6 +537,10 @@ class Bench:
         k = q.key
         if k in self.raise_on:
             raise self.raise_on[k]()
+        if k in self.raise_nth:
+            n_, exc = self.raise_nth[k]
+            if [x for x, _ in self.log].count(k) + 1 == n_:
+                raise exc()
         if self.inject.get(k):
             return self.inject[k].pop(0)
         pat = q.meta.get("pattern")
@@ -428,7 +557,28 @@ class Bench:
         if k == "card_full":
             return ""
         if k in ("field_w", "field_h"):
-            return "100"
+            return "" if self.field_blank else "100"
+        if k in ("range_apply", "range_reapply"):
+            return "y" if self.apply_range else "n"
+        if k == "range_ok":
+            # what the operator sees: a rectangle whose side pair clips when the voltage on that DAC channel
+            # exceeds the galvo limit; sides flattened by the work-area clamp count as wrong on both axes
+            sq = pat.meta["square"]
+            if self.mock.clamped != self.clamp_seen:
+                return "both"
+            vmax = [0.0, 0.0]
+            for X, Y in sq.corners_mm:
+                v = cm.galvo_transform(S, X, Y, clamp_volts=False)
+                vmax = [max(vmax[0], abs(v[0])), max(vmax[1], abs(v[1]))]
+            cx, cy = cm.channel_for_axis("x", S[143]), cm.channel_for_axis("y", S[143])
+            bx, by = vmax[cx] > self.h.limit_v[cx] + 1e-9, vmax[cy] > self.h.limit_v[cy] + 1e-9
+            return "both" if bx and by else "x" if bx else "y" if by else "ok"
+        if k in ("focus_radius", "focus_power", "focus_laps", "focus_feed", "focus_best_height"):
+            return ""
+        if k == "focus_next":
+            return self.focus_script.pop(0) if self.focus_script else "done"
+        if k == "focus_best":
+            return self.focus_best
         if k == "origin":
             return "0"
         if k == "prr_hz":
@@ -657,6 +807,168 @@ def test_e2e_safety(tmp: Path) -> None:
     check("'s' skips the step without changes", code == 0 and mock.settings[100] == 0.1 and "skipped" in text)
 
 
+def report_json(out: Path, step: str) -> dict:
+    """The JSON block of one step in calibration_report.md."""
+    text = (out / "calibration_report.md").read_text()
+    m = re.search(rf"### {step}\n\n```json\n(.*?)\n```", text, re.S)
+    return json.loads(m.group(1)) if m else {}
+
+
+def test_e2e_range(tmp: Path) -> None:
+    print("end to end: range (guide laser only; X channel clips above 7.3 V, Y channel above 8.6 V)")
+    orig = {130: 97.5, 131: 80.0, 142: 0.0003}
+
+    # 1. plain run: levels, restore, state, never fired
+    h = Hidden(("x", "y"), (1, 1), T=(0.1, 0.1), limit_v=(7.3, 8.6))
+    code, mock, bench, out, text = run_wizard(tmp, "range", h, ["--step", "range"], settings=dict(orig))
+    rj = report_json(out, "range")
+    check("range: exit 0, found X 0.7 and Y 0.8 -> +-7 V / +-8 V", code == 0 and rj.get("f_x") == 0.7 and rj.get("f_y") == 0.8
+          and rj.get("range_volts_x") == 7.0 and rj.get("range_volts_y") == 8.0, f"code={code} {rj.get('f_x')} {rj.get('f_y')} {text[-300:]}")
+    check("range: $130/$131/$142 restored exactly (and verified)", all(mock.settings[n] == v for n, v in orig.items())
+          and "verified by $$ readback" in text, str({n: mock.settings[n] for n in orig}))
+    check("range: temporary work area was 2*(10+|offset|)/|scale|+2 = 202 mm and $142 was 0 during the test",
+          rj.get("temporary") == {"130": 202.0, "131": 202.0}, str(rj.get("temporary")))
+    hist = rj.get("history", [])
+    check("range: 6 rectangles; after X failed at 0.8 X stays at 0.7 and Y continues to 0.9",
+          len(hist) == 6 and hist[-2]["answer"] == "x" and (hist[-1]["fx"], hist[-1]["fy"]) == (0.7, 0.9)
+          and hist[-1]["answer"] == "y", str(hist))
+    check("range: nothing was clamped by the work area, laser never armed or fired, guide off",
+          mock.clamped == 0 and not mock.ever_armed and not mock.ever_fired and not mock.guide and not mock.violations,
+          f"clamped={mock.clamped}")
+    check("range: suggestion W = 2 (7 - 0.5) / 0.1 = 130, H = 150; not applied (operator said no)",
+          rj.get("suggested", {}).get("W") == 130.0 and rj.get("suggested", {}).get("H") == 150.0
+          and rj.get("applied") is False and mock.settings[130] == 97.5)
+    st = json.loads((tmp / "range_state.json").read_text())
+    check("range: state JSON has range_volts_x / y", st.get("range_volts_x") == 7.0 and st.get("range_volts_y") == 8.0
+          and st.get("range_volts_ch") == [7.0, 8.0], str(st))
+    rep = (out / "calibration_report.md").read_text()
+    check("range: report has the Range section and no 'settings changed' entry for the temporary values",
+          "## Range" in rep and "X +-7 V, Y +-8 V" in rep and "| range |" not in rep)
+
+    # 2. swapped, inverted, centred origin, different scales: the limit follows the CHANNEL
+    h2 = Hidden(("y", "x"), (1, -1), T=(0.1, 0.08), limit_v=(7.3, 8.6))
+    set2 = {143: 1, 3: 2, 144: 1, 100: 0.1, 101: 0.08, 140: 0.25, 141: -0.15, 130: 100.0, 131: 100.0}
+    code, mock, bench, out, text = run_wizard(tmp, "range_swap", h2, ["--step", "range"], settings=dict(set2))
+    rj = report_json(out, "range")
+    check("range swap: X is driven by channel 1 (8.6 V -> 0.8), Y by channel 0 (7.3 V -> 0.7)",
+          code == 0 and rj.get("f_x") == 0.8 and rj.get("f_y") == 0.7 and rj.get("channel_x") == 1, f"{rj} {text[-200:]}")
+    want = cm.suggest_work_area(8.0, 7.0, 0.08, 0.1, 0.5, -0.15, 0.25)
+    sug = rj.get("suggested", {})
+    check("range swap: suggestion uses the scale and offset of the channel that drives each axis",
+          (sug.get("W"), sug.get("H")) == want, f"{sug} want {want}")
+    check("range swap: temporary work area 2*(10+|off|)/|scale|+2 with the right scale per axis, then restored",
+          abs(rj["temporary"]["130"] - math.ceil((2 * 10.15 / 0.08 + 2) * 10) / 10) < 1e-9
+          and abs(rj["temporary"]["131"] - math.ceil((2 * 10.25 / 0.1 + 2) * 10) / 10) < 1e-9
+          and all(mock.settings[n] == v for n, v in set2.items()) and mock.clamped == 0, str(rj.get("temporary")))
+    st = json.loads((tmp / "range_swap_state.json").read_text())
+    check("range swap: state keeps per-channel volts and the swap in force", st["range_volts_ch"] == [7.0, 8.0]
+          and st["range_swap"] == 1 and st["range_volts_x"] == 8.0 and st["range_volts_y"] == 7.0, str(st))
+
+    # 3. --range-levels
+    code, mock, bench, out, text = run_wizard(tmp, "range_lv", h, ["--step", "range", "--range-levels", "0.5,1.0"],
+                                              settings=dict(orig))
+    rj = report_json(out, "range")
+    check("--range-levels 0.5,1.0: X 0.5, Y 0.5 (both fail at 1.0), two rectangles",
+          code == 0 and rj.get("f_x") == 0.5 and rj.get("f_y") == 0.5 and len(rj["history"]) == 2, str(rj.get("history")))
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        bad = raises(lambda: cal.build_parser().parse_args(["--mock", "--range-levels", "0.5,2"]), SystemExit)
+    check("--range-levels with a value above 1 is rejected", bad and "fractions" in err.getvalue())
+
+    # 4. nothing fails: warning, DAC limit
+    code, mock, bench, out, text = run_wizard(tmp, "range_full", Hidden(("x", "y"), (1, 1), T=(0.1, 0.1)),
+                                              ["--step", "range"], settings=dict(orig))
+    rj = report_json(out, "range")
+    check("range: full +-10 V passes -> warning that the DAC limits the range",
+          rj.get("f_x") == 1.0 and rj.get("f_y") == 1.0 and "the DAC, not the galvo, limits the range" in text
+          and mock.settings[130] == 97.5, text[-300:])
+
+    # 5. Ctrl-C in the middle of the step
+    code, mock, bench, out, text = run_wizard(tmp, "range_ctrlc", h, ["--step", "range"], settings=dict(orig),
+                                              raise_nth={"range_ok": (3, KeyboardInterrupt)})
+    log = (out / "session.log").read_text()
+    check("range Ctrl-C: exit 130, cancel sequence, $130/$131/$142 restored exactly, guide off, disarmed",
+          code == 130 and "<0x18>" in log and all(mock.settings[n] == v for n, v in orig.items()) and not mock.guide
+          and not mock.armed, f"code={code} " + str({n: mock.settings[n] for n in orig}))
+    check("range Ctrl-C: restore verified by readback and no temporary entries in the changes",
+          "verified by $$ readback" in text and "| range |" not in (out / "calibration_report.md").read_text())
+
+    # 6. the field step offers the range-derived size as its default; apply, then scale re-suggests
+    code, mock, bench, out, text = run_wizard(tmp, "range_field", h, ["--step", "range", "--step", "field"],
+                                              settings=dict(orig), field_blank=True)
+    check("field default = range suggestion 130 x 150", bench.defaults.get("field_w") == "130"
+          and bench.defaults.get("field_h") == "150" and mock.settings[130] == 130 and mock.settings[131] == 150,
+          f"{bench.defaults.get('field_w')} {bench.defaults.get('field_h')} {mock.settings[130]}")
+    h3 = Hidden(("x", "y"), (1, 1), T=(0.0952, 0.1), limit_v=(7.3, 8.6))
+    code, mock, bench, out, text = run_wizard(tmp, "range_scale", h3, ["--step", "range", "--step", "scale"],
+                                              settings={130: 100.0, 131: 100.0}, apply_range=True)
+    s = mock.settings
+    wx, wy = cm.suggest_work_area(7.0, 8.0, s[100], s[101])
+    check("range apply, then after 'scale' the field is re-suggested for the new scale (0.1 -> 0.0952 V/mm)",
+          code == 0 and abs(s[100] / 0.0952 - 1) < 0.003 and (s[130], s[131]) == (wx, wy) and s[130] != 130.0
+          and "range_reapply" in [k for k, _ in bench.log], f"{s[100]} {s[130]} {s[131]} want {wx} {wy}")
+
+
+def test_e2e_focus(tmp: Path) -> None:
+    print("end to end: focus (real laser, bursts of circles, spots, heights)")
+    h = Hidden(("x", "y"), (1, 1), T=(0.1, 0.1))
+    script = ["h 160", "n", "h 162,5", "", "h 163", "done"]
+    code, mock, bench, out, text = run_wizard(tmp, "focus", h, ["--fire", "--max-power", "200", "--focus-power", "900",
+                                                                "--step", "focus"], focus_script=script, focus_best="2")
+    rj = report_json(out, "focus")
+    sp = rj.get("spots", [])
+    check("focus: exit 0, two spots; spot 1 one burst h=160, spot 2 two bursts with heights 162.5 and 163",
+          code == 0 and len(sp) == 2 and [s_["bursts"] for s_ in sp] == [1, 2] and sp[0]["height"] == "160"
+          and sp[1]["heights"] == ["162.5", "163"] and sp[1]["height"] == "163", f"code={code} {sp} {text[-300:]}")
+    r = rj.get("radius", 0)
+    far = abs(sp[0]["x"] - sp[1]["x"]) >= 2 * r or abs(sp[0]["y"] - sp[1]["y"]) >= 2 * r
+    check("focus: 'n' moved to a free spot (circles do not overlap); radius 5 and 10 laps are the defaults",
+          len(sp) == 2 and far and r == 5.0 and sp[0]["laps"] == 10 and sp[0]["radius"] == 5.0, str(sp))
+    sv = s_values_in_log(out)
+    check("focus: --focus-power 900 is capped at --max-power 200 (every S <= 200, the marks use 200)",
+          max(sv) == 200 and sp[0]["power"] == 200.0 and "capped" in text, f"max S {max(sv)}")
+    check("focus: armed once for the whole step, disarmed at the end, laser fired, no violations",
+          mock.arm_count == 1 and not mock.armed and mock.ever_fired and not mock.violations and mock.laser not in (3, 4),
+          f"arm_count={mock.arm_count}")
+    check("focus: each spot is framed and confirmed once", [k for k, _ in bench.log].count("frame_ok") == 2)
+    best = rj.get("best", {})
+    st = json.loads((tmp / "focus_state.json").read_text())
+    rep = (out / "calibration_report.md").read_text()
+    check("focus: best spot 2 / height 163 stored in the report (results + section) and the state JSON",
+          best.get("spot") == 2 and best.get("height") == "163" and st.get("focus_best_height") == "163"
+          and "best height: **163**" in rep, str(best))
+
+    # card full -> swap the card; big radius from the prompt, default feed
+    code, mock, bench, out, text = run_wizard(tmp, "focus_card", h, ["--fire", "--max-power", "200", "--step", "focus"],
+                                              focus_script=["n", "done"], inject={"focus_radius": ["25"]})
+    sp = report_json(out, "focus").get("spots", [])
+    check("focus: a full card asks for a fresh one and starts again at the first position",
+          code == 0 and "card_full" in [k for k, _ in bench.log] and len(sp) == 2 and (sp[0]["x"], sp[0]["y"]) == (sp[1]["x"], sp[1]["y"]),
+          str(sp))
+    # best height asked when not recorded, 0 = none
+    code, mock, bench, out, text = run_wizard(tmp, "focus_nh", h, ["--fire", "--max-power", "200", "--step", "focus"],
+                                              inject={"focus_best_height": ["171,5"]})
+    check("focus: height asked afterwards when none was recorded",
+          code == 0 and report_json(out, "focus").get("best", {}).get("height") == "171.5", text[-200:])
+
+    # Ctrl-C while the prompt waits (armed)
+    code, mock, bench, out, text = run_wizard(tmp, "focus_ctrlc", h, ["--fire", "--yes", "--max-power", "200", "--step", "focus"],
+                                              raise_on={"focus_next": KeyboardInterrupt})
+    log = (out / "session.log").read_text()
+    check("focus Ctrl-C: exit 130, cancel sequence + M11, disarmed",
+          code == 130 and "<0x18>" in log and "TX  M11" in log and not mock.armed, f"code={code}")
+    # q at the prompt: disarmed too
+    code, mock, bench, out, text = run_wizard(tmp, "focus_q", h, ["--fire", "--yes", "--max-power", "200", "--step", "focus"],
+                                              focus_script=["q"])
+    check("focus 'q': quits, disarmed, nothing left on", code == 0 and not mock.armed and mock.laser not in (3, 4))
+    # --step focus needs --fire; the default run skips it with a note
+    args = cal.build_parser().parse_args(["--mock", "--step", "focus", "--out", str(tmp / "focus_refuse")])
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        code = cal.run(args, provider=None, mock=None)
+    check("--step focus without --fire is refused (exit 2)", code == 2 and "REFUSING" in err.getvalue() and "'focus'" in err.getvalue())
+
+
 def test_e2e_restore(tmp: Path, full_out: Path) -> None:
     print("end to end: --restore")
     before = full_out / "settings_before.json"
@@ -700,10 +1012,13 @@ def main() -> int:
         test_offset()
         test_scale_distortion()
         test_delays_misc()
+        test_range_math()
         test_patterns()
         full_out = test_e2e_full(tmp)
         test_e2e_orientations(tmp, quick)
         test_e2e_safety(tmp)
+        test_e2e_range(tmp)
+        test_e2e_focus(tmp)
         test_e2e_restore(tmp, full_out)
     finally:
         if keep:

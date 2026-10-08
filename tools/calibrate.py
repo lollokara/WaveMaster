@@ -8,6 +8,8 @@ WaveMaster interactive calibration wizard.
 
 Steps (default: all, in this order, each skippable):
     connect      handshake, $I, $S (ATmega link / armed), current calibration values, backup of $$
+    focus        (needs --fire) circles at a changing Z height -> best focal distance (recorded, not a setting)
+    range        guide laser only: largest correct galvo deflection, volts per axis -> suggested $130/$131
     field        lens field size ($130/$131), origin ($144), laser PRR ($220/$221)
     orientation  guide-laser arrows -> $143 swap and $3 invert so +X = right, +Y = away
     scale        centred square -> $100/$101
@@ -20,6 +22,8 @@ Steps (default: all, in this order, each skippable):
 
 At every prompt: a number (12.34 or 12,34), "s" = skip this step, "q" = quit (summary and an
 offer to restore the backup), "again" = draw the pattern again.
+
+Answers of the range step: ok, x, y, both, again. The focus loop: Enter, n, "h <value>", done.
 
 Real-laser steps follow tools/rftest/run_tests.py: --fire is required, FIRE must be typed once,
 every pattern is framed with the guide laser first, M10 arms explicitly and $S must report
@@ -53,11 +57,13 @@ from gcode_gen import Box, MoveTo, SetPower, SetSpeed         # noqa: E402
 from rfclient import RayforgeClient, SessionLogger, strip_comment  # noqa: E402
 from run_tests import SafetyError, assert_safe                # noqa: E402
 
-STEP_ORDER = ("connect", "field", "orientation", "scale", "distortion", "offset", "delays", "power", "speed",
-              "summary")
-FIRE_STEPS = ("delays", "power")
+STEP_ORDER = ("connect", "focus", "range", "field", "orientation", "scale", "distortion", "offset", "delays",
+              "power", "speed", "summary")
+FIRE_STEPS = ("focus", "delays", "power")
 STEP_INFO = {
     "connect": "handshake, current values, backup",
+    "focus": "focal distance (Z height) with circles, real laser",
+    "range": "galvo maximum deflection (volts per axis), guide laser",
     "field": "lens field size, origin, laser PRR",
     "orientation": "guide laser: +X right, +Y away ($143, $3)",
     "scale": "square size ($100, $101)",
@@ -79,6 +85,7 @@ JUMP_SIZE = (28.0, 12.0)
 CORNER_SIZE = (28.0, 14.0)
 POWER_SIZE = (27.0, 27.0)
 SPEED_SIZE = (27.0, 20.0)
+FOCUS_LAPS = 10
 MAX_RETRY = 40
 DAMPING = 0.8
 
@@ -206,6 +213,22 @@ def pat_speed(box: Box, feeds: Sequence[float], power: float) -> Pattern:
     return _pat("speed_ladder", ops, (box.cx, box.cy), kind="speed", box=box, feeds=tuple(feeds))
 
 
+def pat_range(sq: cm.RangeSquare, feed: float) -> Pattern:
+    """Guide-laser rectangle of the range step (corners from calibrate_math.range_square) plus the short
+    tick that marks the +X side."""
+    ops = _head(feed, 0.0) + gg.polyline(sq.corners_mm, close=True)
+    ops += [MoveTo(*sq.tick_mm[0]), gg.LineTo(*sq.tick_mm[1])]
+    return _pat("range_rectangle", ops, sq.centre_mm, kind="range", fx=sq.fx, fy=sq.fy, square=sq,
+                corners_mm=list(sq.corners_mm))
+
+
+def pat_focus_burst(c: tuple[float, float], r: float, laps: int, feed: float, power: float) -> Pattern:
+    """`laps` identical laps of one circle (two G2 half arcs each, starting at +X)."""
+    arcs = gg.circle_arcs(c[0], c[1], r)
+    ops = _head(feed, power) + [arcs[0]] + list(arcs[1:]) * max(1, laps)
+    return _pat("focus_circle", ops, c, kind="focus", r=r, laps=laps, box=Box(c[0] - r, c[1] - r, 2 * r, 2 * r))
+
+
 def repeat_ops(ops: list, n: int) -> list:
     return list(ops) * max(1, n)
 
@@ -242,6 +265,10 @@ class Wizard:
         self.device_info: dict[str, Any] = {}
         self.state_file = Path(args.state) if getattr(args, "state", None) else HERE / "calibrate" / "last_values.json"
         self.notes: list[str] = []
+        self.range_ch: Optional[list[float]] = None    # usable half range in volts of DAC channel 0 / 1
+        self.range_swap = 0.0                          # $143 when the range was measured
+        self.range_source = ""
+        self.focus_best: Optional[dict] = None
 
     # ---- console helpers
     def say(self, text: str = "") -> None:
@@ -360,15 +387,33 @@ class Wizard:
                 n = int(k)
                 if n in self.dev and cm.same_value(self.dev[n], float(v)):
                     self.exact[n] = float(v)
-        except (OSError, ValueError, AttributeError):
+            self.range_swap = float(data.get("range_swap", 0.0))
+            ch = data.get("range_volts_ch")
+            if isinstance(ch, list) and len(ch) == 2 and all(float(x) > 0 for x in ch):
+                self.range_ch = [float(ch[0]), float(ch[1])]
+            elif float(data.get("range_volts_x", 0)) > 0 and float(data.get("range_volts_y", 0)) > 0:
+                vx, vy = float(data["range_volts_x"]), float(data["range_volts_y"])
+                cx = cm.channel_for_axis("x", self.range_swap)
+                self.range_ch = [vx, vy] if cx == 0 else [vy, vx]
+            if self.range_ch:
+                self.range_source = "state file"
+            if isinstance(data.get("focus_best"), dict):
+                self.focus_best = data["focus_best"]
+        except (OSError, ValueError, AttributeError, TypeError):
             pass
 
     def save_state(self) -> None:
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(json.dumps({"saved": dt.datetime.now().isoformat(timespec="seconds"),
-                                                   "values": {str(n): v for n, v in sorted(self.exact.items())}},
-                                                  indent=1))
+            data: dict[str, Any] = {"saved": dt.datetime.now().isoformat(timespec="seconds"),
+                                    "values": {str(n): v for n, v in sorted(self.exact.items())}}
+            if self.range_ch:
+                cx = cm.channel_for_axis("x", self.range_swap)
+                data.update({"range_volts_x": self.range_ch[cx], "range_volts_y": self.range_ch[1 - cx],
+                             "range_volts_ch": self.range_ch, "range_swap": self.range_swap})
+            if self.focus_best:
+                data.update({"focus_best_height": self.focus_best.get("height"), "focus_best": self.focus_best})
+            self.state_file.write_text(json.dumps(data, indent=1))
         except OSError as e:
             self.log.note(f"could not save {self.state_file}: {e}")
 
@@ -394,7 +439,8 @@ class Wizard:
             return False
         return self.write(rows, why)
 
-    def write(self, rows: Sequence[tuple[int, float, float]], why: str, quiet: bool = False) -> bool:
+    def write(self, rows: Sequence[tuple[int, float, float]], why: str, quiet: bool = False,
+              record: bool = True) -> bool:
         for n, old, new in rows:
             reply = self.c.command(f"${n}={cm.fmt_val(new)}", timeout=5.0)
             if reply[-1] != "ok":
@@ -406,8 +452,9 @@ class Wizard:
             if n in self.dev and not cm.same_value(self.dev[n], new):
                 ok = False
                 self.warn(f"${n}: wrote {cm.fmt_val(new)} but $$ reads back {self.dev[n]:g}")
-            self.changes.append({"step": self.step, "setting": n, "name": cm.NAMES.get(n, ""), "old": old,
-                                 "new": new, "why": why})
+            if record:
+                self.changes.append({"step": self.step, "setting": n, "name": cm.NAMES.get(n, ""), "old": old,
+                                     "new": new, "why": why})
         if not quiet:
             self.say(f"  written and read back ({'verified' if ok else 'MISMATCH'}); "
                      "$$ shows only 4 decimals, the wizard keeps the exact values")
@@ -544,13 +591,16 @@ class Wizard:
         finally:
             self.armed = False
 
+    def frame_pattern(self, box: Box, centre: tuple[float, float]) -> Pattern:
+        """Guide-laser outline of a bounding box (S0)."""
+        return Pattern("frame", _head(self.a.guide_feed, 0) + gg.polyline(
+            [(box.x, box.y), (box.x1, box.y), (box.x1, box.y1), (box.x, box.y1)], close=True), centre, box)
+
     def draw_fire(self, pat: Pattern, repeat: int = 1) -> None:
         self.fire_prelude()
         mp = self.mark_power if self.mark_power is not None else min(100.0, self.cap)
         lines = self.encode(pat.ops, pat.centre, repeat)           # S already capped by the encoder
-        frame = Pattern("frame", _head(self.a.guide_feed, 0) + gg.polyline(
-            [(pat.box.x, pat.box.y), (pat.box.x1, pat.box.y), (pat.box.x1, pat.box.y1), (pat.box.x, pat.box.y1)],
-            close=True), pat.centre, pat.box)
+        frame = self.frame_pattern(pat.box, pat.centre)
         self.say(f"  framing the pattern box X {pat.box.x:.1f}..{pat.box.x1:.1f} Y {pat.box.y:.1f}..{pat.box.y1:.1f} "
                  f"with the guide laser (S <= {mp:g} when firing)")
         self.draw_guide(frame)
@@ -651,6 +701,8 @@ class Wizard:
             if isinstance(res, dict):
                 self.results[name].update(res)
             self.results[name].setdefault("status", "done")
+            if name in ("scale", "distortion"):
+                self.offer_range_workarea(f"the scale changed in '{name}'")
         except SkipStep:
             self.say(f"  step '{name}' skipped")
             self.results[name] = {"status": "skipped by operator"}
@@ -674,13 +726,320 @@ class Wizard:
                 self.say(f"   ${n:<4} {cm.NAMES.get(n, ''):<40} {cm.fmt_val(self.get(n)):>12}")
         return {"link": at.get("link"), "armed": at.get("armed"), "tick_us": gv.get("tick_us")}
 
+    # -- focus
+    def focus_new_spot(self, spots: list, r: float, power: float, feed: float, laps: int) -> dict:
+        """Next free spot on the card (the allocator keeps the circles apart), framed with the guide laser."""
+        box = self.new_region(2 * r, 2 * r)
+        c = (box.cx, box.cy)
+        spot = {"spot": len(spots) + 1, "x": round(c[0], 3), "y": round(c[1], 3), "height": None, "heights": [],
+                "bursts": 0, "power": power, "radius": r, "laps": laps, "feed": feed}
+        spots.append(spot)
+        self.last_pattern = pat_focus_burst(c, r, laps, feed, power)
+        self.say(f"  spot {spot['spot']}: circle R {r:g} mm at X {c[0]:.1f} Y {c[1]:.1f} "
+                 f"(box X {c[0] - r:.1f}..{c[0] + r:.1f} Y {c[1] - r:.1f}..{c[1] + r:.1f}); framing it with the guide laser")
+        self.draw_guide(self.frame_pattern(Box(c[0] - r, c[1] - r, 2 * r, 2 * r), c))
+        if not self.a.yes and not self.ask_yes("frame_ok", "  Frame is on the test card?", False):
+            raise SafetyError("operator rejected the frame")
+        return spot
+
+    def focus_burst(self, spot: dict) -> None:
+        pat = pat_focus_burst((spot["x"], spot["y"]), spot["radius"], spot["laps"], spot["feed"], spot["power"])
+        self.last_pattern = pat
+        lines = self.encode(pat.ops, pat.centre)                   # S capped by the encoder
+        est = self.est_seconds(pat.ops, spot["feed"])
+        self.say(f"  FIRING {spot['laps']} laps of the circle at spot {spot['spot']} (S{spot['power']:g}, "
+                 f"F{spot['feed']:g}, ~{est:.1f} s)")
+        self.fired = True
+        self.stream(lines, est)
+        self.c.command("M5")
+        spot["bursts"] += 1
+
+    def focus_prompt(self, spot: dict) -> str:
+        """'again' (mark again, same spot), 'next' or 'done'; 'h <value>' records the height and asks again."""
+        for _ in range(MAX_RETRY):
+            raw = self.ask(Question("focus_next", "[Enter] mark again at the same spot (adjust height first) / "
+                                    "n = next spot / h <value> = record the height you just used (e.g. 'h 162.5') / done",
+                                    "text", meta={"spot": spot})).strip()
+            low = raw.lower()
+            if low == "":
+                return "again"
+            if low in ("n", "next"):
+                return "next"
+            if low in ("done", "d"):
+                return "done"
+            m = re.match(r"h\s*[:=]?\s*(.*)$", low)
+            if m and m.group(1).strip():
+                label = m.group(1).strip().replace(",", ".")
+                try:
+                    label = cm.fmt_val(cm.parse_floats(label)[0])
+                except CalibError:
+                    pass                                          # free text such as "162.5 mm" is kept as typed
+                spot["heights"].append(label)
+                spot["height"] = label
+                self.say(f"  recorded height {label} for spot {spot['spot']}")
+                continue
+            self.say("  answer Enter, n, 'h <value>' or done")
+        raise CalibError("no valid answer for focus_next")
+
+    def step_focus(self) -> dict:
+        self.header("focus: height / focal distance (real laser)")
+        self.say("Goal: find the Z height of the laser head at which the mark is sharpest. Circles are marked with the")
+        self.say("real laser while YOU change the height between bursts; the wizard only keeps notes. The height is not a")
+        self.say("firmware setting: the best value is recorded in the report and the state file.")
+        self.say("Do this FIRST: scale, distortion and offset are only valid at the final working height.")
+        self.ensure_card()
+        cw = self.card_box[2] - self.card_box[0]
+        ch = self.card_box[3] - self.card_box[1]
+        rmax = min(cw, ch) / 2
+        r = self.ask_nums("focus_radius", f"Circle radius in mm (0.5..{rmax:g})", default=min(self.a.focus_radius, rmax),
+                          lo=0.5, hi=rmax)[0]
+        if self.a.focus_power is not None:
+            d = min(self.a.focus_power, self.cap)
+            if d < self.a.focus_power:
+                self.say(f"  --focus-power {self.a.focus_power:g} is above --max-power: capped to {self.cap:g}")
+            power = self.ask_nums("focus_power", f"S for the focus circles (1..{self.cap:g})", default=d, lo=1,
+                                  hi=self.cap)[0]
+        else:
+            self.ensure_mark_power()
+            power = float(self.mark_power or 0.0)
+        laps = int(self.ask_nums("focus_laps", "Laps per burst (the same circle is marked this many times)",
+                                 default=FOCUS_LAPS, lo=1, hi=1000)[0])
+        feed = self.ask_nums("focus_feed", "Marking speed in mm/min", default=min(self.a.feed, self.get(110)), lo=60,
+                             hi=self.get(110))[0]
+        spots: list[dict] = []
+        res: dict[str, Any] = {"spots": spots, "radius": r, "power": power, "laps": laps, "feed": feed}
+        self.results["focus"] = res
+        self.fire_prelude()
+        self.say("  NOTE: the laser stays ARMED (M10) between bursts, but nothing emits (M5). Keep hands and tools out of the")
+        self.say("  beam path while you adjust the height; the step disarms (M11) when it ends (unless --keep-armed).")
+        clean = False
+        try:
+            spot = self.focus_new_spot(spots, r, power, feed, laps)
+            self.arm()
+            self.focus_burst(spot)
+            while True:
+                self._redraw = lambda sp=spot: self.focus_burst(sp)           # 'again' == Enter
+                act = self.focus_prompt(spot)
+                if act == "done":
+                    break
+                if act == "next":
+                    spot = self.focus_new_spot(spots, r, power, feed, laps)
+                self.focus_burst(spot)
+            clean = True
+        except (SkipStep, QuitWizard):
+            clean = True                       # no emergency follows these: disarm here
+            raise
+        finally:
+            self._redraw = None
+            # errors, SafetyError and Ctrl-C get the cancel sequence + M11 from run() (emergency)
+            if clean and not self.a.keep_armed and self.armed:
+                self.disarm()
+        marked = [sp for sp in spots if sp["bursts"]]
+        if marked:
+            self.say("  Look at the circles with a loupe: the best focus is the THINNEST and brightest line, with the same")
+            self.say("  width all the way around.")
+            n = int(self.ask_nums("focus_best", f"Which spot looked best, 1..{len(spots)} (0 = none)", lo=0,
+                                  hi=len(spots))[0])
+            if n:
+                sp = spots[n - 1]
+                label = sp["height"]
+                if not label:
+                    label = self.ask(Question("focus_best_height", "Height you used for that spot (Enter = not recorded)",
+                                              "text", meta={"spot": sp})).strip().replace(",", ".") or None
+                self.focus_best = {"spot": n, "height": label, "x": sp["x"], "y": sp["y"], "power": sp["power"],
+                                   "radius": sp["radius"], "laps": sp["laps"], "feed": sp["feed"]}
+                res["best"] = self.focus_best
+                self.say(f"  best: spot {n}, height {label if label else 'not recorded'}. Set the head to that height "
+                         "before the next steps.")
+                self.save_state()
+        return res
+
+    # -- range
+    def range_volts_xy(self) -> tuple[float, float]:
+        """Known usable half range (V) of the channels that drive physical X / Y under the CURRENT $143."""
+        assert self.range_ch
+        cx = cm.channel_for_axis("x", self.get(143))
+        return self.range_ch[cx], self.range_ch[1 - cx]
+
+    def range_workarea(self) -> Optional[tuple[float, float]]:
+        """Suggested ($130, $131) from the known range volts and the current scale / offset (None = unknown)."""
+        if not self.range_ch:
+            return None
+        swap = self.get(143)
+        kx, ky = cm.scale_key_for_axis("x", swap), cm.scale_key_for_axis("y", swap)
+        vx, vy = self.range_volts_xy()
+        try:
+            return cm.suggest_work_area(vx, vy, self.get(kx), self.get(ky), self.a.range_margin_v,
+                                        self.get(kx + 40), self.get(ky + 40))
+        except CalibError as e:
+            self.warn(f"cannot suggest a work area: {e}")
+            return None
+
+    def offer_range_workarea(self, why: str) -> None:
+        sug = self.range_workarea()
+        if not sug:
+            return
+        W, H = sug
+        if abs(W - self.get(130)) < 0.05 and abs(H - self.get(131)) < 0.05:
+            return
+        vx, vy = self.range_volts_xy()
+        self.say(f"  Range (galvo limit +-{vx:g} V on X, +-{vy:g} V on Y, {self.range_source or 'this run'}): {why}, so the "
+                 f"field in mm changed too. Suggested work area at the current scale: {W:g} x {H:g} mm "
+                 f"(now {self.get(130):g} x {self.get(131):g}).")
+        try:
+            if self.ask_yes("range_reapply", "  Apply it as $130 / $131?", True):
+                self.apply({130: W, 131: H}, "work area from the galvo range at the new scale", confirm=False)
+                self.regions = None
+        except SkipStep:
+            pass
+
+    def range_temp_values(self) -> dict[int, float]:
+        """Work area big enough that the clamp in grbl.c never cuts the test rectangles (+-10 V plus the offset)."""
+        swap = self.get(143)
+        out = {}
+        for axis, n in (("x", 130), ("y", 131)):
+            k = cm.scale_key_for_axis(axis, swap)
+            sc = abs(self.get(k))
+            if sc < 1e-9:
+                raise CalibError(f"${k} is zero: cannot convert volts to mm")
+            need = 2.0 * (cm.FULL_SCALE_V + abs(self.get(k + 40))) / sc + 2.0
+            out[n] = min(float(cm.RANGES[n][1]), math.ceil(need * 10) / 10)
+        return out
+
+    def range_restore(self, orig: dict[int, float], touched: set, err: Optional[BaseException]) -> bool:
+        """Write the original $130 / $131 / $142 back and verify them against a `$$` readback."""
+        if err is not None and not isinstance(err, (SkipStep, QuitWizard)):
+            self.emergency()                   # stop the motion before touching settings
+        ok = False
+        try:
+            self.write([(n, self.get(n), orig[n]) for n in sorted(touched)], "restore after the range test", quiet=True,
+                       record=False)
+            bad = [n for n in sorted(touched) if n in self.dev and not cm.same_value(self.dev[n], orig[n])]
+            ok = not bad
+            if ok:
+                self.say("  restored " + ", ".join(f"${n}={cm.fmt_val(orig[n])}" for n in sorted(touched))
+                         + " (verified by $$ readback)")
+            else:
+                self.warn("RESTORE MISMATCH: " + ", ".join(f"${n} reads {self.dev[n]:g}, wanted {cm.fmt_val(orig[n])}"
+                                                           for n in bad))
+        except Exception as e:                                       # noqa: BLE001
+            self.warn(f"COULD NOT RESTORE the settings: {e}. Type by hand: "
+                      + " ".join(f"${n}={cm.fmt_val(orig[n])}" for n in sorted(touched))
+                      + f" (or --restore {self.out / 'settings_before.json'})")
+        return ok
+
+    def step_range(self) -> dict:
+        self.header("range: largest correct galvo deflection (guide laser only)")
+        self.say("Goal: the largest deflection the galvos display correctly, in DAC volts per axis (full scale is +-10 V),")
+        self.say("independent of the mm scale. Rectangles are traced with the guide laser, never the marking laser.")
+        self.say("Temporarily $142 = 0 (no radial correction) and the work area is enlarged so that nothing is clamped;")
+        self.say("$130 / $131 / $142 are restored at the end, also after Ctrl-C.")
+        self.say("X = the pair of sides that ends at the short tick drawn inside the rectangle (the +X side and its")
+        self.say("opposite), Y = the other pair. Judge: complete straight edges and sharp corners; flattened or clipped")
+        self.say("sides, a mirror buzzing or hitting its stop are failures.")
+        swap = self.get(143)
+        cx, cy = cm.channel_for_axis("x", swap), cm.channel_for_axis("y", swap)
+        levels = tuple(self.a.range_levels)
+        ladder = cm.RangeLadder(levels)
+        orig = {n: self.get(n) for n in (130, 131, 142)}
+        temp = self.range_temp_values()
+        if orig[142] == 0.0 and not (142 in self.exact or 142 in self.dev_int):
+            self.warn("$142 reads 0 but `$$` may hide a small k1 (fewer than 5 decimals): it is left untouched, so the "
+                      "rectangles can be slightly distorted")
+        res: dict[str, Any] = {"levels": list(levels), "history": ladder.history, "temporary": dict(temp),
+                               "original": {str(n): v for n, v in orig.items()}}
+        self.results["range"] = res
+        touched: set = set()
+        err: Optional[BaseException] = None
+        try:
+            rows = [(n, self.get(n), temp[n]) for n in (130, 131) if abs(self.get(n) - temp[n]) > 1e-9]
+            if orig[142] != 0.0:
+                rows.append((142, orig[142], 0.0))
+            touched.update(n for n, _, _ in rows)
+            if rows:
+                self.say("  temporary: " + ", ".join(f"${n}={cm.fmt_val(new)}" for n, _, new in rows))
+                self.write(rows, "temporary values for the range test", quiet=True, record=False)
+            while not ladder.done:
+                fx, fy = ladder.next_test()
+                sq = cm.range_square(self.view(), fx, fy)
+                pat = pat_range(sq, self.a.guide_feed)
+                ax, ay = sq.actual
+                lv = ladder.levels[ladder.i]
+                self.say(f"  level {lv:g}: X sides +-{ax:.2f} V (asked {sq.target[0]:g}), Y sides +-{ay:.2f} V "
+                         f"(asked {sq.target[1]:g}); corners " + " ".join(f"({a:+.2f},{b:+.2f})" for a, b in sq.corner_volts)
+                         + " V")
+                if sq.limited:
+                    self.warn(f"level {lv:g} is limited by the work area ($130/$131 max 1000): only +-{ax:.2f} V / "
+                              f"+-{ay:.2f} V are reached")
+                self.draw(pat, False)
+                raw = ""
+                for _ in range(MAX_RETRY):
+                    raw = self.ask(Question(
+                        "range_ok", "Is the rectangle displayed correctly? ok = complete, straight edges / "
+                        "x = the X sides (tick side + opposite) clipped, flattened or bent / y = the Y sides / "
+                        "both / again = draw it again", "menu", meta={"level": lv, "fx": fx, "fy": fy})).strip().lower()
+                    if raw in ("ok", "x", "y", "both"):
+                        break
+                    self.say("  answer ok, x, y, both or again")
+                else:
+                    raise CalibError("no valid answer for range_ok")
+                ladder.answer(raw)
+        except BaseException as e:                                   # noqa: BLE001
+            err = e
+            raise
+        finally:
+            restored = self.range_restore(orig, touched, err) if touched else True
+            res["restored"] = restored
+            if not restored and err is None:
+                raise CalibError("the temporary settings could not be restored - see the warning above")
+        # ---- result (axes are the commanded X / Y; the volts belong to the channel that drove them)
+        fxg, fyg = ladder.good["x"], ladder.good["y"]
+        vx, vy = round(fxg * cm.FULL_SCALE_V, 6), round(fyg * cm.FULL_SCALE_V, 6)
+        res.update({"f_x": fxg, "f_y": fyg, "range_volts_x": vx, "range_volts_y": vy, "swap": swap,
+                    "channel_x": cx, "channel_y": cy})
+        self.say(f"  result: X good up to {fxg:g} of full scale = +-{vx:g} V (DAC channel {cx}), "
+                 f"Y good up to {fyg:g} = +-{vy:g} V (DAC channel {cy})")
+        for axis, f in (("X", fxg), ("Y", fyg)):
+            if f >= 1.0 - 1e-9:
+                self.warn(f"axis {axis} is displayed correctly at the full +-10 V: the DAC, not the galvo, limits the range")
+            if f <= 0.0:
+                self.warn(f"axis {axis} already failed at the lowest level {ladder.levels[0]:g}: check the galvo driver, "
+                          "its input range and the wiring")
+        if vx <= 0 or vy <= 0:
+            res["suggested"] = None
+            return res
+        self.range_ch = [0.0, 0.0]
+        self.range_ch[cx], self.range_ch[cy] = vx, vy
+        self.range_swap = swap
+        self.range_source = "this run"
+        self.save_state()
+        sug = self.range_workarea()
+        if sug:
+            W, H = sug
+            res["suggested"] = {"W": W, "H": H, "margin_v": self.a.range_margin_v}
+            self.say(f"  Suggested work area at the current scale (margin {self.a.range_margin_v:g} V): "
+                     f"$130 = {W:g}, $131 = {H:g} mm (now {self.get(130):g} x {self.get(131):g}).")
+            self.say("  It follows the scale: after 'scale' / 'distortion' the wizard offers the new values.")
+            res["applied"] = False
+            if self.ask_yes("range_apply", "  Apply it as $130 / $131?", False):
+                res["applied"] = bool(self.apply({130: W, 131: H}, "work area from the galvo range", confirm=False))
+                self.regions = None
+        return res
+
     def step_field(self) -> dict:
         self.header("field: lens, origin and laser PRR")
         self.say("Enter the working field of the lens (e.g. 100 for an F-theta f=160 mm lens, 70, 150, 200).")
         self.say("Press Enter to keep the current value. Use the real, usable field - patterns are kept inside it.")
         g = self.geometry()
-        w = self.ask_nums("field_w", "Field width in mm", default=g["W"], lo=5, hi=1000)[0]
-        h = self.ask_nums("field_h", "Field height in mm", default=g["H"], lo=5, hi=1000)[0]
+        dw, dh = g["W"], g["H"]
+        sug = self.range_workarea()
+        if sug:
+            dw, dh = max(5.0, sug[0]), max(5.0, sug[1])
+            self.say(f"  The 'range' step ({self.range_source or 'earlier'}) suggests {dw:g} x {dh:g} mm at the current "
+                     f"scale (usable +-{self.range_volts_xy()[0]:g} V / +-{self.range_volts_xy()[1]:g} V minus the margin); "
+                     "it is the default below. Run 'scale' afterwards: the field in mm follows the scale.")
+        w = self.ask_nums("field_w", "Field width in mm", default=dw, lo=5, hi=1000)[0]
+        h = self.ask_nums("field_h", "Field height in mm", default=dh, lo=5, hi=1000)[0]
         if w < 20 or h < 20:
             self.warn("a field below 20 mm leaves little room for the scale and distortion patterns")
         self.say("Origin: 0 = machine (0,0) is a corner of the work area (Rayforge default), "
@@ -1131,6 +1490,16 @@ class Wizard:
         for name in STEP_ORDER:
             if name in self.results:
                 md += [f"### {name}", "", "```json", json.dumps(self.results[name], indent=1, default=str), "```", ""]
+        fb = self.focus_best
+        if fb:
+            md += ["## Focus", "", f"- best height: **{fb.get('height') or 'not recorded'}** (spot {fb.get('spot')}, "
+                   f"S{fb.get('power'):g}, R {fb.get('radius'):g} mm, {fb.get('laps')} laps, F{fb.get('feed'):g}); "
+                   "not a firmware setting - set the head to this height", ""]
+        if self.range_ch:
+            cx = cm.channel_for_axis("x", self.range_swap)
+            md += ["## Range", "", f"- usable galvo range ({self.range_source or 'this run'}): "
+                   f"X +-{self.range_ch[cx]:g} V, Y +-{self.range_ch[1 - cx]:g} V (DAC channel 0: +-{self.range_ch[0]:g} V, "
+                   f"channel 1: +-{self.range_ch[1]:g} V)", ""]
         if self.notes:
             md += ["## Warnings", ""] + [f"- {n}" for n in self.notes] + [""]
         md += ["## Restore", "", f"`python3 tools/calibrate.py PORT --restore {self.out / 'settings_before.json'}`", "",
@@ -1231,13 +1600,21 @@ def parse_card(text: str) -> tuple[float, float]:
         raise argparse.ArgumentTypeError("--card expects WxH in mm, e.g. 60x60")
 
 
+def parse_levels(text: str) -> tuple:
+    try:
+        return cm.parse_levels(text)
+    except CalibError as e:
+        raise argparse.ArgumentTypeError(str(e))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="WaveMaster interactive calibration wizard (see tools/CALIBRATION.md)",
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("port", nargs="?", help="serial port of the ESP32-S3 native USB (not needed with --mock)")
     p.add_argument("--mock", action="store_true", help="talk to tools/rftest/mock_grbl.py instead of hardware")
     p.add_argument("--step", action="append", choices=STEP_ORDER, help="run only this step (repeatable)")
-    p.add_argument("--fire", action="store_true", help="allow steps that emit the real laser")
+    p.add_argument("--fire", action="store_true", help="allow steps that emit the real laser (focus, delays, power, "
+                   "and real marks in scale/distortion/offset/speed)")
     p.add_argument("--yes", action="store_true", help="skip the typed FIRE and the frame confirmation")
     p.add_argument("--max-power", type=float, default=300.0, help="cap for every S value (default 300)")
     p.add_argument("--out", help="output directory (default tools/calibrate/runs/<timestamp>)")
@@ -1247,6 +1624,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--guide-feed", type=float, default=6000.0, help="guide-laser trace speed, mm/min (default 6000)")
     p.add_argument("--guide-seconds", type=float, default=3.0, help="how long a guide pattern is traced (default 3)")
     p.add_argument("--card", type=parse_card, default=(60.0, 60.0), help="test card size WxH in mm (default 60x60)")
+    p.add_argument("--focus-radius", type=float, default=5.0, help="focus step: circle radius in mm (default 5)")
+    p.add_argument("--focus-power", type=float, default=None,
+                   help="focus step: S for the circles (default: the normal mark-power prompt); always capped at --max-power")
+    p.add_argument("--range-levels", type=parse_levels, default=cm.RANGE_LEVELS,
+                   help="range step: comma list of fractions of full scale +-10 V "
+                        "(default 0.2,0.4,0.6,0.7,0.8,0.9,1.0)")
+    p.add_argument("--range-margin-v", type=float, default=0.5,
+                   help="range step: safety margin in volts kept off the usable range when suggesting $130/$131 (default 0.5)")
     p.add_argument("--arm-timeout", type=float, default=10.0)
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--state", help="file remembering exact values between runs (default tools/calibrate/last_values.json)")
@@ -1270,10 +1655,13 @@ def run(args: argparse.Namespace, provider: Any = None, mock: Any = None) -> int
     if args.max_power < 0:
         print("--max-power must be >= 0", file=sys.stderr)
         return 2
+    if args.range_margin_v < 0 or args.focus_radius <= 0:
+        print("--range-margin-v must be >= 0 and --focus-radius > 0", file=sys.stderr)
+        return 2
     explicit = bool(args.step)
     steps = list(args.step) if args.step else list(STEP_ORDER)
     if not args.restore and explicit and any(s in FIRE_STEPS for s in steps) and not args.fire:
-        print("REFUSING: steps 'delays' and 'power' emit the real laser. Re-run with --fire "
+        print("REFUSING: steps 'focus', 'delays' and 'power' emit the real laser. Re-run with --fire "
               "(and read tools/CALIBRATION.md).", file=sys.stderr)
         return 2
     out = Path(args.out) if args.out else HERE / "calibrate" / "runs" / dt.datetime.now().strftime("%Y%m%d_%H%M%S")

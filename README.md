@@ -60,20 +60,24 @@ bring-up checklist in [STATUS.md](STATUS.md)).
 
 **6. Calibrate geometry** (guide laser on paper is enough to start)
 ```bash
-.venv/bin/python tools/calibrate.py ESP                   # field size, orientation, scale, distortion, offset
+.venv/bin/python tools/calibrate.py ESP                   # galvo range, field size, orientation, scale, distortion, offset
 ```
+(`range` finds how many volts the galvos follow and suggests the work area; `focus`, the first step, needs
+`--fire` and is skipped here.)
 ✔ A drawn 20 mm square measures 20.0 mm on both axes and the crosshair lands on your
 reference. Procedure and measuring tips: [tools/CALIBRATION.md](tools/CALIBRATION.md).
 
 **7. First real marks** (test card in the field, enclosure closed, low power)
 ```bash
+.venv/bin/python tools/calibrate.py ESP --fire --max-power 300 --step focus     # set the focal height first
 .venv/bin/python tools/calibrate.py ESP --fire --max-power 300 --step delays --step power --step speed
 .venv/bin/python tools/rftest/run_tests.py ESP fire-power-ladder --fire --max-power 300
 ```
 Each fire run frames the job with the guide laser and asks you to confirm before it arms.
 ✔ Line starts and ends are clean (laser on/off delays tuned), the power ladder shows where
 marking starts and saturates. Then re-run `calibrate.py ESP --fire --step scale --step distortion`
-on a marked card for the best accuracy.
+on a marked card for the best accuracy (the scale is only valid at the focus height found by `focus`; the wizard
+also offers the work area that fits the new scale).
 
 **8. Connect Rayforge.** Follow [docs/RAYFORGE.md](docs/RAYFORGE.md): driver "GRBL (Serial)",
 dialect `grbl` for vectors or `grbl_raster` for engraving, work area = `$130`×`$131`,
@@ -160,7 +164,7 @@ Pin-level wiring is in **[docs/WIRING.md](docs/WIRING.md)**, with a diagram in
 
 Setting up Rayforge is in **[docs/RAYFORGE.md](docs/RAYFORGE.md)**.
 
-Calibrating the galvo (orientation, scale, distortion, offset, delays, power, speed) is guided by `python3 tools/calibrate.py PORT`; the procedure is in **[tools/CALIBRATION.md](tools/CALIBRATION.md)**.
+Calibrating the galvo (focus, range, orientation, scale, distortion, offset, delays, power, speed) is guided by `python3 tools/calibrate.py PORT`; the procedure is in **[tools/CALIBRATION.md](tools/CALIBRATION.md)**.
 
 ---
 
