@@ -669,7 +669,8 @@ class Wizard:
         self.card_box = (c[0] - cw / 2, c[1] - ch / 2, c[0] + cw / 2, c[1] + ch / 2)
         self.regions = cm.RegionAllocator(self.card_box)
         self.say(f"  test card area used: {cw:g} x {ch:g} mm centred on the field centre "
-                 "(change with --card WxH); every pattern gets its own free spot")
+                 "(change with --card WxH); the first pattern is centred on the lens centre, later ones take the "
+                 "nearest free spot around it")
 
     def new_region(self, w: float, h: float) -> Box:
         self.ensure_card()

@@ -290,7 +290,14 @@ def test_delays_misc() -> None:
     check(f"allocator: {len(regs)} regions of 30x18 on 60x60, no overlap, all inside, then None",
           len(regs) == 3 and not overlap and inside and al.allocate(30, 18) is None)
     al.reset()
-    check("allocator reset", al.allocate(30, 18) == (0, 0, 30, 18) and al.allocate(70, 5) is None)
+    check("allocator reset: first box centred on the card centre (the lens centre)",
+          al.allocate(30, 18) == (15.0, 21.0, 30, 18) and al.allocate(70, 5) is None)
+    al2 = cm.RegionAllocator((20, 20, 80, 80))
+    r1, r2 = al2.allocate(24, 12), al2.allocate(24, 12)
+    d1 = math.hypot(r1[0] + 12 - 50, r1[1] + 6 - 50)
+    d2 = math.hypot(r2[0] + 12 - 50, r2[1] + 6 - 50)
+    check("allocator: centre first, then the nearest free spot, keeping the gap",
+          d1 < 1e-9 and d2 > d1 and (abs(r2[1] - r1[1]) >= 12 + 2 - 1e-9 or abs(r2[0] - r1[0]) >= 24 + 2 - 1e-9))
 
     check("ladder values end at the cap, distinct", cm.ladder_values(300, 9)[-1] == 300 and len(set(cm.ladder_values(300, 9))) == 9
           and len(cm.ladder_values(5, 9)) < 9)

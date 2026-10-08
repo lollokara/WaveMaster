@@ -547,8 +547,13 @@ class DelayTuner:
 
 
 class RegionAllocator:
-    """Hands out non-overlapping boxes on a test card (shelf packing, left to right,
-    bottom to top).  `limits` = (x0, y0, x1, y1) of the usable card in machine mm."""
+    """Hands out non-overlapping boxes on a test card, centre outwards: the first
+    box on a fresh card is centred exactly on the card centre (the lens centre),
+    every later one takes the free position whose centre is nearest to it.
+    `limits` = (x0, y0, x1, y1) of the usable card in machine mm; boxes keep
+    `gap` mm from each other."""
+
+    STEP = 0.5          # candidate grid, mm (aligned to the centred position)
 
     def __init__(self, limits: tuple[float, float, float, float], gap: float = 2.0):
         self.x0, self.y0, self.x1, self.y1 = limits
@@ -556,24 +561,46 @@ class RegionAllocator:
         self.reset()
 
     def reset(self) -> None:
-        self.cx = self.x0
-        self.cy = self.y0
-        self.shelf_h = 0.0
         self.used: list[tuple[float, float, float, float]] = []
 
+    def _free(self, x: float, y: float, w: float, h: float) -> bool:
+        g = self.gap - 1e-9
+        for ux, uy, uw, uh in self.used:
+            if x < ux + uw + g and ux < x + w + g and y < uy + uh + g and uy < y + h + g:
+                return False
+        return True
+
+    def _axis(self, lo: float, hi: float, size: float) -> list[float]:
+        """Candidate starts along one axis: the centred one, then +-STEP outwards."""
+        c0 = (lo + hi) / 2 - size / 2
+        out = [c0]
+        k = 1
+        while True:
+            added = False
+            for v in (c0 - k * self.STEP, c0 + k * self.STEP):
+                if lo - 1e-9 <= v and v + size <= hi + 1e-9:
+                    out.append(v)
+                    added = True
+            if not added:
+                return out
+            k += 1
+
     def allocate(self, w: float, h: float) -> Optional[tuple[float, float, float, float]]:
-        """(x, y, w, h) of a free region or None when the card is full."""
+        """(x, y, w, h) of the free region nearest the card centre, or None when full."""
         if w > self.x1 - self.x0 + 1e-9 or h > self.y1 - self.y0 + 1e-9:
             return None
-        if self.cx + w > self.x1 + 1e-9:                       # next shelf
-            self.cy += self.shelf_h + self.gap
-            self.cx = self.x0
-            self.shelf_h = 0.0
-        if self.cy + h > self.y1 + 1e-9:
+        cx, cy = (self.x0 + self.x1) / 2, (self.y0 + self.y1) / 2
+        best = None
+        for y in self._axis(self.y0, self.y1, h):
+            for x in self._axis(self.x0, self.x1, w):
+                d = (x + w / 2 - cx) ** 2 + (y + h / 2 - cy) ** 2
+                if best is not None and d >= best[0]:
+                    continue
+                if self._free(x, y, w, h):
+                    best = (d, x, y)
+        if best is None:
             return None
-        r = (self.cx, self.cy, w, h)
-        self.cx += w + self.gap
-        self.shelf_h = max(self.shelf_h, h)
+        r = (best[1], best[2], w, h)
         self.used.append(r)
         return r
 

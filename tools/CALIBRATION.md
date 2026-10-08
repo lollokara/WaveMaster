@@ -126,7 +126,7 @@ marks a burst. After each burst you decide:
 | Answer | Effect |
 |:---|:---|
 | Enter | mark another burst at the same spot (change the height first) |
-| `n` | next free spot on the card (circles never overlap; a full card asks you to swap it); it is framed again |
+| `n` | next free spot on the card, nearest the lens centre (circles never overlap; a full card asks you to swap it); it is framed again |
 | `h 162.5` | record the height you just used for this spot (any unit; `h` does not mark) |
 | `done` | end the loop |
 
@@ -270,6 +270,8 @@ Steps are 20 us (at least one tick); whenever your answer changes direction the 
 Defaults: `$210=100`, `$211=120`, `$212=300`, `$213=0`, `$214=100`, `$215=0`.
 
 ### power (`$224`, `$225`), real laser
+
+Test-card patterns (focus circles, delay grids, power and speed ladders) are placed centre-out: the first one on a fresh card sits exactly on the lens centre (`$130`/2, `$131`/2, or 0,0 with `$144=1`), later ones take the nearest free spot around it. A centred first pattern leaves less room at the sides, so fewer patterns fit per card than with corner packing; use a larger card (`--card WxH`) if you swap cards often. The geometry patterns (scale, distortion, offset) are always drawn on the lens centre.
 
 Nine hatched patches with rising `S` (up to `--max-power`). Patch 1 is bottom-left (nearest you),
 numbers rise left to right, then the next row away. Enter the **lowest patch that visibly marks** and the
