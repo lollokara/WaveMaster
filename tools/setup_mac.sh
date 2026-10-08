@@ -19,6 +19,27 @@ confirm() { # confirm "question"  -> returns 0 on yes
 
 [[ "$(uname -s)" == "Darwin" ]] || die "This script is for macOS (found $(uname -s)). On Linux: python3 -m venv .venv && .venv/bin/pip install 'platformio>=6.1.16' pyserial"
 
+# ---- Rosetta 2 (Apple Silicon) ------------------------------------------------
+# Some PlatformIO packages only ship Intel (x86_64) binaries for macOS: the AVR
+# toolchain (avr-gcc) used for the ATmega, and tool-ninja used by the ESP-IDF
+# build. On Apple Silicon they fail with "Bad CPU type in executable" /
+# "Unknown system error -86" unless Rosetta 2 is installed.
+if [[ "$(uname -m)" == "arm64" ]]; then
+    if /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+        good "Rosetta 2 present (needed for Intel-only PlatformIO tools)"
+    else
+        warn "Apple Silicon without Rosetta 2: the AVR toolchain and ninja (Intel-only) cannot run."
+        if confirm "Install Rosetta 2 now (softwareupdate --install-rosetta)?"; then
+            softwareupdate --install-rosetta --agree-to-license \
+                || die "Rosetta install failed; run: softwareupdate --install-rosetta --agree-to-license"
+            /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || die "Rosetta still not usable after install."
+            good "Rosetta 2 installed"
+        else
+            die "Rosetta 2 is required. Run: softwareupdate --install-rosetta --agree-to-license"
+        fi
+    fi
+fi
+
 # ---- Homebrew ---------------------------------------------------------------
 find_brew() {
     command -v brew 2>/dev/null || { [[ -x /opt/homebrew/bin/brew ]] && echo /opt/homebrew/bin/brew; } \
@@ -105,7 +126,7 @@ if ((${#ports[@]})); then printf '    %s\n' "${ports[@]}"; else warn "none yet (
 cat <<NEXT
 
 Setup complete. Next:
-  1. Read tools/README_FLASHING.md (laser OFF, DB25 unplugged while flashing).
-  2. Run the wizard:   $VENV/bin/python tools/flash_boards.py
+  1. Read $REPO/tools/README_FLASHING.md (laser OFF, DB25 unplugged while flashing).
+  2. Run the wizard:   $VENV/bin/python $REPO/tools/flash_boards.py
      (or individually: detect | build | flash-atmega | flash-esp32 | verify)
 NEXT

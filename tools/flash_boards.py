@@ -8,6 +8,7 @@ restore FILE, all (default), selftest.  See tools/README_FLASHING.md.
 from __future__ import annotations
 
 import argparse
+import platform
 import datetime as dt
 import json
 import os
@@ -171,7 +172,29 @@ def run_pio(args: list[str], cwd: Path, label: str) -> tuple[int, str]:
     except OSError as e:
         err(f"Could not run pio: {e}")
         return 127, ""
-    return rc, "".join(buf)
+    out = "".join(buf)
+    if rc != 0:
+        rosetta_hint(out)
+    return rc, out
+
+
+def rosetta_missing() -> bool:
+    """True on Apple Silicon when Rosetta 2 cannot run x86_64 binaries."""
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        return False
+    try:
+        return subprocess.run(["/usr/bin/arch", "-x86_64", "/usr/bin/true"],
+                              capture_output=True).returncode != 0
+    except OSError:
+        return True
+
+
+def rosetta_hint(output: str) -> None:
+    low = output.lower()
+    if "bad cpu type" in low or "system error -86" in low:
+        warn("An Intel-only PlatformIO tool (avr-gcc / ninja) could not run on this Apple Silicon Mac.\n"
+             "      Install Rosetta 2, then retry:\n"
+             "          softwareupdate --install-rosetta --agree-to-license")
 
 
 def build_one(name: str, cwd: Path, env: str) -> bool:
@@ -182,6 +205,9 @@ def build_one(name: str, cwd: Path, env: str) -> bool:
 
 def cmd_build(_: argparse.Namespace | None = None) -> int:
     head("Build")
+    if rosetta_missing():
+        warn("Rosetta 2 is not installed; the AVR toolchain and ninja are Intel-only and will fail.\n"
+             "      Run: softwareupdate --install-rosetta --agree-to-license")
     r1 = build_one("ATmega companion", ATMEGA_DIR, ENV_AVR)
     r2 = build_one("ESP32-S3 firmware", REPO, ENV_ESP)
     return EXIT_OK if r1 and r2 else EXIT_FAIL
