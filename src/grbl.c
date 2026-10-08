@@ -526,9 +526,9 @@ static void print_stats(void)
         host_puts("[MSG:motion hardware fault]\r\n");
     } else {
         galvo_out_get_stats(&gs);
-        host_printf("[MSG:galvo chunks=%u underruns=%u barriers=%u ticks=%llu tick_us=%.2f]\r\n",
+        host_printf("[MSG:galvo chunks=%u underruns=%u barriers=%u ticks=%llu tick_us=%.2f clipped=%u]\r\n",
                     (unsigned)gs.chunks, (unsigned)gs.underruns, (unsigned)gs.barriers,
-                    (unsigned long long)gs.ticks, (double)galvo_out_tick_us());
+                    (unsigned long long)gs.ticks, (double)galvo_out_tick_us(), (unsigned)gs.clipped);
     }
     atmega_link_get_status(&as);
     host_printf("[MSG:atmega link=%d armed=%d ready=%d guide=%d power=%u stat=0x%02x vdet=%umV err=%u]\r\n",

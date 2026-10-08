@@ -77,6 +77,7 @@ struct galvo_out_stats {
     uint32_t underruns;
     uint32_t barriers;
     uint64_t ticks;
+    uint32_t clipped;   /* ticks clamped to the DAC's +-10 V range */
 };
 void galvo_out_get_stats(struct galvo_out_stats *s);
 

@@ -136,6 +136,37 @@ void galvo_out_reload(void)
     code_map(0, calib_get(CAL_X_SCALE), calib_get(CAL_X_OFFSET), &s_m0, &s_c0, &s_lo0, &s_hi0);
     code_map(1, calib_get(CAL_Y_SCALE), calib_get(CAL_Y_OFFSET), &s_m1, &s_c1, &s_lo1, &s_hi1);
 
+    /* Does the whole work area fit inside the DAC's +-10 V with this scale,
+     * offset and lens correction? If not, the part of a drawing beyond the
+     * limit is flattened onto a line - say so once per settings change. */
+    {
+        float hx = calib_get(CAL_FIELD_W) * 0.5f, hy = calib_get(CAL_FIELD_H) * 0.5f;
+        float r2 = hx * hx + hy * hy;
+        float fc = 1.0f + s_k1 * r2;                 /* radial factor at a corner */
+        float a0 = s_swap ? hy : hx, a1 = s_swap ? hx : hy;
+        float m0 = fmaxf(a0 * fabsf(fc), a0 * fabsf(1.0f + s_k1 * a0 * a0));
+        float m1 = fmaxf(a1 * fabsf(fc), a1 * fabsf(1.0f + s_k1 * a1 * a1));
+        float sc[2] = { calib_get(CAL_X_SCALE), calib_get(CAL_Y_SCALE) };
+        float of[2] = { calib_get(CAL_X_OFFSET), calib_get(CAL_Y_OFFSET) };
+        float mm[2] = { m0, m1 };
+        /* channel ch is fed by field X ($130) unless swapped */
+        int src[2] = { s_swap ? 131 : 130, s_swap ? 130 : 131 };
+
+        for (int ch = 0; ch < 2; ch++) {
+            float vmax = fabsf(of[ch]) + mm[ch] * fabsf(sc[ch]);
+
+            if (vmax > 10.0f) {
+                float half = (10.0f - fabsf(of[ch])) / fmaxf(fabsf(sc[ch]), 1e-6f);
+
+                ESP_LOGW(TAG, "work area does not fit the DAC: CH%d needs %.2f V (offset %.2f V + "
+                         "%.1f mm x %.4f V/mm), the limit is 10 V - drawings near that edge will be "
+                         "clipped. Max $%d for this scale/offset: %.1f mm",
+                         ch, (double)vmax, (double)of[ch], (double)mm[ch], (double)sc[ch],
+                         src[ch], (double)(half > 0.0f ? 2.0f * half : 0.0f));
+            }
+        }
+    }
+
     s_delay_on_ticks = (uint32_t)lroundf(calib_get(CAL_LASER_ON_DELAY) / s_tick_us);
     s_delay_off_ticks = (uint32_t)lroundf(calib_get(CAL_LASER_OFF_DELAY) / s_tick_us);
 
@@ -292,12 +323,21 @@ static inline void fifo_schedule(bool level)
 
 /* ---- mm -> codes -------------------------------------------------------- */
 
+/* Ticks whose position had to be clamped to the DAC's +-10 V (or 16-bit)
+ * range - a clipped drawing shows up here (see $S). Producer only. */
+static volatile uint32_t s_clipped;
+
 static inline uint16_t to_code(float f, float m, float c, float lo, float hi)
 {
     float v = f * m + c;
 
-    if (v < lo) v = lo;
-    if (v > hi) v = hi;
+    if (v < lo) {
+        v = lo;
+        s_clipped++;
+    } else if (v > hi) {
+        v = hi;
+        s_clipped++;
+    }
     return (uint16_t)(v + 0.5f);
 }
 
@@ -454,6 +494,7 @@ void galvo_out_get_stats(struct galvo_out_stats *s)
     s->underruns = atomic_load(&g_galvo.underruns);
     s->barriers = atomic_load(&g_galvo.barriers);
     s->ticks = atomic_load(&g_galvo.ticks_done);
+    s->clipped = s_clipped;
 }
 
 /* ---- abort / hold --------------------------------------------------------- */
