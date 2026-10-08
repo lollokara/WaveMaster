@@ -209,7 +209,25 @@ def rosetta_hint(output: str) -> None:
              "          softwareupdate --install-rosetta --agree-to-license")
 
 
+def refresh_sdkconfig() -> None:
+    """Delete the generated ESP-IDF sdkconfig when it predates sdkconfig.defaults
+    or platformio.ini. ESP-IDF only applies sdkconfig.defaults when it creates
+    the file, so an old copy silently keeps stale settings (e.g. an 8 MB flash
+    size on this 4 MB board, which boot-loops). It is untracked and regenerated
+    on the next build."""
+    gen = REPO / f"sdkconfig.{ENV_ESP}"
+    if not gen.exists():
+        return
+    newest = max((REPO / n).stat().st_mtime for n in ("sdkconfig.defaults", "platformio.ini")
+                 if (REPO / n).exists())
+    if gen.stat().st_mtime < newest:
+        info(f"{gen.name} is older than sdkconfig.defaults/platformio.ini - regenerating it")
+        gen.unlink()
+
+
 def build_one(name: str, cwd: Path, env: str) -> bool:
+    if env == ENV_ESP:
+        refresh_sdkconfig()
     rc, _ = run_pio(["run", "-e", env], cwd, f"build {name}")
     (ok if rc == 0 else err)(f"build {name}: {'PASS' if rc == 0 else 'FAIL'}")
     return rc == 0
@@ -283,6 +301,7 @@ def cmd_flash_esp32(a: argparse.Namespace) -> int:
             return EXIT_FAIL
     if not build_one("ESP32-S3 firmware", REPO, ENV_ESP):
         return EXIT_FAIL
+    refresh_sdkconfig()
     rc, out = run_pio(["run", "-e", ENV_ESP, "-t", "upload", "--upload-port", port], REPO, "upload ESP32")
     if rc != 0:
         err("ESP32 upload FAILED")

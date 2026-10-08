@@ -32,3 +32,6 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # Gate-edge timer ISR must keep running during flash writes (NVS on a $ setting),
 # otherwise a laser-off edge could be delayed by a flash operation.
 CONFIG_GPTIMER_ISR_CACHE_SAFE=y
+
+# 4 MB flash module (see platformio.ini board_upload.flash_size).
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
