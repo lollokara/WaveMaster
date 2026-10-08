@@ -64,16 +64,3 @@ When modifying firmware code:
    - Optical scale `$100`/`$101` (V/mm), offset `$110`/`$111` (V), and timing delays `$130`-`$134` persist in NVS via `calib.c`.
    - Any new tuning parameter should follow this pattern and update `calib.c` / `calib_dump()`.
 
----
-
-## 4. Git & Push Discipline
-
-* The repo uses dual-push configuration for `origin` (`git@192.168.3.87:...` and `git@github.com:...`).
-* On macOS / exFAT volumes, ensure `COPYFILE_DISABLE=1` is set and strip any `._*` AppleDouble sidecars before staging commits:
-  ```bash
-  export COPYFILE_DISABLE=1
-  find . -name "._*" -delete
-  git add <files>
-  git commit -m "..."
-  git push origin main
-  ```
