@@ -1,189 +1,186 @@
 # WaveMaster 🌊
 
-**High-Performance ESP32-S3 Firmware for Fiber-Laser Galvano Controllers (AD3552R Dual DAC)**
+**ESP32-S3 firmware for fiber-laser galvo controllers, driving an AD3552R dual 16-bit DAC.**
 
-WaveMaster turns an **ESP32-S3** into a real-time, dual-core fiber laser galvo controller. It drives an ultra-low latency **Analog Devices AD3552R dual 16-bit DAC** over high-speed SPI for galvanometer mirror positioning, exposes a **GRBL 1.1-compatible serial interface** for host senders (e.g., LightBurn, Rayforge, LaserWeb), and manages laser safety, setpoints, and arming alongside a companion **ATmega328P** controller.
-
----
-
-## ⚡ Key Architecture & Highlights
-
-* **Dual-Core Architecture (FreeRTOS)**:
-  * **Core 0 (`dac_task`)**: Dedicated exclusively to DAC hardware control, SPI transfers, high-speed buffered streaming, look-ahead path pacing, laser firing (`Engrave GPIO`), and timing delays. Unsubscribes idle task and feeds task watchdog directly (`esp_task_wdt_reset`) to ensure jitter-free marking and previews.
-  * **Core 1 (`grbl_task` & `atmega_task`)**: Handles G-code parsing, kinematics (trapezoidal planner, junction deviation, arc interpolation), calibration, and asynchronous background communication with the ATmega companion.
-* **Analog Devices AD3552R 16-bit Dual DAC**:
-  * Dual-channel ±10V / ±5V differential output for X and Y galvanometer servo amplifiers.
-  * Supports single-point writes and high-throughput hardware-paced SPI streaming.
-* **GRBL 1.1 Protocol Compatibility**:
-  * Speaks standard G-code (`G0`, `G1`, `G2`, `G3`, `G4`, `G90`, `G91`, `G92`).
-  * Realtime commands (`?`, `!`, `~`, `Ctrl-X`) and setting management (`$$`).
-  * Seamless laser-mode semantics (`$32=1` convention): `G0` automatically inhibits laser firing during rapid traversing; `G1/G2/G3` mark.
-* **Industrial Galvo Marking Features**:
-  * Configurable settle delays: **Jump Delay**, **Mark Delay**, **Polygon Delay**, **Laser-On Delay**, and **Laser-Off Delay** (`$130`-`$134`).
-  * F-theta lens radial correction ($k_1$ parameter via `$140`).
-  * Wobble mark / kerf-widening generator (`$150` diameter, `$151` pitch).
-  * Skywriting acceleration margin (`$160`).
-  * Hardware boundary preview loop (`M68`).
-  * Closed-polygon hatch-fill generator (`M64` / `M65`).
+WaveMaster turns an ESP32-S3 into a galvo marking controller. It speaks GRBL 1.1
+over USB for Rayforge, turns G-code into a constant-speed trajectory at a fixed
+10 us tick, and streams it to the AD3552R as one continuous hardware-paced
+quad-SPI transfer. The laser gate is switched in lock-step with the DAC samples.
+A companion ATmega328P owns the slow laser lines (power word, arm, guide, status).
 
 ---
 
-## 📌 Hardware Pinouts & Wiring
+## ✨ Features
 
-### 1. ESP32-S3 Pinout
-
-| ESP32-S3 GPIO | Function / Signal | Connected To / Description |
-|:---:|:---|:---|
-| **GPIO 5** | `BOARD_PIN_SCK` | AD3552R SPI Serial Clock (SCK) |
-| **GPIO 6** | `BOARD_PIN_CS` | AD3552R SPI Chip Select (CS) |
-| **GPIO 7** | `BOARD_PIN_SPI_OP1` | AD3552R QSPI Mode Pin (Low = Classic/Dual, High = Quad) |
-| **GPIO 8** | `BOARD_PIN_DIR` | AD3552R SPI Direction Control Pin |
-| **GPIO 9** | `BOARD_PIN_RST` | AD3552R Hardware Reset (RST) |
-| **GPIO 10** | `BOARD_PIN_D3` | AD3552R Data Lane 3 / QSPI |
-| **GPIO 11** | `BOARD_PIN_D2` | AD3552R Data Lane 2 / QSPI |
-| **GPIO 12** | `BOARD_PIN_D1` | AD3552R Data Lane 1 / SDO |
-| **GPIO 13** | `BOARD_PIN_D0` | AD3552R Data Lane 0 / SDI |
-| **GPIO 3** | `BOARD_PIN_PRR` | Laser Pulse Repetition Rate (PWM out, via LEDC) |
-| **GPIO 4** | `BOARD_PIN_ENGRAVE` | Laser Firing Trigger Output (High = Firing) |
-| **GPIO 44** | `UART0 TX` | Link to ATmega328P RX (via Level Shifter) |
-| **GPIO 43** | `UART0 RX` | Link to ATmega328P TX (via Level Shifter) |
-| **Native USB** | `USB-Serial-JTAG` | PC / Host G-Code & Monitor Connection (115200 baud) |
-
-> [!NOTE]
-> *The ATmega328P link runs at **250,000 baud 8N1** across a logic level shifter. In firmware, UART0 pins are explicitly assigned as **GPIO44 (TX)** and **GPIO43 (RX)**.*
+- **Constant-speed trajectory:** arc-length interpolation at a fixed tick (`$200`, default 10 us). The beam keeps its speed through corners. `$215` adds a hold at sharp turns.
+- **Sample-locked laser gate:** the gate (DB25 pin 19) is set from the SPI transaction callback and toggled mid-chunk by a GPTimer alarm, both timed from the same instant as the DAC samples.
+- **Jump trapezoids:** `G0` uses a trapezoidal profile (`$201` speed, `$120` acceleration) and a settle delay.
+- **EZCAD-style delays:** laser-on / laser-off, jump, mark and polygon-corner delays (`$210`-`$216`).
+- **Power modes:** analog power word over the ATmega link (`$223=0`), or pulse-density modulation at fixed power (`$223=1`).
+- **GRBL 1.1 over USB** with character counting, 1024-byte RX window, realtime `?` `!` `~` Ctrl-X and jog cancel.
+- **ATmega protocol v2:** CRC-8 framed, with a heartbeat. The ATmega disarms within 1 s if the ESP32 goes silent.
+- **Stream statistics:** `$S` reports underruns, barriers and ATmega link state. `$RB` reads back the DAC registers when idle.
 
 ---
 
-### 2. Arduino Companion (ATmega328P) Pinout
+## 🧭 Pipeline
 
-Located in [`ArduinoCompanion/`](ArduinoCompanion/), this microcontroller offloads 8-bit parallel digital power level setting, safety arming sequences, and auxiliary laser control.
+```
+Rayforge --USB--> host_rx (core 1, prio 10) --> grbl (prio 9) --> motion_task (prio 8)
+                                                                    | motion generator: one (x, y, power) per tick
+                                                                    v
+                                              galvo_out: mm -> DAC codes, gate edges, power barriers
+                                                                    | chunk pool: 8 x 2048 ticks (12 KB DMA each)
+                                                                    v
+                    dac_task (core 0, prio 10): quad-SPI streaming, gate ISR + GPTimer
+                                                                    |
+                                                                    v
+                                              AD3552R --> galvo X/Y drivers
 
-| ATmega Pin | Signal Name | Type | Description |
-|:---:|:---|:---:|:---|
-| **A7** | `PIN_D0` | Output | Power Bit 0 (LSB) to Fiber Laser Source |
-| **A6** | `PIN_D1` | Output | Power Bit 1 |
-| **A4** | `PIN_D2` | Output | Power Bit 2 |
-| **A2** | `PIN_D3` | Output | Power Bit 3 |
-| **A1** | `PIN_D4` | Output | Power Bit 4 |
-| **13** | `PIN_D5` | Output | Power Bit 5 |
-| **3** | `PIN_D6` | Output | Power Bit 6 |
-| **5** | `PIN_D7` | Output | Power Bit 7 (MSB) |
-| **6** | `PIN_LATCH` | Output | Latch pulse for power data |
-| **A0** | `PIN_EMISSION_ENABLE` | Output | System Arm / Emission Enable relay/line |
-| **2** | `PIN_EMISSION_MOD` | Output | Emission modulation signal (PWM) |
-| **4** | `PIN_SYNC` | Output | Laser sync signal (PWM) |
-| **7** | `PIN_GUIDE_LASER` | Output | Visible Red Guide Laser On/Off |
-| **8** | `PIN_AUX_OFF` | Output | Auxiliary safety power cut (Default HIGH) |
-| **11** | `PIN_RED_LED` | Output | Armed indicator LED |
-| **12** | `PIN_GREEN_LED` | Output | Standby / Ready indicator LED |
-| **A5** | `PIN_5V_DETECT` | Input | 5V rail voltage sense (analog) |
-| **9** | `PIN_STAT_11` | Input | Status line from laser module |
-| **10** | `PIN_STAT_12` | Input | Status line from laser module |
-| **A3** | `PIN_STAT_16` | Input | Status line from laser module |
-| **D0 (RX)** | `UART RX` | Input | Serial from ESP32 GPIO 44 (250 kBaud) |
-| **D1 (TX)** | `UART TX` | Output | Serial to ESP32 GPIO 43 (250 kBaud) |
+atmega_link (core 1, prio 5) <--UART0 250k--> ATmega328P --> power word, arm, guide, status
+```
+
+Flow control is end to end. `motion_submit()` blocks while the segment queue is full. `grbl` then withholds `ok`, and the host's character counting pauses.
 
 ---
 
-## 🛠️ Calibration & Parameters (`$$`)
+## 📦 Modules
 
-All calibration settings are stored in ESP32 NVS flash and persist across power cycles. Values can be queried with `$$` and changed via `$<id>=<val>`.
-
-| Setting | Name | Unit | Default | Description |
-|:---|:---|:---:|:---:|:---|
-| **`$100`** | X Volts/mm | V/mm | `1.0` | Output scale for X galvanometer axis |
-| **`$101`** | Y Volts/mm | V/mm | `1.0` | Output scale for Y galvanometer axis |
-| **`$110`** | X Offset | V | `0.0` | Voltage center offset for X galvo |
-| **`$111`** | Y Offset | V | `0.0` | Voltage center offset for Y galvo |
-| **`$130`** | Jump Delay | $\mu\text{s}$ | `250` | Galvo settle time after rapid traversal (`G0`) |
-| **`$131`** | Mark Delay | $\mu\text{s}$ | `150` | Settle time at the end of a marking stroke |
-| **`$132`** | Polygon Delay | $\mu\text{s}$ | `50` | Extra settle delay on stroke corner vertices |
-| **`$133`** | Laser-On Delay | $\mu\text{s}$ | `100` | Delay after asserting laser fire before moving |
-| **`$134`** | Laser-Off Delay| $\mu\text{s}$ | `100` | Delay after deasserting laser fire |
-| **`$140`** | Radial Corr $k_1$ | — | `0.0` | $r' = r(1 + k_1 r^2)$ barrel/pincushion F-theta correction |
-| **`$150`** | Wobble Diameter | mm | `0.0` | Beam wobble diameter (`0` = disabled) |
-| **`$151`** | Wobble Pitch | mm | `0.1` | Forward distance per wobble cycle |
-| **`$160`** | Skywriting Margin| mm | `0.0` | Traversal run-in/run-out margin with laser off |
-| **`$170`** | Hatch Spacing | mm | `0.1` | Scanline spacing for `M64`/`M65` polygon fills |
-| **`$171`** | Hatch Angle | deg | `0.0` | Scanline angle for hatch fills |
-| **`$180`** | Acceleration | $\text{mm/s}^2$ | `10000` | Look-ahead motion planner maximum acceleration |
-| **`$181`** | Junction Deviation| mm | `0.02` | Cornering tolerance factor |
-| **`$182`** | Max Velocity | mm/s | `2000` | Hard cap on trajectory velocity |
+| Path | Role |
+|:---|:---|
+| `src/main.c` | Boot sequence: early gate-off, NVS, UART, DAC, motion, GRBL. |
+| `src/host_serial.{c,h}` | USB-Serial-JTAG driver, host RX task, realtime bytes, `[MSG:...]` logging. |
+| `src/grbl.{c,h}` | GRBL 1.1 front end: line parser, modal state, `$` commands, status reports, reset handling. |
+| `src/gcode_parse.{c,h}` | Word parser, arc linearisation, feed and power mapping. |
+| `src/calib.{c,h}` | Settings table (`s_defs`), NVS persistence, `$$` dump. |
+| `src/motion.{c,h}` | Pure-C trajectory generator (ticks). No ESP-IDF dependencies, host-testable. |
+| `src/motion_task.{c,h}` | Core 1 task that owns the segment queue and the generator. Underrun policy. |
+| `src/galvo_out.{c,h}` | Tick to DAC codes, gate timing, power modes, chunking, abort and feed hold. |
+| `src/galvo_chunk.h` | Private chunk structure shared by `galvo_out` and `dac_task`. |
+| `src/dac_task.{c,h}` | Core 0 owner of SPI and the AD3552R: streaming, gate ISR and timer, barriers, readback. |
+| `src/laser_io.{c,h}` | GPIO4 gate (IRAM-safe, kill switch) and GPIO3 SYNC (LEDC). |
+| `src/ad3552r_board.{c,h}` | AD3552R bring-up, pin map, quad-mode switching, volts-to-code conversion. |
+| `src/atmega_link.{c,h}` | Protocol v2 client for the ATmega: power, arm, guide, status, heartbeat. |
+| `components/ad3552r/` | Ported no-OS AD3552R driver with ESP-IDF SPI, GPIO and CRC shims. |
+| `ArduinoCompanion/` | ATmega328P firmware: power word, arm, guide, status inputs, watchdog. See its [README](ArduinoCompanion/README.md). |
+| `test/host/` | Host unit tests for the trajectory generator. |
+| `test/host/gcode/` | Host unit tests for the G-code parser. |
+| `tools/` | Host helpers: `stream_test.py` (character-counting bring-up and tuning patterns, preview unless `--fire`), `jog.py`. |
 
 ---
 
-## 📡 Custom M-Codes & Laser Protocol
+## 📌 Hardware
 
-| Code | Parameters | Description |
-|:---|:---|:---|
-| **`M3` / `M4`** | `S<0-1000>` | Laser marking mode enabled; sets power (0-100% mapped to ATmega) |
-| **`M5`** | — | Laser marking mode off (Engrave disabled) |
-| **`M10`** | — | **Arm Laser**: Initiates 2-second safety arm sequence on ATmega companion |
-| **`M11`** | — | **Disarm Laser**: De-asserts emission enable line |
-| **`M62`** | — | Turn **Red Guide Laser ON** |
-| **`M63`** | — | Turn **Red Guide Laser OFF** |
-| **`M64`** | — | Start recording closed polygon for hardware hatch-filling |
-| **`M65`** | — | Finish polygon and execute hatch fill pattern |
-| **`M66`** | — | Enter **Preview Mode** (guide laser ON, main laser forced OFF) |
-| **`M67`** | — | Exit **Preview Mode** |
-| **`M68`** | `P<Hz>` | Replay recorded outline continuously on galvo (boundary preview) |
-| **`Q<Hz>`** | `<Hz>` | Configure laser Pulse Repetition Rate (PWM frequency on GPIO 3) |
-| **`$RB`** | — | Debug command: Read back raw AD3552R DAC output registers over SPI |
+Pin-level wiring is in **[docs/WIRING.md](docs/WIRING.md)**, with a diagram in
+[docs/wiring.svg](docs/wiring.svg). The short version:
+
+- **ESP32-S3 GPIO4** is the laser gate, on DB25 pin 19. **GPIO3** is SYNC / PRR, on DB25 pin 20.
+- **ESP32-S3 GPIO5-13** drive the AD3552R (SCK, CS, QSPI select, DIR, RST, D0-D3).
+- **ESP32-S3 GPIO44 / GPIO43** are UART0 TX / RX to the ATmega, through a level shifter.
+- **ATmega328P** drives the power word (DB25 pins 1-9), arm (pin 18), guide (pin 22), and E-stop (pin 23, held high). It reads status on pins 11, 12, 16 and 17.
+
+Setting up Rayforge is in **[docs/RAYFORGE.md](docs/RAYFORGE.md)**.
 
 ---
 
-## 🚀 Building & Flashing
+## 🛠️ Settings (`$$`)
 
-### WaveMaster (ESP32-S3)
-Using [PlatformIO](https://platformio.org/):
+Settings persist in NVS and load at boot. Read them with `$$`, and change one with
+`$<n>=<value>`. The table below is copied verbatim from `src/calib.h`. Valid ranges
+are in the `s_defs` table in `src/calib.c`.
+
+```
+$3    axis invert mask: bit0 = invert X, bit1 = invert Y        [0]
+$12   arc tolerance, mm (G2/G3 chord error)                    [0.01]
+$13   report inches - fixed 0 (read-only)
+$30   S value for 100% power                                   [1000]
+$31   S value for 0% power - fixed 0 (read-only)
+$32   laser mode - fixed 1 (read-only)
+$100  X scale, volts per mm                                    [0.1]
+$101  Y scale, volts per mm                                    [0.1]
+$110  max marking speed, mm/min ($111 is an alias)             [300000]
+$120  jump acceleration, mm/s^2, 0 = no ramp ($121 alias)      [2000000]
+$130  work area width, mm                                      [100]
+$131  work area height, mm                                     [100]
+$140  X offset, volts                                          [0]
+$141  Y offset, volts                                          [0]
+$142  radial (F-theta) correction k1: r' = r(1 + k1 r^2)       [0]
+$143  swap X/Y axes (0/1)                                      [0]
+$144  origin: 0 = work area corner (0,0)..(W,H) centred on the
+      lens; 1 = (0,0) is the lens centre                       [0]
+$150  wobble diameter, mm, 0 = off                             [0]
+$151  wobble pitch, mm per revolution                          [0.5]
+$200  tick period, us (one DAC point per tick)                 [10]
+$201  jump speed, mm/s                                         [3000]
+$203  default marking speed when no F was given, mm/s         [500]
+$210  laser-on delay, us                                       [100]
+$211  laser-off delay, us                                      [120]
+$212  jump delay, us                                           [300]
+$213  extra jump delay per mm of jump, us/mm                   [0]
+$214  mark delay (hold at end of a polyline), us               [100]
+$215  polygon delay at a 180 deg corner, us                    [0]
+$216  polygon delay angle threshold, degrees                   [30]
+$220  pulse repetition rate (SYNC), Hz                         [30000]
+$221  SYNC duty cycle, %                                       [50]
+$223  power mode: 0 analog (ATmega word), 1 pulse density      [0]
+$224  power at S = 0+ (min), %                                 [0]
+$225  power at S = $30 (max), %                                [100]
+$226  auto-arm when the first mark needs the laser (0/1)        [1]
+$227  max wait for arm/ready, ms                               [4000]
+$229  pulse-density period, ticks                              [10]
+$230  gate (EMISSION MODULATION) active low (0/1)              [0]
+```
+
+Read-only GRBL values (`$0`, `$1`, `$2`, `$4`-`$6`, `$10`, `$11`, `$20`-`$27`, `$31`, `$32`, `$102`, `$112`, `$122`, `$132`) are reported for sender compatibility and ignored when set.
+
+---
+
+## 📡 G-code and custom M-codes
+
+| Code | Description |
+|:---|:---|
+| `G0` / `G1` | Travel (jump, laser off) / mark at `F` mm/min. Marking speed is capped at `$110`. |
+| `G2` / `G3` | Arcs, linearised to the `$12` tolerance. |
+| `G4 P<s>` | Dwell. |
+| `G10 L2` / `L20` | Set work coordinate offsets. |
+| `G20` / `G21` | Inches / millimetres. |
+| `G53`, `G54`-`G59`, `G90`, `G91`, `G92` (`G92.1`-`G92.3` clear it) | Machine coordinates, work offsets, absolute / relative, coordinate offset. |
+| `M3` / `M4` / `M5` | Laser mode on (`M4` and `M3` set power from `S`) / off. `S` maps to power through `$30`, `$224` and `$225`. |
+| **`M10`** / **`M11`** | **Arm** / disarm the laser (ATmega emission enable, with a 2 s settle). |
+| **`M62`** / **`M63`** | Guide (red) laser on / off. |
+| **`M66`** / **`M67`** | **Preview** on (guide on, marking laser forced off, real trajectory) / off. |
+| `M0`, `M1`, `M2`, `M6`-`M9`, `M30`, `M64`, `M65`, `M68`, `M69` | Accepted. Most are no-ops. `M2` and `M30` end the program. |
+| `$J=` | Jog. A jog cancel (0x85) stops motion. |
+| `$H` | Accepted, does nothing (no homing). |
+| `$RB` | Read back the AD3552R output registers (idle only). |
+| `$S` | Stream and ATmega link statistics. |
+| `$I` | Version and buffer sizes. |
+| `?`, `!`, `~`, Ctrl-X | Status, feed hold, resume, soft reset (laser off immediately). |
+
+---
+
+## 🚀 Build and flash
+
+Requires [PlatformIO](https://platformio.org/). The platform is pinned to
+`espressif32@6.13.0` (ESP-IDF 5.5), in `platformio.ini`.
 
 ```bash
-# Build firmware
+# ESP32-S3 firmware
 pio run
-
-# Flash to ESP32-S3 and launch serial monitor
 pio run -t upload -t monitor
+
+# ATmega328P companion (flash before reconnecting the laser; see docs/WIRING.md)
+cd ArduinoCompanion && pio run -t upload
+
+# Host unit tests
+make -C test/host              # trajectory generator
+make -C test/host/gcode        # G-code parser
 ```
 
-### Arduino Companion (ATmega328P)
-```bash
-cd ArduinoCompanion
-pio run -t upload
-```
-
----
-
-## 📁 Repository Structure
-
-```
-├── CMakeLists.txt                 # ESP-IDF CMake definition
-├── platformio.ini                 # PlatformIO configuration (esp32-s3-devkitc-1)
-├── sdkconfig.defaults             # ESP-IDF configurations (USB-Serial-JTAG, TWDT)
-├── components/
-│   └── ad3552r/                   # Ported Analog Devices no-OS AD3552R driver + ESP32 SPI/GPIO HAL
-├── src/
-│   ├── main.c                     # System entrypoint, boot sequence, log multiplexer
-│   ├── ad3552r_board.{c,h}        # AD3552R hardware init, QSPI setup, volts/code conversion
-│   ├── dac_task.{c,h}             # Core 0: Real-time DAC SPI writes, streaming, delays
-│   ├── grbl_task.{c,h}            # Core 1: G-code interpreter, status responses, laser logic
-│   ├── motion_planner.{c,h}       # Kinematics lookahead planner, junction deviation
-│   ├── atmega_link.{c,h}          # Asynchronous serial client to ATmega companion
-│   ├── calib.{c,h}                # NVS-backed optical & timing calibration
-│   ├── laser_ctrl.{c,h}           # Inter-core FreeRTOS command queues & unit conversions
-│   ├── laser_fill.{c,h}           # Scanline polygon hatch-fill geometry generator
-│   ├── engrave_gpio.{c,h}         # Laser trigger output GPIO control
-│   └── prr_pwm.{c,h}              # LEDC PWM pulse-repetition-rate generator
-├── ArduinoCompanion/              # Standalone ATmega328P companion firmware
-│   ├── platformio.ini
-│   ├── README.md
-│   └── src/main.cpp
-└── tools/
-    ├── jog.py                     # Interactive CLI jogging utility
-    └── square_loop.py             # Boundary test utility for preview/tuning
-```
+`sdkconfig.defaults` selects the USB-Serial-JTAG console, sets `CONFIG_FREERTOS_HZ=1000`, and keeps the ISR code that the stream path uses in IRAM.
 
 ---
 
 ## 📜 License
 
-Distributed under the MIT License. Feel free to use, adapt, and build upon this project.
+Distributed under the MIT License, as stated in the previous README. There is no `LICENSE` file in this repository yet.
