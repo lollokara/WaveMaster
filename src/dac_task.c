@@ -569,6 +569,7 @@ static void dac_task(void *arg)
     }
     ad3552r_esp32_spi_set_stream_cbs(stream_pre, stream_post);
     boot_self_test();
+    ad3552r_board_guard_snapshot();     /* reference for the config guard */
     s_init_ok = true;
     xSemaphoreGive(s_init_sem);
 
@@ -603,4 +604,15 @@ bool dac_task_readback(uint16_t *code_x, uint16_t *code_y)
     e |= ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_CH_DAC_24B(1), code_y);
     xSemaphoreGive(s_bus_mtx);
     return e == 0;
+}
+
+int dac_task_regdump(const uint8_t **addrs, uint16_t *vals, size_t max)
+{
+    int n;
+
+    if (!s_init_ok || xSemaphoreTake(s_bus_mtx, 0) != pdTRUE)
+        return -1; /* stream open (or not ready) */
+    n = (int)ad3552r_board_dump_regs(addrs, vals, max);
+    xSemaphoreGive(s_bus_mtx);
+    return n;
 }

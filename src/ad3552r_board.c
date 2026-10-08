@@ -210,29 +210,181 @@ static bool s_stream_mode_configured = false;
 static uint32_t s_stream_saved_clock_hz = 0;
 static uint8_t s_stream_marker[1];
 
+/*
+ * Analog/interface configuration that must never change while running:
+ * output range, per-channel offset and gain, reference, power-down and the
+ * interface config. Snapshotted after ad3552r_init() and checked before every
+ * stream session.
+ *
+ * Why: a stream session writes the two DAC registers by letting the chip's
+ * address pointer loop over 6 bytes (STREAM_MODE). If that loop is not in
+ * effect, or the instruction is mis-decoded, the stream walks down through
+ * the register map instead - output range 0x19, offsets/gains 0x1B-0x1E -
+ * which shows up as a stray point and then a permanent shift/scale of the
+ * output until reboot. The open sequence below is built so this cannot
+ * happen, and this check repairs (and reports) it if anything else ever
+ * does.
+ */
+static const uint8_t s_guard_regs[] = {
+    AD3552R_REG_ADDR_INTERFACE_CONFIG_A,
+    AD3552R_REG_ADDR_INTERFACE_CONFIG_D,
+    AD3552R_REG_ADDR_SH_REFERENCE_CONFIG,
+    AD3552R_REG_ADDR_POWERDOWN_CONFIG,
+    AD3552R_REG_ADDR_CH0_CH1_OUTPUT_RANGE,
+    AD3552R_REG_ADDR_CH_OFFSET(0),
+    AD3552R_REG_ADDR_CH_GAIN(0),
+    AD3552R_REG_ADDR_CH_OFFSET(1),
+    AD3552R_REG_ADDR_CH_GAIN(1),
+};
+#define GUARD_N (sizeof(s_guard_regs) / sizeof(s_guard_regs[0]))
+static uint16_t s_guard_vals[GUARD_N];
+static bool s_guard_valid;
+static uint32_t s_guard_repairs;
+
+void ad3552r_board_guard_snapshot(void)
+{
+    size_t i;
+
+    s_guard_valid = false;
+    for (i = 0; i < GUARD_N; i++) {
+        if (ad3552r_read_reg(g_dac, s_guard_regs[i], &s_guard_vals[i]) != 0) {
+            ESP_LOGE(TAG, "config snapshot: read of reg 0x%02x failed", s_guard_regs[i]);
+            return;
+        }
+    }
+    s_guard_valid = true;
+}
+
+/* Single-lane, non-streaming mode only. Returns the number of registers
+ * that had to be restored. */
+static uint32_t guard_check_and_repair(void)
+{
+    uint32_t fixed = 0;
+    size_t i;
+
+    if (!s_guard_valid)
+        return 0;
+    for (i = 0; i < GUARD_N; i++) {
+        uint16_t v = 0;
+
+        if (ad3552r_read_reg(g_dac, s_guard_regs[i], &v) != 0)
+            continue;
+        if (v == s_guard_vals[i])
+            continue;
+        ESP_LOGW(TAG, "DAC config reg 0x%02x changed: 0x%02x (expected 0x%02x) - restoring",
+                 s_guard_regs[i], v, s_guard_vals[i]);
+        ad3552r_write_reg(g_dac, s_guard_regs[i], s_guard_vals[i]);
+        fixed++;
+    }
+    s_guard_repairs += fixed;
+    return fixed;
+}
+
+uint32_t ad3552r_board_guard_repairs(void)
+{
+    return s_guard_repairs;
+}
+
+int32_t ad3552r_board_dump_regs(const uint8_t **addrs, uint16_t *vals, size_t max)
+{
+    size_t i, n = GUARD_N + 3;
+    static const uint8_t extra[3] = {
+        AD3552R_REG_ADDR_INTERFACE_CONFIG_B,
+        AD3552R_REG_ADDR_STREAM_MODE,
+        AD3552R_REG_ADDR_TRANSFER_REGISTER,
+    };
+    static uint8_t all[GUARD_N + 3];
+
+    if (max < n)
+        return -EINVAL;
+    for (i = 0; i < GUARD_N; i++)
+        all[i] = s_guard_regs[i];
+    for (i = 0; i < 3; i++)
+        all[GUARD_N + i] = extra[i];
+    for (i = 0; i < n; i++) {
+        int32_t err = ad3552r_read_reg(g_dac, all[i], &vals[i]);
+
+        if (err)
+            return err;
+    }
+    *addrs = all;
+    return (int32_t)n;
+}
+
+/*
+ * Open order (all configuration in single-lane, non-streaming mode, where
+ * register reads are verified reliable; nothing is read over quad SPI):
+ *  1. check/restore the analog config (above);
+ *  2. write TRANSFER_REGISTER with STREAM_LENGTH_KEEP_VALUE set and
+ *     STREAM_MODE = 6, then read both back - the loop length can no longer
+ *     auto-reset to 0 between transactions;
+ *  3. clear SINGLE_INST in INTERFACE_CONFIG_B (streaming mode) as the last
+ *     register write;
+ *  4. switch the QSPI pin and the bus to 4 lines and send only the write
+ *     instruction for CH1 (CS stays low; chunks follow as data-only
+ *     transactions).
+ * The previous version applied the stream config with the driver's
+ * read-modify-write helper AFTER switching to quad, i.e. it read
+ * INTERFACE_CONFIG_B and STREAM_MODE over quad SPI through the bidirectional
+ * level shifter; a bad read there gets written back and corrupts the
+ * instruction decoding or the loop, which is how the stream could land in
+ * the range/offset/gain registers.
+ */
 int32_t ad3552r_board_stream_open(uint32_t clock_hz)
 {
-    struct ad3552_transfer_config stream_cfg = {0};
     struct ad3552_transfer_data xfer = {0};
+    uint16_t xfer_reg = 0, cfg_b = 0, rb_mode = 0, rb_xfer = 0;
     int32_t err;
 
-    s_stream_saved_clock_hz = g_dac->spi->clock_hz;
-    err = ad3552r_esp32_spi_set_clock(g_dac->spi, clock_hz);
+    /* 1-3: single lane, QSPI pin low (the closed state), normal clock. */
+    guard_check_and_repair();
+
+    err = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_TRANSFER_REGISTER, &xfer_reg);
+    if (!err)
+        err = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_INTERFACE_CONFIG_B, &cfg_b);
     if (err)
         return err;
+    xfer_reg |= AD3552R_MASK_STREAM_LENGTH_KEEP_VALUE;
+    err = ad3552r_write_reg(g_dac, AD3552R_REG_ADDR_TRANSFER_REGISTER, xfer_reg);
+    if (!err)
+        err = ad3552r_write_reg(g_dac, AD3552R_REG_ADDR_STREAM_MODE, STREAM_BYTES_PER_POINT);
+    if (!err)
+        err = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_STREAM_MODE, &rb_mode);
+    if (!err)
+        err = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_TRANSFER_REGISTER, &rb_xfer);
+    if (err)
+        return err;
+    if (rb_mode != STREAM_BYTES_PER_POINT || !(rb_xfer & AD3552R_MASK_STREAM_LENGTH_KEEP_VALUE)) {
+        ESP_LOGE(TAG, "stream setup did not stick (STREAM_MODE=0x%02x TRANSFER=0x%02x); not streaming",
+                 rb_mode, rb_xfer);
+        return -EIO;
+    }
+    err = ad3552r_write_reg(g_dac, AD3552R_REG_ADDR_INTERFACE_CONFIG_B,
+                            cfg_b & ~AD3552R_MASK_SINGLE_INST);
+    if (err)
+        return err;
+    /* Keep the driver's cached view in step, so stream_end() only has to
+     * flip SINGLE_INST back. */
+    g_dac->spi_cfg.single_instr = 0;
+    g_dac->spi_cfg.stream_mode_length = STREAM_BYTES_PER_POINT;
+    g_dac->spi_cfg.stream_length_keep_value = 1;
+    s_stream_mode_configured = true;
 
+    /* 4: quad, slow clock, instruction only. */
+    s_stream_saved_clock_hz = g_dac->spi->clock_hz;
+    err = ad3552r_esp32_spi_set_clock(g_dac->spi, clock_hz);
+    if (err) {
+        ad3552r_board_stream_end();
+        return err;
+    }
     set_qspi_pin(true);
     ad3552r_esp32_spi_set_lines(g_dac->spi, 4);
 
-    stream_cfg.single_instr = 0;
-    stream_cfg.stream_mode_length = STREAM_BYTES_PER_POINT;
-    stream_cfg.addr_asc = 0;
-    xfer.spi_cfg = &stream_cfg;
+    xfer.spi_cfg = NULL;
     xfer.addr = AD3552R_REG_ADDR_CH_DAC_24B(1); /* CH1, the higher address */
     xfer.data = s_stream_marker;
     xfer.len = 1;
     xfer.is_read = 0;
-    s_stream_mode_configured = true;
 
     ad3552r_esp32_spi_stream_arm(s_stream_marker);
     err = ad3552r_transfer(g_dac, &xfer);
@@ -297,8 +449,12 @@ int32_t ad3552r_board_stream_end(void)
     if (!s_stream_mode_configured)
         return 0;
 
+    /* Only SINGLE_INST goes back. STREAM_MODE (6) and KEEP_VALUE stay set:
+     * they have no effect in single-instruction mode, and keeping them means
+     * _update_spi_cfg() does no read-modify-write of them here. */
     normal_cfg.single_instr = 1;
-    normal_cfg.stream_mode_length = 0;
+    normal_cfg.stream_mode_length = STREAM_BYTES_PER_POINT;
+    normal_cfg.stream_length_keep_value = 1;
     normal_cfg.addr_asc = 0;
 
     /* ad3552r_read_reg()/_write_reg() never attach a spi_cfg to their

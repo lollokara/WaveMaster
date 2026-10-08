@@ -54,6 +54,16 @@ int32_t ad3552r_board_stream_end(void);
 int32_t ad3552r_board_stream_open(uint32_t clock_hz);
 void ad3552r_board_stream_close(void);
 
+/* Analog/interface config guard (see ad3552r_board.c): snapshot after init,
+ * checked and restored before every stream session. */
+void ad3552r_board_guard_snapshot(void);
+uint32_t ad3552r_board_guard_repairs(void);
+
+/* Diagnostics: reads the guarded registers plus INTERFACE_CONFIG_B,
+ * STREAM_MODE and TRANSFER_REGISTER. Returns the count (addrs points to a
+ * static table) or a negative error. Only while the stream is closed. */
+int32_t ad3552r_board_dump_regs(const uint8_t **addrs, uint16_t *vals, size_t max);
+
 /* spi_device_handle_t of the current device (valid after stream_open). */
 void *ad3552r_board_spi_dev(void);
 /* Clock the device really runs at (Hz), 0 if unknown. */

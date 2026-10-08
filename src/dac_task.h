@@ -14,6 +14,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 /* Initialises the AD3552R and starts the task pinned to core 0. */
 bool dac_task_start(void);
@@ -22,5 +23,10 @@ bool dac_task_start(void);
  * stream is closed (idle); returns false otherwise or on SPI error. Runs on
  * the caller's task but serialises with dac_task internally. */
 bool dac_task_readback(uint16_t *code_x, uint16_t *code_y);
+
+/* Diagnostic: reads the DAC configuration registers (range, offsets, gains,
+ * interface and stream config). Same rules as dac_task_readback(). Returns
+ * the number of registers read into addrs/vals, or a negative value. */
+int dac_task_regdump(const uint8_t **addrs, uint16_t *vals, size_t max);
 
 #endif /* DAC_TASK_H_ */

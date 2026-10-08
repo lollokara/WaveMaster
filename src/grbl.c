@@ -38,6 +38,7 @@
 #include "atmega_link.h"
 #include "calib.h"
 #include "dac_task.h"
+#include "ad3552r_board.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -541,6 +542,8 @@ static void print_stats(void)
         laser_io_get_state(&io);
         host_printf("[MSG:io gate=%d kill=%d gate_active_low=%d sync_hz=%lu]\r\n",
                     io.gate_on, io.killed, io.active_low, (unsigned long)io.prr_hz);
+        host_printf("[MSG:dac config_repairs=%lu]\r\n",
+                    (unsigned long)ad3552r_board_guard_repairs());
     }
 }
 
@@ -692,7 +695,7 @@ static int exec_dollar(char *line)
         p[--len] = '\0';
 
     if (len == 1) {
-        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $GT=ms $LT=ms,S ~ ! ? ctrl-x]\r\n");
+        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $RD $GT=ms $LT=ms,S ~ ! ? ctrl-x]\r\n");
         return 0;
     }
     if (strcmp(p, "$$") == 0) {
@@ -736,6 +739,24 @@ static int exec_dollar(char *line)
         return laser_test(p + 4, false);
     if (strncmp(p, "$LT=", 4) == 0)
         return laser_test(p + 4, true);
+    if (strcmp(p, "$RD") == 0) {
+        const uint8_t *a = NULL;
+        uint16_t v[16];
+        int n = (s_fault || motion_busy() || galvo_out_busy()) ? -1 : dac_task_regdump(&a, v, 16);
+
+        if (n <= 0) {
+            host_puts("[MSG:RD unavailable (busy or SPI error)]\r\n");
+        } else {
+            char line[160];
+            int o = snprintf(line, sizeof(line), "[MSG:RD");
+
+            for (int i = 0; i < n && o < (int)sizeof(line) - 12; i++)
+                o += snprintf(line + o, sizeof(line) - o, " %02X=%02X", a[i], v[i] & 0xFF);
+            snprintf(line + o, sizeof(line) - o, "]\r\n");
+            host_puts(line);
+        }
+        return 0;
+    }
     if (strcmp(p, "$S") == 0) {
         print_stats();
         return 0;
