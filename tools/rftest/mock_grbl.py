@@ -381,7 +381,14 @@ class MockGrbl:
                     f"barriers={self.barriers} ticks={ticks} tick_us={TICK_US:.2f}]\r\n"
                     f"[MSG:atmega link=1 armed={int(self.armed)} ready={int(self.armed)} "
                     f"guide={int(self.guide)} power={power} stat=0x00 vdet=5000mV err=0]\r\n"
-                    f"[MSG:host rx_dropped=0 clamped={self.clamped}]\r\n")
+                    f"[MSG:host rx_dropped=0 clamped={self.clamped}]\r\n"
+                    f"[MSG:io gate=0 kill=0 gate_active_low=0 sync_hz={self.sync_hz()}]\r\n")
+
+    def sync_hz(self) -> int:
+        """What the firmware's laser_io reports as SYNC/PRR frequency ($220 is applied at once when idle).
+        `sync_hz_stuck` (tests) simulates a firmware that does not apply it."""
+        v = getattr(self, "sync_hz_stuck", None)
+        return int(self.settings.get(220, 0) if v is None else v)
 
     # ------------------------------------------------------------ G-code
     def _gcode(self, line: str, gen: int, jog: bool) -> int:
@@ -469,8 +476,13 @@ class MockGrbl:
             self.preview = self.guide = False
 
     def _clamp(self, x: float, y: float) -> tuple[float, float]:
-        cx = min(max(x, 0.0), self.work[0])
-        cy = min(max(y, 0.0), self.work[1])
+        w, h = self.settings[130], self.settings[131]
+        if self.settings.get(144):                    # centred origin: -W/2..W/2
+            cx = min(max(x, -w / 2), w / 2)
+            cy = min(max(y, -h / 2), h / 2)
+        else:
+            cx = min(max(x, 0.0), w)
+            cy = min(max(y, 0.0), h)
         if (cx, cy) != (x, y):
             self.clamped += 1
         return cx, cy

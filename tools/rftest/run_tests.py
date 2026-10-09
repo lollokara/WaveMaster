@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import re
 import sys
 import threading
@@ -74,13 +75,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mock-speedup", type=float, default=20.0, help="mock: run simulated motion N times faster")
     p.add_argument("--mock-slow-ms", type=float, default=0.0, help="mock: extra delay per line")
     p.add_argument("--mock-error-on", help="mock: regex of lines answered with an error")
+    p.add_argument("--mock-work-area", help="mock: device work area WxH ($130/$131, default: --work-area or 100x100)")
+    p.add_argument("--mock-centered", action="store_true", help="mock: device with $144=1 (centred origin)")
     p.add_argument("--dialect", choices=gg.DIALECTS, help="default: grbl for vectors, grbl_raster for raster plans")
-    p.add_argument("--origin", default="25,25", help="pattern origin x,y in mm (default 25,25)")
-    p.add_argument("--size", type=float, default=50.0, help="pattern size in mm (default 50)")
+    p.add_argument("--origin", help="pattern origin x,y (lower-left corner) in machine mm "
+                                    "(default: patterns centred on the work-area centre)")
+    p.add_argument("--size", type=float, help="pattern size in mm (default min(50, 0.8 * min(W, H)))")
     p.add_argument("--feed", type=float, default=30000, help="marking speed mm/min (default 30000)")
     p.add_argument("--power", type=float, help="S value (default 100, always capped by --max-power)")
     p.add_argument("--max-power", type=float, default=300, help="hard cap for every S sent (default 300)")
-    p.add_argument("--work-area", default="100x100", help="work area WxH in mm (default 100x100)")
+    p.add_argument("--work-area", default="auto",
+                   help="work area WxH in mm; 'auto' (default) reads $130/$131/$144 from the device "
+                        "($$) after the handshake (100x100 for --dry-run). An explicit value must match the device.")
+    p.add_argument("--centered", action="store_true",
+                   help="with an explicit --work-area: the device uses a centred origin ($144=1, "
+                        "coordinates -W/2..W/2)")
     p.add_argument("--powers", default="100,200,300,500,750,1000", help="fire-power-ladder S values")
     p.add_argument("--feeds", default="6000,15000,30000,60000,120000,180000", help="fire-speed-ladder F values")
     p.add_argument("--spacing", type=float, default=0.25, help="hatch spacing in mm (default 0.25)")
@@ -114,10 +123,56 @@ class Config:
     powers: list[float]
     feeds: list[float]
     out: Path
+    auto: bool = False             # work area still to be read from the device
+    centered: bool = False         # $144=1: coordinates -W/2..W/2
 
     @property
     def is_fire(self) -> bool:
         return self.plan in FIRE_PLANS
+
+
+class ConfigError(RuntimeError):
+    """The requested pattern cannot be placed in the (now known) work area."""
+
+
+def default_size(area: tuple[float, float]) -> float:
+    return math.floor(min(50.0, 0.8 * min(area)) * 10 + 1e-9) / 10
+
+
+def area_limits(area: tuple[float, float], centered: bool) -> tuple[float, float, float, float]:
+    """Machine-coordinate limits x0, y0, x1, y1 of the work area."""
+    if centered:
+        return -area[0] / 2, -area[1] / 2, area[0] / 2, area[1] / 2
+    return 0.0, 0.0, area[0], area[1]
+
+
+def place_box(args: argparse.Namespace, area: tuple[float, float], centered: bool) -> Box:
+    """Pattern box for a known work area; raises ConfigError with a suggested --size if it does not fit."""
+    size = args.size if args.size is not None else default_size(area)
+    x0, y0, x1, y1 = area_limits(area, centered)
+    if args.origin is not None:
+        ox, oy = parse_pair(args.origin, "--origin")
+        how = f"--origin {ox:g},{oy:g}"
+    else:
+        ox, oy = (x0 + x1) / 2 - size / 2, (y0 + y1) / 2 - size / 2
+        ox, oy = round(ox, 4), round(oy, 4)
+        how = "centred"
+    box = Box(ox, oy, size, size)
+    if not box.inside_area(*area, centered=centered):
+        if args.origin is None:
+            fit = default_size(area)
+        else:
+            fit = math.floor(min(x1 - ox, y1 - oy) * 10) / 10 if ox >= x0 and oy >= y0 else 0.0
+        hint = f"try --size {fit:g}" if fit >= 1 else "choose a smaller --size / another --origin"
+        frame = "centred origin, X %g..%g Y %g..%g" % (x0, x1, y0, y1) if centered else "X 0..%g Y 0..%g" % (x1, y1)
+        raise ConfigError(f"pattern box x={box.x:g} y={box.y:g} size {size:g} ({how}) does not fit the work area "
+                          f"{area[0]:g}x{area[1]:g} ({frame}); {hint}")
+    return box
+
+
+def apply_geometry(cfg: "Config", area: tuple[float, float], centered: bool) -> None:
+    cfg.box = place_box(cfg.args, area, centered)
+    cfg.area, cfg.centered = area, centered
 
 
 def make_config(argv: Optional[Sequence[str]] = None) -> Config:
@@ -129,11 +184,18 @@ def make_config(argv: Optional[Sequence[str]] = None) -> Config:
     port = a.items[0] if len(a.items) > 1 else None
     if not a.mock and not port and not a.dry_run:
         p.error("PORT is required (or use --mock)")
-    area = parse_pair(a.work_area, "--work-area", "x")
-    ox, oy = parse_pair(a.origin, "--origin")
-    box = Box(ox, oy, a.size, a.size)
-    if not box.inside(*area):
-        p.error(f"pattern box {box} does not fit the work area {area[0]:g}x{area[1]:g}")
+    auto = a.work_area.strip().lower() == "auto"
+    if a.origin is not None:
+        parse_pair(a.origin, "--origin")
+    if a.size is not None and a.size <= 0:
+        p.error("--size must be > 0")
+    # auto: provisional 100x100 (dry-run, mock default); the real values come from the device later
+    area = (100.0, 100.0) if auto else parse_pair(a.work_area, "--work-area", "x")
+    centered = bool(a.centered) and not auto
+    try:
+        box = place_box(a, area, centered)
+    except ConfigError as e:
+        p.error(str(e))
     cap = a.max_power
     power = min(a.power if a.power is not None else 100.0, cap)
     powers: list[float] = []
@@ -142,7 +204,7 @@ def make_config(argv: Optional[Sequence[str]] = None) -> Config:
         if v not in powers:
             powers.append(v)
     out = Path(a.out) if a.out else HERE / "runs" / f"{dt.datetime.now():%Y%m%d-%H%M%S}_{plan}"
-    return Config(port, plan, a, area, box, power, cap, powers, parse_floats(a.feeds), out)
+    return Config(port, plan, a, area, box, power, cap, powers, parse_floats(a.feeds), out, auto, centered)
 
 
 # ---------------------------------------------------------------- jobs -----
@@ -191,7 +253,7 @@ def fmt_list(vals: Sequence[float], n: int = 8) -> str:
 def encode_job(cfg: Config, spec: JobSpec, index: int) -> BuiltJob:
     a = cfg.args
     code = gg.encode(spec.ops, spec.dialect, arcs=not a.no_arcs, modal_feed=a.modal_feed,
-                     max_s=cfg.cap, work_area=cfg.area)
+                     max_s=cfg.cap, work_area=cfg.area, centered=cfg.centered)
     lines = [s for s in (strip_comment(l) for l in code.lines) if s]
     assert_safe(lines, cfg.cap)
     return BuiltJob(spec, index, code.text, lines, gg.bbox(spec.ops), code.stats.clamped_coords,
@@ -311,7 +373,7 @@ def cancel_job_lines(cfg: Config) -> list[str]:
     ops: list[Op] = [gg.SetSpeed(6000), gg.SetPower(0), gg.MoveTo(b.x, b.y)]
     for k in range(700):
         ops.append(gg.LineTo(b.x1 if k % 2 == 0 else b.x, b.y + (k % 50) * b.h / 49))
-    code = gg.encode(ops, "grbl", max_s=cfg.cap, work_area=cfg.area)
+    code = gg.encode(ops, "grbl", max_s=cfg.cap, work_area=cfg.area, centered=cfg.centered)
     return [s for s in (strip_comment(l) for l in code.lines) if s]
 
 
@@ -588,10 +650,14 @@ class Session:
 
     def check_limits(self, settings: dict[str, float]) -> bool:
         w, h, o = settings.get("130"), settings.get("131"), settings.get("144", 0.0)
-        ok = (w, h) == self.cfg.area and o == 0
+        cfg = self.cfg
+        ok = (w, h) == cfg.area and bool(o) == cfg.centered
+        what = f"--work-area {cfg.area[0]:g}x{cfg.area[1]:g}" + (" --centered" if cfg.centered else "")
+        if cfg.auto:
+            what = "work area adopted from the device"
         return self.check("work area matches device", ok,
-                          f"device $130={w} $131={h} $144={o}, --work-area {self.cfg.area[0]:g}x{self.cfg.area[1]:g}"
-                          + ("" if ok else " (set --work-area / $144=0)"))
+                          f"device $130={w} $131={h} $144={o}, {what}"
+                          + ("" if ok else " (omit --work-area to adopt the device's, or fix --work-area / --centered)"))
 
     # ---- fire safety
     def fire_summary(self, jobs: Sequence[BuiltJob]) -> str:
@@ -744,6 +810,23 @@ def connect(cfg: Config, logger: SessionLogger, mock) -> RayforgeClient:
     return c.open()
 
 
+def describe_jobs(cfg: Config, jobs: Sequence[BuiltJob]) -> None:
+    total = sum(len(j.lines) for j in jobs)
+    wa = f"{cfg.area[0]:g}x{cfg.area[1]:g}" + (" centred ($144=1)" if cfg.centered else "")
+    print(f"plan {cfg.plan}: {len(jobs)} job(s), {total} lines, S cap {cfg.cap:g}, work area {wa}, "
+          f"pattern box X {cfg.box.x:g}..{cfg.box.x1:g} Y {cfg.box.y:g}..{cfg.box.y1:g}, files in {cfg.out}")
+
+
+def adopt_device_area(cfg: Config, settings: dict[str, float], sess: "Session") -> None:
+    w, h = settings.get("130"), settings.get("131")
+    if w is None or h is None or w <= 0 or h <= 0:
+        raise ConfigError("cannot read $130/$131 from the device ($$); give --work-area WxH explicitly")
+    centered = bool(settings.get("144", 0.0))
+    apply_geometry(cfg, (float(w), float(h)), centered)
+    sess.say(f"work area adopted from the device: {w:g}x{h:g} mm, "
+             + ("centred origin ($144=1)" if centered else "origin at a corner ($144=0)"))
+
+
 def run(cfg: Config, input_fn: Callable[[str], str] = input) -> int:
     a = cfg.args
     cfg.out.mkdir(parents=True, exist_ok=True)
@@ -751,11 +834,10 @@ def run(cfg: Config, input_fn: Callable[[str], str] = input) -> int:
         print("REFUSING: fire plans emit the real laser. Re-run with --fire (and read tools/rftest/README.md).",
               file=sys.stderr)
         return 2
-    jobs = build_jobs(cfg)
-    write_job_files(cfg, jobs)
-    total = sum(len(j.lines) for j in jobs)
-    print(f"plan {cfg.plan}: {len(jobs)} job(s), {total} lines, S cap {cfg.cap:g}, files in {cfg.out}")
     if a.dry_run:
+        jobs = build_jobs(cfg)
+        write_job_files(cfg, jobs)
+        describe_jobs(cfg, jobs)
         for j in jobs:
             bb = j.bbox
             print(f"  {j.index:02d} {j.name:<22} {len(j.lines):>6} lines  "
@@ -766,8 +848,11 @@ def run(cfg: Config, input_fn: Callable[[str], str] = input) -> int:
     mock = None
     if a.mock:
         from mock_grbl import MockGrbl
+        marea = parse_pair(a.mock_work_area, "--mock-work-area", "x") if a.mock_work_area else cfg.area
         mock = MockGrbl(slow_ms=a.mock_slow_ms, error_on=a.mock_error_on, speedup=a.mock_speedup,
-                        work_area=cfg.area)
+                        work_area=marea)
+        if a.mock_centered:
+            mock.settings[144] = 1
         mock.start()
     logger = SessionLogger(cfg.out, verbose=a.verbose)
     rep = Report(cfg.plan, dt.datetime.now().isoformat(timespec="seconds"), mock.path if mock else str(cfg.port),
@@ -781,12 +866,17 @@ def run(cfg: Config, input_fn: Callable[[str], str] = input) -> int:
         rep.device = {"version": info.version, "options": info.options, "rx_window": info.rx_window,
                       "machine": info.machine, "planner_blocks": info.planner_blocks}
         rep.settings = {k: v for k, v in sess.device_settings().items()}
+        if cfg.auto:
+            adopt_device_area(cfg, rep.settings, sess)
+        jobs = build_jobs(cfg)
+        write_job_files(cfg, jobs)
+        describe_jobs(cfg, jobs)
         rep.stats_before = client.stats_s()
         sess.say(f"connected: {info.version} {info.options} window {info.rx_window}")
         if cfg.plan != "smoke":
             ok = sess.check_limits(rep.settings)
             if not ok and cfg.is_fire:
-                raise SafetyError("work area / origin does not match the device")
+                raise SafetyError("work area / origin does not match the device (omit --work-area to adopt the device's)")
         if cfg.is_fire:
             sess.fire_prelude(jobs)
         if cfg.plan == "smoke":
@@ -795,6 +885,11 @@ def run(cfg: Config, input_fn: Callable[[str], str] = input) -> int:
             sess.run_jobs(jobs, stop_on_fail=cfg.is_fire)
         sess.finish_safe()
         rep.stats_after = client.stats_s()
+    except ConfigError as e:
+        rep.notes.append(f"configuration error: {e}")
+        print(f"ERROR: {e}", file=sys.stderr)
+        sess.finish_safe()
+        code = 2
     except KeyboardInterrupt:
         rep.interrupted = True
         rep.notes.append("interrupted by Ctrl-C")

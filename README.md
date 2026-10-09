@@ -164,7 +164,7 @@ Pin-level wiring is in **[docs/WIRING.md](docs/WIRING.md)**, with a diagram in
 
 Setting up Rayforge is in **[docs/RAYFORGE.md](docs/RAYFORGE.md)**.
 
-Calibrating the galvo (focus, range, orientation, scale, distortion, offset, delays, power, speed) is guided by `python3 tools/calibrate.py PORT`; the procedure is in **[tools/CALIBRATION.md](tools/CALIBRATION.md)**.
+Calibrating the galvo (focus, range, orientation, scale, distortion, offset, delays, power, prr, speed) is guided by `python3 tools/calibrate.py PORT`; the procedure is in **[tools/CALIBRATION.md](tools/CALIBRATION.md)**.
 
 ---
 

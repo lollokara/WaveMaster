@@ -241,8 +241,83 @@ def test_mock(tmp: Path) -> None:
     check("slow device (250 ms/line) is reported as underruns (fail)",
           rc == 1 and any((j["underruns_delta"] or 0) > 0 for j in rep.get("jobs", [])),
           str([(j["underruns_delta"], j["reasons"]) for j in rep.get("jobs", [])]))
+    test_work_area(tmp)
     test_overflow_detection(tmp)
     test_stall(tmp)
+
+
+def job_boxes(out: Path) -> list[tuple[float, float, float, float]]:
+    """Bounding boxes of the streamed fire jobs (G-code coordinates), excluding the guide frame."""
+    res = []
+    for f in sorted(out.glob("*.gcode")):
+        if f.name.endswith(".rayforge.gcode") or "guide_frame" in f.name:
+            continue
+        body = "\n".join(l for l in f.read_text().splitlines() if l != "G0 X0 Y0")    # drop the postamble
+        xs = [float(v) for v in re.findall(r"X(-?[\d.]+)", body)]
+        ys = [float(v) for v in re.findall(r"Y(-?[\d.]+)", body)]
+        res.append((min(xs), min(ys), max(xs), max(ys)))
+    return res
+
+
+def test_work_area(tmp: Path) -> None:
+    print("work area: auto / explicit / centred origin")
+    base = ["--mock", "--mock-speedup", "40", "--poll-ms", "100"]
+    fire = ["fire-shapes", "--fire", "--yes"]
+    # the reported user case: device 51.7 x 51.7, nothing else given
+    rc, rep, out = run_cli(base + ["--mock-work-area", "51.7x51.7"] + fire, tmp / "wa_auto")
+    check("auto: 51.7x51.7 device adopted, fire-shapes passes, no clamps", rc == 0 and rep.get("passed")
+          and "adopted from the device: 51.7x51.7" in out, out[-300:])
+    boxes = job_boxes(tmp / "wa_auto")
+    c = 51.7 / 2
+    check("auto: patterns fit; the square is centred on the lens centre (25.85, 25.85)",
+          bool(boxes) and all(b[0] >= 0 and b[1] >= 0 and b[2] <= 51.7 and b[3] <= 51.7 for b in boxes)
+          and abs((boxes[0][0] + boxes[0][2]) / 2 - c) < 0.01 and abs((boxes[0][1] + boxes[0][3]) / 2 - c) < 0.01, str(boxes))
+    cfg = run_tests.make_config(base + ["--work-area", "51.7x51.7", "guide-shapes"])
+    check("default size = min(50, 0.8*min(W,H)) -> 41.3 for 51.7; 50 for 100x100",
+          cfg.box.w == 41.3 and run_tests.make_config(base + ["guide-shapes"]).box.w == 50.0
+          and run_tests.make_config(base + ["guide-shapes"]).box.x == 25.0, str(cfg.box))
+    rc, rep, out = run_cli(base + ["--mock-work-area", "100x60", "guide-shapes"], tmp / "wa_rect")
+    check("auto: non-square 100x60 adopted (size 48)", rc == 0 and rep.get("passed")
+          and "100x60" in out and "Y 6..54" in out, out[:300])
+    # explicit mismatch is refused, message points at auto
+    rc, rep, out = run_cli(base + ["--mock-work-area", "51.7x51.7", "--work-area", "100x100"] + fire, tmp / "wa_bad")
+    sl = (tmp / "wa_bad" / "session.log").read_text()
+    check("explicit --work-area 100x100 on a 51.7 device: SAFETY STOP, nothing armed/fired, hint to omit",
+          rc == 2 and "SAFETY STOP" in out and "omit --work-area" in out and "TX  M10" not in sl and "TX  M4" not in sl, out[-300:])
+    rc, rep, out = run_cli(base + ["--mock-work-area", "51.7x51.7", "--work-area", "51.7x51.7", "--size", "40"] + fire,
+                           tmp / "wa_ok")
+    check("explicit matching --work-area 51.7x51.7 works", rc == 0 and rep.get("passed"), out[-200:])
+    # validation message with a suggested size
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+        try:
+            run_tests.make_config(base + ["--work-area", "50x50", "--size", "60", "guide-shapes"])
+            rc = 0
+        except SystemExit as e:
+            rc = e.code
+    check("explicit too-large pattern: clear error with a --size suggestion", rc == 2 and "try --size 40" in buf.getvalue(),
+          buf.getvalue()[-200:])
+    rc, rep, out = run_cli(base + ["--mock-work-area", "30x30", "--size", "40", "guide-shapes"], tmp / "wa_big")
+    check("auto + too-large --size: error after the handshake, suggests a size, nothing streamed",
+          rc == 2 and "try --size 24" in out and "TX  G" not in (tmp / "wa_big" / "session.log").read_text(), out[-250:])
+    # centred origin
+    rc, rep, out = run_cli(base + ["--mock-work-area", "51.7x51.7", "--mock-centered"] + fire, tmp / "wa_ctr")
+    boxes = job_boxes(tmp / "wa_ctr")
+    check("$144=1 auto: centred origin adopted, patterns around (0,0), inside +-25.85, no clamps",
+          rc == 0 and rep.get("passed") and "centred origin" in out and bool(boxes)
+          and all(b[0] >= -c and b[1] >= -c and b[2] <= c and b[3] <= c for b in boxes)
+          and abs(boxes[0][0] + boxes[0][2]) < 0.01 and abs(boxes[0][1] + boxes[0][3]) < 0.01, str(boxes))
+    rc, rep, out = run_cli(base + ["--mock-work-area", "51.7x51.7", "--mock-centered", "--work-area", "51.7x51.7"] + fire,
+                           tmp / "wa_ctr_bad")
+    check("$144=1 device with explicit corner-origin --work-area: refused", rc == 2 and "SAFETY STOP" in out, out[-200:])
+    rc, rep, out = run_cli(base + ["--mock-work-area", "51.7x51.7", "--mock-centered", "--work-area", "51.7x51.7",
+                                   "--centered"] + fire, tmp / "wa_ctr_ok")
+    check("$144=1 device with --work-area 51.7x51.7 --centered: passes", rc == 0 and rep.get("passed"), out[-200:])
+    cl = gg.encode([gg.SetPower(100), gg.MoveTo(-40, 5), gg.LineTo(40, -30)], "grbl", work_area=(50, 40), centered=True)
+    check("encoder clamps to -W/2..W/2 when centred", "G0 X-25 Y5" in cl.text and "G1 X25 Y-20" in cl.text
+          and cl.stats.clamped_coords == 2, cl.text)
+    rc, _, out = run_cli(["--dry-run", "fire-shapes"], tmp / "wa_dry")
+    check("dry-run with auto keeps 100x100", rc == 0 and "work area 100x100" in out, out[:200])
 
 
 def test_overflow_detection(tmp: Path) -> None:

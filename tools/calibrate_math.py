@@ -617,6 +617,20 @@ def ladder_values(cap: float, n: int = 9) -> list[int]:
     return vals
 
 
+def prr_values(lo_khz: float, hi_khz: float, n: int) -> list[int]:
+    """n PRR values in Hz, linearly spaced from lo_khz to hi_khz (both included), distinct and rising."""
+    if not (0 < lo_khz < hi_khz):
+        raise CalibError(f"PRR range must satisfy 0 < min < max (got {lo_khz:g} .. {hi_khz:g} kHz)")
+    if n < 2:
+        raise CalibError("at least 2 PRR steps are needed")
+    vals: list[int] = []
+    for k in range(n):
+        hz = int(round((lo_khz + (hi_khz - lo_khz) * k / (n - 1)) * 1000.0))
+        if hz not in vals:
+            vals.append(hz)
+    return vals
+
+
 def power_percent(S: float, smax: float, pmin: float, pmax: float) -> float:
     """% power the firmware requests for S (gcode_power_byte): pmin + (pmax-pmin) * S/smax."""
     f = 1.0 if smax <= 0 else min(max(S / smax, 0.0), 1.0)
