@@ -214,6 +214,8 @@ $226  auto-arm when the first mark needs the laser (0/1)        [1]
 $227  max wait for arm/ready, ms                               [4000]
 $229  pulse-density period, ticks                              [10]
 $230  gate (EMISSION MODULATION) active low (0/1)              [0]
+$231  auto guide laser for framing: guide on while moving with
+      M3 S0 (Rayforge's Frame), off at M5 / M4 / S>0 (0/1)       [1]
 ```
 
 Read-only GRBL values (`$0`, `$1`, `$2`, `$4`-`$6`, `$10`, `$11`, `$20`-`$27`, `$31`, `$32`, `$102`, `$112`, `$122`, `$132`) are reported for sender compatibility and ignored when set.
