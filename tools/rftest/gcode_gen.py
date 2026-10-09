@@ -115,6 +115,12 @@ class Box:
     def inside(self, w: float, h: float, eps: float = 1e-6) -> bool:
         return self.x >= -eps and self.y >= -eps and self.x1 <= w + eps and self.y1 <= h + eps
 
+    def inside_area(self, w: float, h: float, centered: bool = False, eps: float = 1e-6) -> bool:
+        """Inside a w x h work area; centered = origin in the middle ($144=1)."""
+        x0, y0 = (-w / 2, -h / 2) if centered else (0.0, 0.0)
+        return (self.x >= x0 - eps and self.y >= y0 - eps
+                and self.x1 <= x0 + w + eps and self.y1 <= y0 + h + eps)
+
 
 # ---------------------------------------------------------- geometry -------
 
@@ -244,6 +250,7 @@ class EncoderOptions:
     modal_feed: bool = False                 # "grbl": emit F only when it changed
     max_s: float = 1000.0                    # hard cap applied to every S
     work_area: Optional[tuple[float, float]] = (100.0, 100.0)   # clamp; None = off
+    centered: bool = False                   # $144=1: coordinates run -W/2..W/2, -H/2..H/2
     arc_tol: float = 0.01
     preamble: bool = True
     postamble: bool = True
@@ -291,7 +298,11 @@ class GcodeEncoder:
         wa = self.o.work_area
         if wa is None:
             return x, y
-        cx, cy = min(max(x, 0.0), wa[0]), min(max(y, 0.0), wa[1])
+        if self.o.centered:
+            hx, hy = wa[0] / 2, wa[1] / 2
+            cx, cy = min(max(x, -hx), hx), min(max(y, -hy), hy)
+        else:
+            cx, cy = min(max(x, 0.0), wa[0]), min(max(y, 0.0), wa[1])
         if (cx, cy) != (x, y):
             self.stats.clamped_coords += 1
         return cx, cy

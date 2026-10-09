@@ -49,10 +49,24 @@ The runner sends `M66` as a command, checks `$S` shows `guide=1`, streams the jo
 The jobs still contain `M4 S<power>` lines, which is the point: the stream is the real one, and the firmware must not fire.
 
 Common options (see `--help`): `--dialect grbl|grbl_raster` (default `grbl`, `grbl_raster` for raster plans),
-`--origin 25,25`, `--size 50`, `--feed 30000` (mm/min), `--power 100`, `--max-power 300`, `--work-area 100x100`,
+`--feed 30000` (mm/min), `--power 100`, `--max-power 300`, `--work-area auto|WxH`, `--size`, `--origin`,
 `--poll-ms 250` (status polling during jobs; `0` = exactly like Rayforge, which does not poll), `--repeat N`,
 `--out DIR` (default `tools/rftest/runs/<timestamp>_<plan>/`), `--dry-run` (only write the `.gcode` files),
 `--no-arcs`, `--modal-feed`, `--verbose` (echo all traffic), `--stall-timeout`, `--idle-timeout`.
+
+### Work area and pattern placement
+
+- `--work-area` defaults to `auto`: after the handshake the runner reads `$130`/`$131`/`$144` from `$$` and uses them
+  (`--dry-run`, which has no device, assumes 100x100 with the origin in a corner). The mock reports what
+  `--mock-work-area WxH` / `--mock-centered` say (default 100x100).
+- `$144=1` (centred origin, coordinates `-W/2..W/2`) is supported: patterns are placed around (0,0) and the coordinate
+  clamp uses the centred range. With an explicit `--work-area` and a centred device, add `--centered`.
+- Default `--size` is `min(50, 0.8 * min(W, H))` (rounded down to 0.1 mm); default origin puts the pattern box
+  centred on the work-area centre (the lens centre). So `fire-shapes --fire` fits any work area, e.g. 51.7x51.7 gives
+  a 41.3 mm pattern at 5.2,5.2. `--origin x,y` is the lower-left corner of the box in machine coordinates.
+- The box is validated once the work area is known; if it does not fit you get an error with a `--size` that fits.
+- An explicit `--work-area` must equal the device's; on a mismatch fire plans stop with a SAFETY STOP and the message
+  says to omit `--work-area` to adopt the device's values.
 
 ## Safety procedure for fire plans
 
@@ -63,7 +77,7 @@ Common options (see `--help`): `--dialect grbl|grbl_raster` (default `grbl`, `gr
 5. The runner then:
    - refuses without `--fire`;
    - prints the plan (jobs, the S values actually sent after capping, F values, bounding box) and requires you to type `FIRE` (skippable only with `--yes`);
-   - checks `$130`/`$131`/`$144` against `--work-area` and aborts on a mismatch;
+   - adopts `$130`/`$131`/`$144` from the device (`--work-area auto`) or, for an explicit `--work-area`, checks them and aborts on a mismatch;
    - runs a guide-laser frame of the job's bounding box (`M66` ... `M67`, S0) and asks `frame OK? [y/N]`;
    - sends `M10`, waits for Idle and for `armed=1` in `$S`;
    - runs the jobs, stops at the first failed job, always sends `M5` and (unless `--keep-armed`) `M11` at the end.

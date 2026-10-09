@@ -17,6 +17,7 @@ Steps (default: all, in this order, each skippable):
     offset       crosshair -> $140/$141
     delays       (needs --fire) $210 .. $216
     power        (needs --fire) power ladder -> $224/$225
+    prr          (needs --fire) pulse repetition rate patches -> $220 (duty $221 unchanged)
     speed        (marking ladder needs --fire) $110 and jump speed $201
     summary      all changes, final $$, next steps (always printed)
 
@@ -58,8 +59,8 @@ from rfclient import RayforgeClient, SessionLogger, strip_comment  # noqa: E402
 from run_tests import SafetyError, assert_safe                # noqa: E402
 
 STEP_ORDER = ("connect", "focus", "range", "field", "orientation", "scale", "distortion", "offset", "delays",
-              "power", "speed", "summary")
-FIRE_STEPS = ("focus", "delays", "power")
+              "power", "prr", "speed", "summary")
+FIRE_STEPS = ("focus", "delays", "power", "prr")
 STEP_INFO = {
     "connect": "handshake, current values, backup",
     "focus": "focal distance (Z height) with circles, real laser",
@@ -71,6 +72,7 @@ STEP_INFO = {
     "offset": "centre offset ($140, $141)",
     "delays": "laser/jump/mark/polygon delays ($210-$216), real laser",
     "power": "power ladder ($224, $225), real laser",
+    "prr": "pulse repetition rate ($220) with hatched patches, real laser",
     "speed": "marking speed ($110) and jump speed ($201)",
     "summary": "report",
 }
@@ -85,6 +87,8 @@ JUMP_SIZE = (28.0, 12.0)
 CORNER_SIZE = (28.0, 14.0)
 POWER_SIZE = (27.0, 27.0)
 SPEED_SIZE = (27.0, 20.0)
+PRR_PATCH = (10.0, 10.0)
+PRR_SPACING = 0.25            # hatch line spacing of the PRR patches, mm
 FOCUS_LAPS = 10
 MAX_RETRY = 40
 DAMPING = 0.8
@@ -213,6 +217,12 @@ def pat_speed(box: Box, feeds: Sequence[float], power: float) -> Pattern:
     return _pat("speed_ladder", ops, (box.cx, box.cy), kind="speed", box=box, feeds=tuple(feeds))
 
 
+def pat_prr_patch(box: Box, feed: float, power: float, hz: float, spacing: float = PRR_SPACING) -> Pattern:
+    """One hatched square (the PRR step draws one per PRR value, each as its own job)."""
+    ops = gg.hatch_square(box, feed, power, spacing)
+    return _pat("prr_patch", ops, (box.cx, box.cy), kind="prr", box=box, hz=hz, power=power)
+
+
 def pat_range(sq: cm.RangeSquare, feed: float) -> Pattern:
     """Guide-laser rectangle of the range step (corners from calibrate_math.range_square) plus the short
     tick that marks the +X side."""
@@ -269,6 +279,7 @@ class Wizard:
         self.range_swap = 0.0                          # $143 when the range was measured
         self.range_source = ""
         self.focus_best: Optional[dict] = None
+        self.pending_restore: dict[int, float] = {}    # settings changed temporarily by a step (restore_pending)
 
     # ---- console helpers
     def say(self, text: str = "") -> None:
@@ -714,6 +725,7 @@ class Wizard:
             if name in ("scale", "distortion"):
                 self.offer_range_workarea(f"the scale changed in '{name}'")
         except SkipStep:
+            self.restore_pending()
             self.say(f"  step '{name}' skipped")
             self.results[name] = {"status": "skipped by operator"}
 
@@ -1387,6 +1399,104 @@ class Wizard:
                  "'just marks' to 'saturated'.")
         return {"powers": powers, "lowest": lo, "saturated": sat, "proposed": ch, "applied": applied}
 
+    # -- prr
+    def restore_pending(self) -> None:
+        """Put back settings a step had changed temporarily (PRR trials). Safe to call any time, also after
+        an emergency stop; a failure is reported with the exact value to restore by hand."""
+        if not self.pending_restore:
+            return
+        pend, self.pending_restore = dict(self.pending_restore), {}
+        try:
+            self.read_settings()
+            rows = [(n, self.get(n), v) for n, v in sorted(pend.items()) if abs(self.get(n) - v) > 1e-9]
+            if rows:
+                self.write(rows, "restore after trial", quiet=True, record=False)
+                self.say("  restored " + ", ".join(f"${n}={cm.fmt_val(v)}" for n, _, v in rows))
+        except Exception as e:                                   # noqa: BLE001
+            self.warn("could not restore " + ", ".join(f"${n}={cm.fmt_val(v)}" for n, v in sorted(pend.items()))
+                      + f" ({e}); write it back by hand or use --restore")
+
+    def prr_synced(self, hz: float) -> dict:
+        """Check with $S that the io line reports the SYNC frequency just written (within 2 %)."""
+        io = self.refresh_stats().get("io", {})
+        try:
+            got: Optional[float] = float(io.get("sync_hz", ""))
+        except ValueError:
+            got = None
+        ok = got is not None and abs(got - hz) <= 0.02 * hz
+        if not ok:
+            self.warn(f"$S io reports sync_hz={io.get('sync_hz', '?')} but $220={hz:g} was written: the firmware may "
+                      "not have applied it (older firmware needs a reboot or M3/M4); this patch may not show the "
+                      "intended PRR")
+        return {"sync_hz": got, "ok": ok}
+
+    def step_prr(self) -> dict:
+        self.header("prr: pulse repetition rate $220 (real laser)")
+        self.ensure_mark_power()
+        orig = self.get(220)
+        self.say(f"  current: $220 = {orig:g} Hz ({orig / 1000:g} kHz), duty $221 = {self.get(221):g} %.")
+        self.say("  Check your laser's datasheet: outside the allowed PRR range IPG lasers may not emit or may alarm.")
+        lo = self.ask_nums("prr_min", "Lowest PRR the laser allows, kHz", default=20, lo=0.1, hi=2000)[0]
+        hi = self.ask_nums("prr_max", "Highest PRR the laser allows, kHz", default=80, lo=0.1, hi=2000)[0]
+        if hi <= lo:
+            raise CalibError(f"the highest PRR ({hi:g} kHz) must be above the lowest ({lo:g} kHz)")
+        n = int(self.ask_nums("prr_steps", "Number of PRR values to try (2..12)", default=6, lo=2, hi=12)[0])
+        power = self.ask_nums("prr_power", f"S value for the PRR patches (1..{self.cap:g})",
+                              default=self.mark_power, lo=1, hi=self.cap)[0]
+        feed = self.ask_nums("prr_feed", "Marking speed for the patches, mm/min", default=self.a.feed, lo=60,
+                             hi=self.get(110))[0]
+        values = cm.prr_values(lo, hi, n)
+        for hz in values:
+            cm.check_range(220, hz)
+        self.say(f"  {len(values)} patches, S{power:g}, F{feed:g} mm/min, linear steps "
+                 + ", ".join(f"{hz / 1000:g}" for hz in values) + " kHz (rising PRR = patch 1, 2, ...).")
+        self.say("  Each patch is its own job (framed, armed, fired). They are placed centre-out like the other "
+                 "patterns, so the positions are listed below; patch 1 is the lowest PRR.")
+        saved_feed = self.a.feed
+        self.a.feed = feed
+        patches: list[dict] = []
+        self.pending_restore = {220: orig}
+        try:
+            first: Optional[Box] = None
+            for i, hz in enumerate(values, 1):
+                self.write([(220, self.get(220), float(hz))], f"PRR trial {hz} Hz", quiet=True, record=False)
+                sync = self.prr_synced(float(hz))
+                box = self.new_region(*PRR_PATCH)
+                first = first or box
+                pat = pat_prr_patch(box, feed, power, hz)
+                dx, dy = box.cx - first.cx, box.cy - first.cy
+                where = "centre of the card" if i == 1 else f"{dx:+.0f} mm X, {dy:+.0f} mm Y from patch 1"
+                self.say(f"  patch {i}/{len(values)}: $220 = {hz} Hz ({hz / 1000:g} kHz) at X {box.cx:.1f} Y {box.cy:.1f}"
+                         f" ({where}; +X right, +Y away from you)")
+                self.draw(pat, True)
+                patches.append({"patch": i, "hz": hz, "x": round(box.cx, 3), "y": round(box.cy, 3), "sync_hz": sync["sync_hz"],
+                                "sync_ok": sync["ok"]})
+            self.say("  patch  kHz    X       Y   (mm)")
+            for p in patches:
+                self.say(f"   {p['patch']:>2}   {p['hz'] / 1000:<6g} {p['x']:<7.1f} {p['y']:<7.1f}")
+            self.say("  Judge: even coverage without dots or gaps, the colour/depth you want, no burn-through or "
+                     "sputter. Low PRR = more energy per pulse and separate dots; high PRR = more overlap and less "
+                     "energy per pulse (see tools/CALIBRATION.md).")
+            best = int(self.ask_nums("prr_best", f"Which patch looks best (1..{len(values)}, 0 = keep the current PRR)",
+                                     default=None, lo=0, hi=len(values),
+                                     meta={"values": list(values), "power": power})[0])
+            res: dict[str, Any] = {"original_hz": orig, "values_hz": values, "power": power, "feed": feed,
+                                   "patches": patches, "best": best}
+            # back to the original first, so the proposal reads old -> new and a declined change keeps it
+            self.restore_pending()
+            if best == 0:
+                self.say(f"  $220 stays {orig:g} Hz")
+                res["applied"] = False
+                return res
+            res["applied"] = self.apply({220: float(values[best - 1])},
+                                        f"best PRR: patch {best} ({values[best - 1] / 1000:g} kHz)")
+            if res["applied"]:
+                self.say(f"  duty $221 = {self.get(221):g} % is unchanged; if the laser needs another pulse width "
+                         "change $221 in the 'field' step.")
+            return res
+        finally:
+            self.a.feed = saved_feed
+
     # -- speed
     def step_speed(self) -> dict:
         self.header("speed: $110 max marking speed, $201 jump speed")
@@ -1582,6 +1692,7 @@ class Wizard:
                 if name in steps and name != "summary":
                     self.run_step(name, explicit and name in self.a.step)
         except QuitWizard as e:
+            self.restore_pending()
             status = f"quit ({e})"
             self.say("\nquitting")
         return status
@@ -1623,7 +1734,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("port", nargs="?", help="serial port of the ESP32-S3 native USB (not needed with --mock)")
     p.add_argument("--mock", action="store_true", help="talk to tools/rftest/mock_grbl.py instead of hardware")
     p.add_argument("--step", action="append", choices=STEP_ORDER, help="run only this step (repeatable)")
-    p.add_argument("--fire", action="store_true", help="allow steps that emit the real laser (focus, delays, power, "
+    p.add_argument("--fire", action="store_true", help="allow steps that emit the real laser (focus, delays, power, prr, "
                    "and real marks in scale/distortion/offset/speed)")
     p.add_argument("--yes", action="store_true", help="skip the typed FIRE and the frame confirmation")
     p.add_argument("--max-power", type=float, default=300.0, help="cap for every S value (default 300)")
@@ -1674,7 +1785,7 @@ def run(args: argparse.Namespace, provider: Any = None, mock: Any = None) -> int
     explicit = bool(args.step)
     steps = list(args.step) if args.step else list(STEP_ORDER)
     if not args.restore and explicit and any(s in FIRE_STEPS for s in steps) and not args.fire:
-        print("REFUSING: steps 'focus', 'delays' and 'power' emit the real laser. Re-run with --fire "
+        print("REFUSING: steps 'focus', 'delays', 'power' and 'prr' emit the real laser. Re-run with --fire "
               "(and read tools/CALIBRATION.md).", file=sys.stderr)
         return 2
     out = Path(args.out) if args.out else HERE / "calibrate" / "runs" / dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1712,14 +1823,17 @@ def run(args: argparse.Namespace, provider: Any = None, mock: Any = None) -> int
     except KeyboardInterrupt:
         status, code = "interrupted by Ctrl-C", 130
         wiz.emergency()
+        wiz.restore_pending()
     except SafetyError as e:
         status, code = f"safety stop: {e}", 2
         print(f"SAFETY STOP: {e}", file=sys.stderr)
         wiz.emergency()
+        wiz.restore_pending()
     except Exception as e:                                       # noqa: BLE001
         status, code = f"error: {type(e).__name__}: {e}", 1
         print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
         wiz.emergency()
+        wiz.restore_pending()
     try:
         if status.startswith("quit"):
             wiz.step = "summary"

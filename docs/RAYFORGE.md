@@ -56,7 +56,7 @@ You need three things from [`docs/rayforge/`](rayforge/):
    - Send `$$` and check `$30=1000`, `$32=1`, `$130=100`, `$131=100`, `$144=0`, `$12=0.01`.
    - Machine Settings > **G-code** > **Dialect**: the list shows **WaveMaster Galvo** with its check mark set. That is what `dialect_uid: wavemaster` selects.
    - **Machine > Macros** lists the 8 macros (below).
-7. Before the first real job, run a frame with preview (see "Framing and preview" below). The bring-up steps for the real laser are in [STATUS.md](../STATUS.md).
+7. Before the first real job, click **Frame**: the guide laser traces the job's box (see "Framing and preview" below). The bring-up steps for the real laser are in [STATUS.md](../STATUS.md).
 
 ### Macros
 
@@ -153,11 +153,7 @@ Start from **Grbl (Compat)**, not from GRBL Raster: the dialect editor has no sw
 
 Rayforge's **Frame** (toolbar button, or **Machine > Frame**) generates a normal minimal job (`rayforge/machine/driver/driver.py`, `build_frame_ops`): preamble, the outline with constant power (`M3`) at the head's Frame Power and Frame Speed, then the postscript. Frame Power is 0 %, so it sends `M3 S0` and the marking laser cannot fire. Frame Speed, Frame Power, Repeat Count and Pause at Corners are in Machine Settings > **Heads** > laser > **Framing**.
 
-To see the outline with the guide laser:
-
-1. **Machine > Macros > Preview ON (M66)**.
-2. Click **Frame**.
-3. The postscript ends with `M67`, so preview and the guide laser switch off by themselves when the frame job finishes. If you cancel the frame, the soft reset clears preview too.
+To see the outline with the guide laser, **just click Frame**. With `$231=1` (the default) the firmware turns the guide laser on while it moves under `M3 S0` - exactly what Rayforge's Frame sends; real jobs always use `M4` - and turns it off after the last frame move, at the frame's closing `M5` (also on `M4`, any `S` above 0, `M2`/`M30` or a soft reset). Keep Frame Power at **0 %**. With `$231=0`, or to trace a whole job instead of its box, use the macros: **Preview ON (M66)**, run Frame or the job, then **Preview OFF (M67)** (the postscript's `M67` also switches it off at the end of a job).
 
 Why there is no hook that sends `M66` / `M67` around framing: the frame job is built from the same layer and workpiece markers as a real job, and a `WORKPIECE_START` hook would run for every real job as well. `M66` in a real job would stop all marking. The macro is the safe way.
 
@@ -206,11 +202,11 @@ Why there is no hook that sends `M66` / `M67` around framing: the frame job is b
 - **`M66`** turns preview on: guide laser on, marking laser forced off, the real trajectory is run.
 - **`M67`** turns preview off.
 - `M62` / `M63` turn the guide laser on and off directly.
-- To frame with Rayforge's **Frame** feature, run the **Preview ON (M66)** macro first, then **Frame**. With the WaveMaster dialect the postscript's `M67` switches preview off again. Details are in the quick setup. Keep the head's **Frame Power** at 0 %.
+- Rayforge's **Frame** shows the outline with the guide laser by itself (`$231=1`, default: guide on while moving under `M3 S0`, off at the frame's closing `M5`). Keep the head's **Frame Power** at 0 %. Use M66/M67 to trace a whole job instead.
 
 ## 7. Cancel
 
-Rayforge's **Cancel Job** soft-resets the controller (**Ctrl-X**, `0x18`) and then sends the dialect's laser-off commands (`M5`, `M9`). The soft reset also clears preview. The firmware cuts the gate immediately and stops the stream. The target is within about 60 ms. This is not yet measured on hardware (see [STATUS.md](../STATUS.md)).
+Rayforge's **Cancel Job** soft-resets the controller (**Ctrl-X**, `0x18`) and then sends the dialect's laser-off commands (`M5`, `M9`). The soft reset also clears preview and **disarms the laser** (EMISSION ENABLE off, power word 0 on the ATmega); the next job re-arms by itself when `$226=1`. The firmware cuts the gate immediately and stops the stream. The target is within about 60 ms. This is not yet measured on hardware (see [STATUS.md](../STATUS.md)).
 
 ## 8. Tuning the galvo and laser delays
 

@@ -465,6 +465,10 @@ class FwMock(MockGrbl):
     ever_fired = False
     arm_count = 0
 
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.fired_prr: list[float] = []      # $220 in force whenever a mark was streamed (in order, no repeats)
+
     def _dollar(self, line, gen):
         if line.rstrip() == "$$":
             self._write("".join(f"${k}={fw_fmt(v)}\r\n" for k, v in sorted(self.settings.items())))
@@ -492,6 +496,8 @@ class FwMock(MockGrbl):
     def _move(self, mo, w, k, jog, gen):
         if mo in (1, 2, 3) and self.laser in (3, 4) and self.s > 0 and not self.preview:
             self.ever_fired = True
+            if not self.fired_prr or self.fired_prr[-1] != self.settings[220]:
+                self.fired_prr.append(self.settings[220])
         return super()._move(mo, w, k, jog, gen)
 
 
@@ -502,7 +508,7 @@ class Bench:
                  max_clean_feed_mm_s: float = 1000.0, max_clean_jump: float = 5000.0, fire: bool = True,
                  inject: dict | None = None, raise_on: dict | None = None, raise_nth: dict | None = None,
                  apply_range: bool = False, focus_script: list | None = None, focus_best: str = "1",
-                 field_blank: bool = False):
+                 field_blank: bool = False, prr_best_hz: float = 55000.0):
         self.mock, self.h, self.quant = mock, hidden, quant
         self.true = true_delays or {210: 150.0, 211: 60.0, 212: 500.0, 213: 3.0, 214: 140.0, 215: 40.0}
         self.tol = 15.0
@@ -516,6 +522,7 @@ class Bench:
         self.focus_script = list(focus_script) if focus_script is not None else None
         self.focus_best = focus_best
         self.field_blank = field_blank
+        self.prr_best_hz = prr_best_hz         # the simulated laser's best PRR: the operator picks the nearest patch
         self.log: list[tuple[str, str]] = []
         self.defaults: dict[str, str | None] = {}
         self.clamp_seen = 0
@@ -594,8 +601,12 @@ class Bench:
             return "40000"
         if k == "prr_duty":
             return "50"
-        if k in ("scale_side", "dist_R", "delay_feed", "power_feed"):
+        if k in ("scale_side", "dist_R", "delay_feed", "power_feed", "prr_min", "prr_max", "prr_steps", "prr_power",
+                 "prr_feed"):
             return ""
+        if k == "prr_best":
+            vals = q.meta["values"]
+            return str(min(range(len(vals)), key=lambda i: abs(vals[i] - self.prr_best_hz)) + 1)
         if k.startswith("orient_"):
             p0, p1 = self.h.phys(S, *pat.meta["tail"]), self.h.phys(S, *pat.meta["tip"])
             return cm.dir_name(classify(p1[0] - p0[0], p1[1] - p0[1]))
@@ -658,10 +669,12 @@ class Bench:
 
 
 def run_wizard(tmp: Path, name: str, hidden: Hidden, argv: list[str], settings: dict | None = None,
-               link: int = 1, **bench_kw) -> tuple[int, FwMock, Bench, Path, str]:
+               link: int = 1, mock_attrs: dict | None = None, **bench_kw) -> tuple[int, FwMock, Bench, Path, str]:
     out = tmp / name
     mock = FwMock(speedup=200.0)
     mock.link = link
+    for k_, v_ in (mock_attrs or {}).items():
+        setattr(mock, k_, v_)
     if settings:
         mock.settings.update(settings)
     mock.start()
@@ -704,7 +717,10 @@ def test_e2e_full(tmp: Path) -> Path:
     check("distortion: k1 ~ -d within 20 %", abs(s[142] + d) < 0.2 * d, f"k1={s[142]:g} want {-d:g}")
     check("offset: $140/$141 = mirror offset volts (+-5 mV)", abs(s[140] - v0[0]) < 0.005 and abs(s[141] - v0[1]) < 0.005,
           f"{s[140]} {s[141]} want {v0}")
-    check("field: PRR set", s[220] == 40000 and s[221] == 50)
+    check("field: duty set; prr: $220 = the patch closest to the simulated best (56000 for 55000)",
+          s[221] == 50 and s[220] == 56000 and any(mock.fired_prr[i:i + 6] == [20000, 32000, 44000, 56000, 68000, 80000]
+                                for i in range(len(mock.fired_prr))),
+          f"{s[220]} {mock.fired_prr}")
     tr = bench.true
     check("delays within the bench's tolerance band", all(abs(s[n] - tr[n]) <= 15.5 for n in (210, 211, 212, 214, 215))
           and s[213] >= 2.5, str({n: s[n] for n in (210, 211, 212, 213, 214, 215)}))
@@ -814,6 +830,83 @@ def test_e2e_safety(tmp: Path) -> None:
     # 9. 's' skips a step
     code, mock, bench, out, text = run_wizard(tmp, "skip", h, ["--step", "scale"], inject={"scale_x": ["s"]})
     check("'s' skips the step without changes", code == 0 and mock.settings[100] == 0.1 and "skipped" in text)
+
+
+def test_e2e_prr(tmp: Path) -> None:
+    print("end to end: prr (patches at rising $220, best one applied, original restored on abort)")
+    h = Hidden(("x", "y"), (1, 1), T=(0.1, 0.1))
+    orig = 30000.0
+    check("prr_values: linear, rising, both ends in Hz", cm.prr_values(20, 80, 6) == [20000, 32000, 44000, 56000, 68000, 80000]
+          and cm.prr_values(20, 80, 2) == [20000, 80000] and raises(lambda: cm.prr_values(80, 20, 6))
+          and raises(lambda: cm.prr_values(20, 80, 1)))
+    # 1. normal run, simulated best at 55 kHz, S cap 150
+    code, mock, bench, out, text = run_wizard(tmp, "prr", h, ["--fire", "--yes", "--step", "prr", "--max-power", "150"])
+    rep = report_json(out, "prr")
+    check("prr: exit 0, six patches fired at 20..80 kHz in rising order", code == 0 and
+          mock.fired_prr == [20000, 32000, 44000, 56000, 68000, 80000], f"{code} {mock.fired_prr} {text[-300:]}")
+    check("prr: patch 4 (56 kHz) chosen -> $220 = 56000, applied via old -> new, $221 untouched",
+          mock.settings[220] == 56000 and mock.settings[221] == 50 and rep.get("best") == 4 and rep.get("applied") is True
+          and "30000" in text and "56000" in text, f"{mock.settings[220]} {rep.get('best')}")
+    check("prr: $S io sync_hz matched for every patch, no warning", all(p["sync_ok"] for p in rep.get("patches", []))
+          and len(rep.get("patches", [])) == 6 and "WARNING" not in text, text[-300:])
+    check("prr: patch positions listed (centre-out, distinct)", len({(p["x"], p["y"]) for p in rep["patches"]}) == 6
+          and "patch 6/6" in text)
+    sv = s_values_in_log(out)
+    check("prr: S never above --max-power 150 (mark power 100 asked, patches at 100)", sv and max(sv) <= 150 and 100 in sv,
+          str(max(sv or [0])))
+    ch = (out / "calibration_report.md").read_text()
+    check("prr: report lists $220 30000 -> 56000 once, state saved the exact value",
+          ch.count("| prr | $220 |") == 1 and "| 30000 | 56000 |" in ch
+          and json.loads((tmp / "prr_state.json").read_text())["values"]["220"] == 56000)
+    check("prr: laser disarmed afterwards, no protocol violations", not mock.armed and not mock.violations)
+    # 2. 0 = keep current
+    code, mock, bench, out, text = run_wizard(tmp, "prr0", h, ["--fire", "--yes", "--step", "prr"], inject={"prr_best": ["0"]})
+    check("prr: answer 0 keeps the original $220", code == 0 and mock.settings[220] == orig and len(mock.fired_prr) == 6,
+          f"{mock.settings[220]}")
+    # 3. decline the apply: original comes back
+    code, mock, bench, out, text = run_wizard(tmp, "prrno", h, ["--fire", "--yes", "--step", "prr"],
+                                              inject={"apply_prr": ["n"]})
+    check("prr: declining the change leaves the original $220", code == 0 and mock.settings[220] == orig, f"{mock.settings[220]}")
+    # 4. aborts restore the original
+    code, mock, bench, out, text = run_wizard(tmp, "prrc1", h, ["--fire", "--yes", "--step", "prr"],
+                                              raise_on={"prr_best": KeyboardInterrupt})
+    check("prr: Ctrl-C at the question: exit 130, $220 restored, disarmed", code == 130 and mock.settings[220] == orig
+          and not mock.armed and len(mock.fired_prr) == 6, f"{code} {mock.settings[220]}")
+    code, mock, bench, out, text = run_wizard(tmp, "prrc2", h, ["--fire", "--step", "prr"],
+                                              raise_nth={"frame_ok": (3, KeyboardInterrupt)})
+    log = (out / "session.log").read_text()
+    check("prr: Ctrl-C while framing patch 3: exit 130, $220 restored, cancel sequence sent", code == 130
+          and mock.settings[220] == orig and mock.fired_prr == [20000, 32000] and "<0x18>" in log
+          and log.rfind("TX  $220=30000") > log.rfind("<0x18>"), f"{code} {mock.settings[220]} {mock.fired_prr}")
+    code, mock, bench, out, text = run_wizard(tmp, "prrq", h, ["--fire", "--yes", "--step", "prr"],
+                                              inject={"prr_best": ["q"]})
+    check("prr: 'q' at the question restores $220", code == 0 and mock.settings[220] == orig and "quit" in text, f"{mock.settings[220]}")
+    code, mock, bench, out, text = run_wizard(tmp, "prrs", h, ["--fire", "--yes", "--step", "prr"], inject={"prr_best": ["s"]})
+    check("prr: 's' at the question restores $220", code == 0 and mock.settings[220] == orig, f"{mock.settings[220]}")
+    code, mock, bench, out, text = run_wizard(tmp, "prrerr", h, ["--fire", "--step", "prr"],
+                                              raise_nth={"frame_ok": (2, CalibError)})
+    check("prr: error mid-run: exit 1, $220 restored", code == 1 and mock.settings[220] == orig, f"{code} {mock.settings[220]}")
+    # 5. sync_hz not applied by the firmware -> warning
+    code, mock, bench, out, text = run_wizard(tmp, "prrsync", h, ["--fire", "--yes", "--step", "prr"],
+                                              mock_attrs={"sync_hz_stuck": 30000})
+    rep = report_json(out, "prr")
+    check("prr: sync_hz != $220 -> warning, flagged in the report", code == 0 and "WARNING" in text and "sync_hz=30000" in text
+          and not any(p["sync_ok"] for p in rep.get("patches", [])), text[-300:])
+    # 6. inputs: power above the cap is refused and asked again; custom range and step count
+    code, mock, bench, out, text = run_wizard(tmp, "prrin", h, ["--fire", "--yes", "--step", "prr", "--max-power", "120"],
+                                              inject={"prr_power": ["900", "50"], "prr_min": ["30"], "prr_max": ["50"],
+                                                      "prr_steps": ["3"]})
+    check("prr: 30..50 kHz in 3 steps, S 900 rejected (cap 120), marks at S50", code == 0 and
+          mock.fired_prr == [30000, 40000, 50000] and "outside the allowed range" in text and max(s_values_in_log(out)) == 50,
+          f"{mock.fired_prr} {max(s_values_in_log(out))}")
+    # 7. without --fire the step is skipped / refused
+    args = cal.build_parser().parse_args(["--mock", "--step", "prr", "--out", str(tmp / "prrrefuse")])
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        code = cal.run(args, provider=None, mock=None)
+    check("--step prr without --fire is refused (exit 2)", code == 2 and "REFUSING" in err.getvalue())
+    check("prr sits after power and before speed in the default order",
+          cal.STEP_ORDER[cal.STEP_ORDER.index("power") + 1] == "prr" and cal.STEP_ORDER[cal.STEP_ORDER.index("prr") + 1] == "speed")
 
 
 def report_json(out: Path, step: str) -> dict:
@@ -1028,6 +1121,7 @@ def main() -> int:
         test_e2e_safety(tmp)
         test_e2e_range(tmp)
         test_e2e_focus(tmp)
+        test_e2e_prr(tmp)
         test_e2e_restore(tmp, full_out)
     finally:
         if keep:

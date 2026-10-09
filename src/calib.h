@@ -49,6 +49,8 @@
  *  $227  max wait for arm/ready, ms                               [4000]
  *  $229  pulse-density period, ticks                              [10]
  *  $230  gate (EMISSION MODULATION) active low (0/1)              [0]
+ *  $231  auto guide laser for framing: guide on while moving with
+ *        M3 S0 (Rayforge's Frame), off at M5 / M4 / S>0 (0/1)       [1]
  */
 
 #include <stdbool.h>
@@ -89,6 +91,7 @@ enum calib_id {
     CAL_ARM_TIMEOUT_MS,
     CAL_PD_PERIOD,
     CAL_GATE_ACTIVE_LOW,
+    CAL_AUTO_GUIDE,
     CAL_COUNT
 };
 

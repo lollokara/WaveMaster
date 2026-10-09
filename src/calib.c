@@ -58,6 +58,7 @@ static const struct calib_def s_defs[CAL_COUNT] = {
     [CAL_ARM_TIMEOUT_MS]     = { 227,  -1, "armtmo",    4000.0f,   0.0f,        60000.0f },
     [CAL_PD_PERIOD]          = { 229,  -1, "pdper",     10.0f,     2.0f,        255.0f },
     [CAL_GATE_ACTIVE_LOW]    = { 230,  -1, "gatelow",   0.0f,      0.0f,        1.0f },
+    [CAL_AUTO_GUIDE]         = { 231,  -1, "autoguide", 1.0f,      0.0f,        1.0f },
 };
 
 /* Read-only GRBL settings reported for sender compatibility. */
@@ -81,6 +82,7 @@ static bool flags_are_integral(enum calib_id id)
 {
     return id == CAL_AXIS_INVERT || id == CAL_SWAP_XY || id == CAL_ORIGIN_CENTER ||
            id == CAL_POWER_MODE || id == CAL_AUTO_ARM || id == CAL_GATE_ACTIVE_LOW ||
+           id == CAL_AUTO_GUIDE ||
            id == CAL_PD_PERIOD;
 }
 

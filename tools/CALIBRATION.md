@@ -40,7 +40,7 @@ if you change the lens or the distance.
 
 ## Safety
 
-* Only steps `focus`, `delays` and `power` need `--fire`. For `scale`, `distortion`, `offset` and the
+* Only steps `focus`, `delays`, `power` and `prr` need `--fire`. For `scale`, `distortion`, `offset` and the
   jump-speed part of `speed`, `--fire` lets you mark with the real laser; without it the same
   patterns are traced with the red guide laser (M66 preview, S0).
 * The same rules as `tools/rftest/run_tests.py`: `--fire` is required, `FIRE` must be typed
@@ -89,9 +89,11 @@ if you change the lens or the distance.
    short lines: `$210` laser-on, `$211` laser-off, `$212` jump, `$213` jump per mm, `$214` mark,
    `$215` polygon.
 10. **power** maps `S` onto the useful part of the laser power range (`$224`/`$225`).
-11. **speed** finds the highest marking speed with clean corners (`$110`) and the highest clean
+11. **prr** (needs `--fire`) compares pulse repetition rates (`$220`) on small hatched patches, at
+    the power you will use. It comes after `power` because the energy per pulse depends on both.
+12. **speed** finds the highest marking speed with clean corners (`$110`) and the highest clean
     jump speed (`$201`).
-12. **summary** lists all changes and the final `$$`.
+13. **summary** lists all changes and the final `$$`.
 
 ## Measuring: general rules
 
@@ -281,6 +283,41 @@ wizard converts those `S` values to power percent with the current mapping and s
 max power stays `$30`; its 1 % ... 100 % range then spans "just marks" to "saturated". Use
 `--max-power` high enough to see saturation, or accept that only `$224` is set. If the lowest patch
 already marks, repeat with a smaller `--max-power`.
+
+### prr (`$220`), real laser
+
+The PRR (pulse repetition rate) of a pulsed fibre laser trades **energy per pulse** against **pulse
+overlap**. At a fixed average power, a low PRR gives few, strong pulses: deep, high-contrast
+dots that can leave a visible dotted structure along and between the lines. A high PRR gives many, weak
+pulses that overlap strongly: a smoother, more even surface and a gentler (often darker or cleaner on
+some materials, paler on others) mark, with less peak energy per pulse. Overlap also depends on the
+speed and the hatch spacing, which is why the patches use the speed (`--feed` by default) and `S` you
+will really use. `$221` (duty of the SYNC signal) is not changed by this step.
+
+The wizard asks for:
+
+- the allowed PRR range of your laser in kHz (default 20 .. 80). **Check your laser's datasheet:
+  outside the allowed range IPG lasers may not emit or may raise an alarm.** Enter the real limits,
+  not the ones you would like;
+- the number of values (default 6, linear spacing from the lowest to the highest);
+- `S` (default: the mark power you gave) and the speed (default `--feed`). `S` is capped at `--max-power`.
+
+For each value it writes `$220` (the firmware applies it at once when idle), checks with `$S` that the
+`io` line reports `sync_hz` within 2 % of it (otherwise it warns: the patch may not have the PRR you
+think), then marks one 10 x 10 mm hatched patch as its own job (guide-laser frame, arm, fire). Patches
+are numbered in order of **rising PRR**, but placed centre-out like every other pattern, so the wizard
+prints every patch's position (centre X/Y, and the offset from patch 1; +X right, +Y away from you) and a
+table at the end.
+
+How to judge: look at the patches with a loupe and pick the one with the **most even** surface (no
+dots, no gaps or stripes between lines), no burn-through or spatter, and the colour or depth you want.
+Normally the answer is a trade: the lowest PRR with a still even surface for maximum pulse energy, or a
+higher PRR for a smoother look. Enter its number; `0` keeps the current PRR. The proposal is shown as
+old -> new, confirmed and read back with `$$`.
+
+The original `$220` is restored if you answer 0, decline the change, skip (`s`) or quit (`q`), press
+Ctrl-C, or if an error stops the step. The temporary trial values are never written to the report as
+changes.
 
 ### speed (`$110`, `$201`)
 

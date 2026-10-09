@@ -77,6 +77,9 @@ static float s_wcs_off[6][2];
 static float s_g92[2];
 
 static bool s_fault;
+/* $231: guide laser switched on automatically for a frame (moves under
+ * M3 S0, which is what Rayforge's Frame sends - real jobs use M4). */
+static bool s_auto_guide;
 static bool s_clamp_warned;
 static uint32_t s_clamp_count;
 
@@ -119,8 +122,9 @@ static void publish(void)
 
 static void modal_reset(void)
 {
-    if (s_m.preview && !s_fault)
+    if ((s_m.preview || s_auto_guide) && !s_fault)
         atmega_link_set_guide(false);
+    s_auto_guide = false;
     s_m.motion = 0;
     s_m.relative = false;
     s_m.inches = false;
@@ -344,6 +348,18 @@ static int exec_gcode(const char *line, bool jog)
             s_m.preview = (preview == 1);
             atmega_link_set_guide(s_m.preview);
         }
+        if (guide >= 0 || preview >= 0)
+            s_auto_guide = false;           /* the user took over the guide laser */
+
+        /* Auto guide ends when the line leaves "M3 with S0" (M5 at the end of
+         * Rayforge's frame, or M4 / a real power for a job). Wait for the
+         * frame's queued moves first so the guide stays on to the end. */
+        if (s_auto_guide && !(s_m.laser == 3 && !(s_m.s > 0.0f))) {
+            if (!wait_idle())
+                return E_ABORT;
+            atmega_link_set_guide(s_m.preview);
+            s_auto_guide = false;
+        }
     }
 
     float wco_x = s_wcs_off[s_m.wcs][0] + s_g92[0];
@@ -430,6 +446,11 @@ static int exec_gcode(const char *line, bool jog)
                     s_jog_active = true;
             }
         } else {
+            if (!s_auto_guide && s_m.laser == 3 && !(s_m.s > 0.0f) && !s_m.preview &&
+                calib_get(CAL_AUTO_GUIDE) > 0.5f) {
+                atmega_link_set_guide(true);      /* framing: show it with the guide laser */
+                s_auto_guide = true;
+            }
             float speed = gcode_mark_speed(s_m.feed, calib_get(CAL_MAX_MARK_RATE),
                                            calib_get(CAL_DEFAULT_MARK_SPEED));
             uint8_t pw = current_power();
@@ -468,6 +489,10 @@ static int exec_gcode(const char *line, bool jog)
         s_m.laser = 0;
         s_m.relative = false;
         s_clamp_warned = false;
+        if (s_auto_guide) {
+            atmega_link_set_guide(s_m.preview);
+            s_auto_guide = false;
+        }
         if (s_clamp_count) {
             ESP_LOGW(TAG, "%u targets were clamped to the work area", (unsigned)s_clamp_count);
             s_clamp_count = 0;
@@ -573,8 +598,13 @@ static int dollar_setting(const char *line)
         return 3;
     }
     if (!s_fault) {
-        if (!motion_busy() && !galvo_out_busy())
+        if (!motion_busy() && !galvo_out_busy()) {
             galvo_out_reload();
+            /* PRR / SYNC duty take effect at once (they used to wait for
+             * a reboot). */
+            if (n == 220 || n == 221)
+                laser_io_set_prr(calib_get(CAL_PRR_HZ), calib_get(CAL_PRR_DUTY));
+        }
         motion_reload_params();
     }
     return 0;
@@ -867,6 +897,11 @@ static void on_resume(void)
 static void on_reset(void)
 {
     s_reset_gen++;                       /* first: the GRBL task starts discarding */
+    /* Stop / Ctrl-X is an emergency stop: drop EMISSION ENABLE (MO) and the
+     * power word on the ATmega too, not just the gate. Asynchronous, so it
+     * does not delay the abort below; also done in fault mode. The next job
+     * re-arms by itself ($226). */
+    atmega_link_set_armed(false);
     if (!s_fault) {
         float x, y;
 
