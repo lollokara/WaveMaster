@@ -897,6 +897,11 @@ static void on_resume(void)
 static void on_reset(void)
 {
     s_reset_gen++;                       /* first: the GRBL task starts discarding */
+    /* Stop / Ctrl-X is an emergency stop: drop EMISSION ENABLE (MO) and the
+     * power word on the ATmega too, not just the gate. Asynchronous, so it
+     * does not delay the abort below; also done in fault mode. The next job
+     * re-arms by itself ($226). */
+    atmega_link_set_armed(false);
     if (!s_fault) {
         float x, y;
 

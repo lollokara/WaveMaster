@@ -799,6 +799,12 @@ class Session:
                    "none" if cr.reset_latency is None else f"{cr.reset_latency * 1000:.1f} ms")
         self.check("M5/M9 accepted after cancel", cr.ok, f"M5={cr.m5} M9={cr.m9}")
         self.check("guide off after cancel", guide == "0", f"guide={guide}")
+        armed = c.stats_s().get("atmega", {}).get("armed")
+        deadline = time.monotonic() + 1.0       # async ATmega link: poll briefly
+        while armed != "0" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            armed = c.stats_s().get("atmega", {}).get("armed")
+        self.check("laser disarmed after cancel", armed == "0", f"armed={armed}")
 
 
 # ----------------------------------------------------------------- main ----

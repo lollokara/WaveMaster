@@ -206,7 +206,7 @@ Why there is no hook that sends `M66` / `M67` around framing: the frame job is b
 
 ## 7. Cancel
 
-Rayforge's **Cancel Job** soft-resets the controller (**Ctrl-X**, `0x18`) and then sends the dialect's laser-off commands (`M5`, `M9`). The soft reset also clears preview. The firmware cuts the gate immediately and stops the stream. The target is within about 60 ms. This is not yet measured on hardware (see [STATUS.md](../STATUS.md)).
+Rayforge's **Cancel Job** soft-resets the controller (**Ctrl-X**, `0x18`) and then sends the dialect's laser-off commands (`M5`, `M9`). The soft reset also clears preview and **disarms the laser** (EMISSION ENABLE off, power word 0 on the ATmega); the next job re-arms by itself when `$226=1`. The firmware cuts the gate immediately and stops the stream. The target is within about 60 ms. This is not yet measured on hardware (see [STATUS.md](../STATUS.md)).
 
 ## 8. Tuning the galvo and laser delays
 

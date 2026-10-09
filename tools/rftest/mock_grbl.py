@@ -243,6 +243,7 @@ class MockGrbl:
                         buf.append(c)
 
     def _do_reset(self) -> None:
+        self.armed = False          # firmware: Ctrl-X / Stop disarms the laser
         with self._lines_cv, self._acklock:
             self._gen += 1
             self._lines.clear()
