@@ -59,6 +59,7 @@ static const struct calib_def s_defs[CAL_COUNT] = {
     [CAL_PD_PERIOD]          = { 229,  -1, "pdper",     10.0f,     2.0f,        255.0f },
     [CAL_GATE_ACTIVE_LOW]    = { 230,  -1, "gatelow",   0.0f,      0.0f,        1.0f },
     [CAL_AUTO_GUIDE]         = { 231,  -1, "autoguide", 1.0f,      0.0f,        1.0f },
+    [CAL_WIFI_EN]            = { 240,  -1, "wifien",    0.0f,      0.0f,        1.0f },
 };
 
 /* Read-only GRBL settings reported for sender compatibility. */

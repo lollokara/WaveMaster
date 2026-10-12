@@ -9,6 +9,7 @@
 #include "host_serial.h"
 #include "laser_io.h"
 #include "motion_task.h"
+#include "net_wifi.h"
 
 static const char *TAG = "wavemaster";
 
@@ -36,6 +37,8 @@ void app_main(void)
 
     if (!grbl_task_start())
         ESP_LOGE(TAG, "GRBL task failed to start");
+    if (!net_wifi_start())               /* idle unless $240 = 1 and credentials are stored */
+        ESP_LOGE(TAG, "network manager failed to start");
 
     if (hw_ok)
         ESP_LOGI(TAG, "ready: tick %.2f us, field %.0fx%.0f mm, scale %.4f/%.4f V/mm",

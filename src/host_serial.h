@@ -21,6 +21,14 @@
  *      ok lines, status reports and log lines from any task or core never
  *      interleave. Not callable from ISRs.
  *
+ *  Second host (WiFi, net_server.c): a TCP client is a second transport into
+ *  the same stream. One host at a time: replies, status and logs go to the
+ *  active host. Input from the other host is ignored while the machine is
+ *  busy (see host_serial_set_busy_fn), except Ctrl-X, which always works; while
+ *  idle, input from the other host makes it the active one. When the TCP
+ *  client goes away while it is the active host, a soft reset (Ctrl-X) is
+ *  injected and USB becomes active again.
+ *
  *  Logging: esp_log output is redirected to GRBL feedback messages,
  *      "[MSG:<text>]\r\n" (ANSI colours stripped, one line per message).
  */
@@ -28,6 +36,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "freertos/FreeRTOS.h"
 
 #define HOST_RX_RESET_MARK 0x18
 
@@ -41,6 +51,17 @@ struct host_rt_handlers {
 
 /* Installs the driver, starts the RX task and redirects esp_log. */
 bool host_serial_init(void);
+
+/* Predicate: true while a job or a partial line is in progress. */
+void host_serial_set_busy_fn(bool (*busy)(void));
+
+/* TCP client transport (called from the net server task only).
+ *   up:   a client is attached; write() sends to it (full write or 0).
+ *   rx:   bytes received from it.
+ *   down: client gone; aborts like Ctrl-X if it was the active host. */
+void host_link_net_up(int (*write)(const char *s, size_t n, TickType_t wait));
+void host_link_net_rx(const uint8_t *data, int n);
+void host_link_net_down(void);
 
 /* Handlers run in the RX task; they must be quick and must not block on
  * anything the GRBL task holds. NULL members are ignored. */

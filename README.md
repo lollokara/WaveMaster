@@ -171,52 +171,49 @@ Calibrating the galvo (focus, range, orientation, scale, distortion, offset, del
 ## 🛠️ Settings (`$$`)
 
 Settings persist in NVS and load at boot. Read them with `$$`, and change one with
-`$<n>=<value>`. The table below is copied verbatim from `src/calib.h`. Valid ranges
-are in the `s_defs` table in `src/calib.c`.
+`$<n>=<value>`. Values are floats, flags are 0/1. A value outside its range is rejected.
+The same table is in `src/calib.h` (comments) and `src/calib.c` (`s_defs`, the source of truth).
+A number in brackets is an alias that writes the same value.
 
-```
-$3    axis invert mask: bit0 = invert X, bit1 = invert Y        [0]
-$12   arc tolerance, mm (G2/G3 chord error)                    [0.01]
-$13   report inches - fixed 0 (read-only)
-$30   S value for 100% power                                   [1000]
-$31   S value for 0% power - fixed 0 (read-only)
-$32   laser mode - fixed 1 (read-only)
-$100  X scale, volts per mm                                    [0.1]
-$101  Y scale, volts per mm                                    [0.1]
-$110  max marking speed, mm/min ($111 is an alias)             [300000]
-$120  jump acceleration, mm/s^2, 0 = no ramp ($121 alias)      [2000000]
-$130  work area width, mm                                      [100]
-$131  work area height, mm                                     [100]
-$140  X offset, volts                                          [0]
-$141  Y offset, volts                                          [0]
-$142  radial (F-theta) correction k1: r' = r(1 + k1 r^2)       [0]
-$143  swap X/Y axes (0/1)                                      [0]
-$144  origin: 0 = work area corner (0,0)..(W,H) centred on the
-      lens; 1 = (0,0) is the lens centre                       [0]
-$150  wobble diameter, mm, 0 = off                             [0]
-$151  wobble pitch, mm per revolution                          [0.5]
-$200  tick period, us (one DAC point per tick)                 [10]
-$201  jump speed, mm/s                                         [3000]
-$203  default marking speed when no F was given, mm/s         [500]
-$210  laser-on delay, us                                       [100]
-$211  laser-off delay, us                                      [120]
-$212  jump delay, us                                           [300]
-$213  extra jump delay per mm of jump, us/mm                   [0]
-$214  mark delay (hold at end of a polyline), us               [100]
-$215  polygon delay at a 180 deg corner, us                    [0]
-$216  polygon delay angle threshold, degrees                   [30]
-$220  pulse repetition rate (SYNC), Hz                         [30000]
-$221  SYNC duty cycle, %                                       [50]
-$223  power mode: 0 analog (ATmega word), 1 pulse density      [0]
-$224  power at S = 0+ (min), %                                 [0]
-$225  power at S = $30 (max), %                                [100]
-$226  auto-arm when the first mark needs the laser (0/1)        [1]
-$227  max wait for arm/ready, ms                               [4000]
-$229  pulse-density period, ticks                              [10]
-$230  gate (EMISSION MODULATION) active low (0/1)              [0]
-$231  auto guide laser for framing: guide on while moving with
-      M3 S0 (Rayforge's Frame), off at M5 / M4 / S>0 (0/1)       [1]
-```
+| `$` | Meaning | Default | Range | NVS key |
+|---|---|---|---|---|
+| `$3` | Axis invert mask: bit 0 inverts X, bit 1 inverts Y. | 0 | 0 … 3 | `axinv` |
+| `$12` | Arc tolerance, mm: the chord error allowed when G2/G3 arcs are split into lines. | 0.01 | 0.0005 … 1 | `arctol` |
+| `$30` | S value that means 100 % power (Rayforge's max power). | 1000 | 1 … 100000 | `smax` |
+| `$100` | X scale, volts per mm of work area. | 0.1 | -100 … 100 | `xvpm` |
+| `$101` | Y scale, volts per mm of work area. | 0.1 | -100 … 100 | `yvpm` |
+| `$110` (`$111`) | Maximum marking speed, mm/min (`$111` writes the same value). | 300000 | 1 … 3000000 | `maxrate` |
+| `$120` (`$121`) | Jump acceleration, mm/s²; 0 means no ramp (`$121` writes the same value). | 2000000 | 0 … 1e9 | `jaccel` |
+| `$130` | Work area width, mm. | 100 | 1 … 1000 | `fieldw` |
+| `$131` | Work area height, mm. | 100 | 1 … 1000 | `fieldh` |
+| `$140` | X offset, volts. | 0 | -10 … 10 | `xoff` |
+| `$141` | Y offset, volts. | 0 | -10 … 10 | `yoff` |
+| `$142` | Radial (F-theta) lens correction k1: r' = r(1 + k1·r²). | 0 | -1 … 1 | `radk1` |
+| `$143` | Swap the X and Y axes (0/1). | 0 | 0 … 1 | `swapxy` |
+| `$144` | Origin: 0 = work area corner, (0,0)..(W,H) centred on the lens; 1 = (0,0) is the lens centre. | 0 | 0 … 1 | `origc` |
+| `$150` | Wobble diameter, mm; 0 = off. | 0 | 0 … 10 | `wobd` |
+| `$151` | Wobble pitch, mm per revolution. | 0.5 | 0.001 … 100 | `wobp` |
+| `$200` | Tick period, µs: one DAC point per tick (sets the point rate). | 10 | 2 … 200 | `tickus` |
+| `$201` | Jump (G0) speed, mm/s. | 3000 | 1 … 100000 | `jspeed` |
+| `$203` | Marking speed used when no F was given, mm/s. | 500 | 0.1 … 100000 | `dmspeed` |
+| `$210` | Laser-on delay, µs. | 100 | 0 … 100000 | `laserond` |
+| `$211` | Laser-off delay, µs. | 120 | 0 … 100000 | `laseroffd` |
+| `$212` | Jump delay (settle after a jump), µs. | 300 | 0 … 1000000 | `jumpdly` |
+| `$213` | Extra jump delay per mm of jump, µs/mm. | 0 | 0 … 100000 | `jdlypmm` |
+| `$214` | Mark delay: hold at the end of a polyline, µs. | 100 | 0 … 1000000 | `markdly` |
+| `$215` | Polygon delay at a 180° corner, µs. | 0 | 0 … 100000 | `polydly` |
+| `$216` | Polygon delay angle threshold, degrees. | 30 | 0 … 180 | `polyang` |
+| `$220` | Pulse repetition rate (SYNC, DB25 pin 20), Hz. | 30000 | 0 … 2000000 | `prrhz` |
+| `$221` | SYNC duty cycle, %. | 50 | 1 … 99 | `prrduty` |
+| `$223` | Power mode: 0 = analog power word over the ATmega link, 1 = pulse density at fixed power. | 0 | 0 … 1 | `pwrmode` |
+| `$224` | Power at S = 0+ (minimum), %. | 0 | 0 … 100 | `pwrmin` |
+| `$225` | Power at S = `$30` (maximum), %. | 100 | 0 … 100 | `pwrmax` |
+| `$226` | Auto-arm when the first mark needs the laser (0/1). | 1 | 0 … 1 | `autoarm` |
+| `$227` | Maximum wait for arm / ready, ms. | 4000 | 0 … 60000 | `armtmo` |
+| `$229` | Pulse-density period, ticks (used when `$223=1`). | 10 | 2 … 255 | `pdper` |
+| `$230` | Gate (EMISSION MODULATION) active low (0/1). Check `docs/WIRING.md` before changing. | 0 | 0 … 1 | `gatelow` |
+| `$231` | Auto guide laser for framing: guide on while moving with `M3 S0` (Rayforge's Frame), off at `M5` / `M4` / S>0 (0/1). | 1 | 0 … 1 | `autoguide` |
+| `$240` | WiFi host link on (0/1). Needs credentials from `$WIFI=ssid,password`. See the WiFi section. | 0 | 0 … 1 | `wifien` |
 
 Read-only GRBL values (`$0`, `$1`, `$2`, `$4`-`$6`, `$10`, `$11`, `$20`-`$27`, `$31`, `$32`, `$102`, `$112`, `$122`, `$132`) are reported for sender compatibility and ignored when set.
 

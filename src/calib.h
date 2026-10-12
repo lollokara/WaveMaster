@@ -51,6 +51,8 @@
  *  $230  gate (EMISSION MODULATION) active low (0/1)              [0]
  *  $231  auto guide laser for framing: guide on while moving with
  *        M3 S0 (Rayforge's Frame), off at M5 / M4 / S>0 (0/1)       [1]
+ *  $240  WiFi host link on (0/1): needs credentials set with $WIFI=ssid,password
+ *        (see README); read at runtime, off by default                [0]
  */
 
 #include <stdbool.h>
@@ -92,6 +94,7 @@ enum calib_id {
     CAL_PD_PERIOD,
     CAL_GATE_ACTIVE_LOW,
     CAL_AUTO_GUIDE,
+    CAL_WIFI_EN,
     CAL_COUNT
 };
 

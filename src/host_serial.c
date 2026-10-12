@@ -22,9 +22,11 @@
 #define LOG_MUTEX_MS     10
 #define LOG_TX_WAIT_MS   5
 #define LOG_LINE_MAX     200
+#define SWITCH_MUTEX_MS  20
 
 static StreamBufferHandle_t s_rx_stream;
 static SemaphoreHandle_t s_tx_mutex;
+static SemaphoreHandle_t s_rx_mutex;        /* one writer into s_rx_stream; lock order: rx, then tx */
 static struct host_rt_handlers s_h;
 static volatile uint32_t s_accepted;
 static volatile uint32_t s_dropped;
@@ -45,7 +47,9 @@ static int usb_write(const char *s, size_t n, TickType_t wait)
 }
 
 static const struct host_transport s_usb = { .write = usb_write };
-static const struct host_transport *s_active = &s_usb;
+static struct host_transport s_net;         /* .write set while a client is attached */
+static const struct host_transport *volatile s_active = &s_usb;
+static bool (*s_busy_fn)(void);
 
 /* ---------------------------------------------------------------- TX --- */
 
@@ -172,15 +176,46 @@ static void rx_flush(uint8_t *batch, size_t *len)
     }
 }
 
+/* Makes src the host that gets replies and logs. Fails (false) if the TX
+ * mutex is not free quickly: a stuck write must not delay realtime input. */
+static bool switch_active(const struct host_transport *src)
+{
+    if (xSemaphoreTakeRecursive(s_tx_mutex, pdMS_TO_TICKS(SWITCH_MUTEX_MS)) != pdTRUE)
+        return false;
+    s_active = src;
+    s_tx_dead = false;
+    xSemaphoreGiveRecursive(s_tx_mutex);
+    return true;
+}
+
 /* Parses one block of host input: realtime bytes act at once, everything
- * else goes into the stream. Called from the RX task of the transport that
- * received it; with a second transport the callers must be serialised, since
- * a stream buffer has a single writer. */
-static void rx_ingest(const uint8_t *in, int got)
+ * else goes into the stream. s_rx_mutex must be held.
+ *
+ * One host at a time: input from the transport that is not active is
+ * ignored while the machine is busy, except Ctrl-X, which always works.
+ * While idle, input from the other transport makes it the active one. */
+static void rx_ingest_locked(const struct host_transport *src, const uint8_t *in, int got)
 {
     uint8_t batch[128];
+    uint8_t reset_only = HOST_RX_RESET_MARK;
     size_t bl = 0;
 
+    if (src != s_active) {
+        bool switched = false;
+
+        if (!(s_busy_fn && s_busy_fn()))
+            switched = switch_active(src);
+        if (!switched) {
+            bool has_reset = false;
+
+            for (int i = 0; i < got; i++)
+                has_reset |= in[i] == HOST_RX_RESET_MARK;
+            if (!has_reset)
+                return;
+            in = &reset_only;
+            got = 1;
+        }
+    }
     s_tx_dead = false;                  /* the host is alive */
     for (int i = 0; i < got; i++) {
         uint8_t c = in[i];
@@ -224,6 +259,13 @@ static void rx_ingest(const uint8_t *in, int got)
     rx_flush(batch, &bl);
 }
 
+static void rx_ingest(const struct host_transport *src, const uint8_t *in, int got)
+{
+    xSemaphoreTake(s_rx_mutex, portMAX_DELAY);
+    rx_ingest_locked(src, in, got);
+    xSemaphoreGive(s_rx_mutex);
+}
+
 static void rx_task(void *arg)
 {
     uint8_t in[128];
@@ -234,7 +276,7 @@ static void rx_task(void *arg)
 
         if (got <= 0)
             continue;
-        rx_ingest(in, got);
+        rx_ingest(&s_usb, in, got);
     }
 }
 
@@ -253,6 +295,53 @@ uint32_t host_rx_dropped(void)
     return s_dropped;
 }
 
+void host_serial_set_busy_fn(bool (*busy)(void))
+{
+    s_busy_fn = busy;
+}
+
+void host_link_net_up(int (*write)(const char *s, size_t n, TickType_t wait))
+{
+    if (!s_up)
+        return;
+    xSemaphoreTakeRecursive(s_tx_mutex, portMAX_DELAY);
+    s_net.write = write;
+    xSemaphoreGiveRecursive(s_tx_mutex);
+}
+
+void host_link_net_rx(const uint8_t *data, int n)
+{
+    if (s_up && s_net.write && n > 0) {
+        for (int off = 0; off < n; off += 128)
+            rx_ingest(&s_net, data + off, n - off > 128 ? 128 : n - off);
+    }
+}
+
+void host_link_net_down(void)
+{
+    bool was_active;
+
+    if (!s_up)
+        return;
+    xSemaphoreTake(s_rx_mutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(s_tx_mutex, portMAX_DELAY);
+    was_active = s_active == &s_net;
+    s_net.write = NULL;
+    if (was_active) {
+        s_active = &s_usb;
+        s_tx_dead = false;
+    }
+    xSemaphoreGiveRecursive(s_tx_mutex);
+    if (was_active) {
+        /* The controlling host is gone: same as Ctrl-X (stop, gate off,
+         * disarm). A reconnecting Rayforge cannot resume a job anyway. */
+        uint8_t reset = HOST_RX_RESET_MARK;
+
+        rx_ingest_locked(&s_usb, &reset, 1);
+    }
+    xSemaphoreGive(s_rx_mutex);
+}
+
 void host_serial_set_handlers(const struct host_rt_handlers *h)
 {
     s_h = *h;
@@ -268,8 +357,9 @@ bool host_serial_init(void)
     if (s_up)
         return true;
     s_tx_mutex = xSemaphoreCreateRecursiveMutex();
+    s_rx_mutex = xSemaphoreCreateMutex();
     s_rx_stream = xStreamBufferCreate(RX_STREAM_BUF, 1);
-    if (!s_tx_mutex || !s_rx_stream)
+    if (!s_tx_mutex || !s_rx_mutex || !s_rx_stream)
         return false;
     if (!usb_serial_jtag_is_driver_installed() &&
         usb_serial_jtag_driver_install(&cfg) != ESP_OK)

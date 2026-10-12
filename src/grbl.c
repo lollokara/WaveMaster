@@ -48,6 +48,7 @@
 #include "laser_io.h"
 #include "motion.h"
 #include "motion_task.h"
+#include "net_wifi.h"
 
 static const char *TAG = "grbl";
 
@@ -718,6 +719,11 @@ static int exec_dollar(char *line)
     char *p = line;
     size_t len;
 
+    /* $WIFI carries a case-sensitive password: handle it before the line is
+     * upper-cased below. */
+    if (strncasecmp(p, "$WIFI", 5) == 0)
+        return net_wifi_command(p + 5, out_line);
+
     for (len = 0; p[len]; len++)
         if (p[len] >= 'a' && p[len] <= 'z')
             p[len] = (char)(p[len] - 'a' + 'A');
@@ -725,7 +731,7 @@ static int exec_dollar(char *line)
         p[--len] = '\0';
 
     if (len == 1) {
-        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $RD $PW=word $GT=ms $LT=ms,S ~ ! ? ctrl-x]\r\n");
+        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $RD $PW=word $GT=ms $LT=ms,S $WIFI[=ssid,pass|CLEAR] ~ ! ? ctrl-x]\r\n");
         return 0;
     }
     if (strcmp(p, "$$") == 0) {
@@ -880,6 +886,14 @@ static void report_status(void)
 static void on_status(void)
 {
     report_status();
+}
+
+/* host_serial.c: another host may take over only while this is false. */
+static bool host_busy(void)
+{
+    if (s_fault)
+        return false;
+    return motion_busy() || s_jog_active || host_rx_accepted() != s_acked;
 }
 
 static void on_hold(void)
@@ -1046,6 +1060,7 @@ bool grbl_task_start(void)
         s_m.y = y;
     }
     host_serial_set_handlers(&h);
+    host_serial_set_busy_fn(host_busy);
     return xTaskCreatePinnedToCore(grbl_task, "grbl", GRBL_TASK_STACK, NULL, GRBL_TASK_PRIO,
                                    NULL, 1) == pdPASS;
 }
