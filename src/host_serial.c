@@ -211,8 +211,11 @@ static bool machine_busy(void)
 }
 
 /* Parses one block of host input: realtime bytes act at once, everything
- * else goes into the stream. s_rx_mutex must be held. reset_done: the reset
- * handler already ran for this block (see rx_ingest), only the mark is queued.
+ * else goes into the stream. s_rx_mutex must be held. reset_done: the block
+ * holds a Ctrl-X and the reset handler already ran once for it (see
+ * rx_ingest). Then exactly one mark is queued, at the last Ctrl-X: grbl.c
+ * counts handler calls and marks one to one, so they must match. Everything
+ * before that Ctrl-X is dropped (a '!' there must not act after the reset).
  *
  * One host at a time: input from the transport that is not active is
  * ignored while the machine is busy, except Ctrl-X, which always works.
@@ -241,6 +244,19 @@ static void rx_ingest_locked(const struct host_transport *src, const uint8_t *in
         }
     }
     s_tx_dead = false;                  /* the host is alive */
+    if (reset_done) {
+        int last = 0;
+
+        for (int i = 0; i < got; i++)
+            if (in[i] == HOST_RX_RESET_MARK)
+                last = i;
+        /* The mark must not be lost: wait briefly if the stream is
+         * (pathologically) full - the GRBL task is draining it. */
+        if (xStreamBufferSend(s_rx_stream, &reset_only, 1, pdMS_TO_TICKS(100)) != 1)
+            s_dropped++;
+        in += last + 1;
+        got -= last + 1;
+    }
     for (int i = 0; i < got; i++) {
         uint8_t c = in[i];
 
@@ -265,7 +281,7 @@ static void rx_ingest_locked(const struct host_transport *src, const uint8_t *in
             uint8_t mark = HOST_RX_RESET_MARK;
 
             rx_flush(batch, &bl);       /* earlier bytes stay ahead of the mark */
-            if (s_h.reset && !reset_done)
+            if (s_h.reset)
                 s_h.reset();
             /* The mark must not be lost: wait briefly if the stream is
              * (pathologically) full - the GRBL task is draining it. */

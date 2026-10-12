@@ -101,7 +101,7 @@ Each result goes into `STATUS.md` under "Verified on hardware". Anything not mea
 
 ## Review follow-up (code review of phases 2 and 3)
 
-Fixed after review: Ctrl-X no longer waits behind a `?` that holds the receive lock; a CRLF line no longer leaves the
+Fixed after review (the logic is covered by `test/host/hostlink`): Ctrl-X no longer waits behind a `?` that holds the receive lock, and a block with several Ctrl-X bytes queues one mark for one handler call; a CRLF line no longer leaves the
 machine "busy" for the other host; WiFi event handlers only set flags (they run on core 0 above `dac_task`); log lines
 from the lwIP and event-loop tasks are dropped instead of written to a host; the netif is created once and WiFi gives up
 after 3 failed starts; the TCP client is dropped at once when the link is lost or WiFi is stopped; network settings only
@@ -114,5 +114,6 @@ Known and left as is:
 - A silent client is not detected by traffic: Rayforge does not poll during jobs, so only TCP keepalive (about 6 s) and
   link loss end a job whose client disappeared without a FIN.
 - The SSID is split at the first comma, so it cannot contain one.
+- Another `?` can still hold the receive lock while it writes its reply (up to the 200 ms network write cap), so a `!` from the other host can wait that long. Ctrl-X cannot.
 - Reset marks: if the stream is full for 100 ms when a Ctrl-X mark is queued, `grbl.c` keeps discarding input until the
   next reboot. This predates the WiFi work and is unchanged.

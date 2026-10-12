@@ -916,7 +916,9 @@ static void on_resume(void)
 
 static void on_reset(void)
 {
-    s_reset_gen++;                       /* first: the GRBL task starts discarding */
+    /* Atomic: with a second host this can run in two tasks at once, and a lost
+     * increment would leave s_reset_gen != s_gen_seen for good. */
+    __atomic_fetch_add(&s_reset_gen, 1, __ATOMIC_SEQ_CST);   /* first: the GRBL task starts discarding */
     /* Stop / Ctrl-X is an emergency stop: drop EMISSION ENABLE (MO) and the
      * power word on the ATmega too, not just the gate. Asynchronous, so it
      * does not delay the abort below; also done in fault mode. The next job

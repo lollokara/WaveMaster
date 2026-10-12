@@ -40,21 +40,27 @@ static int net_write(const char *s, size_t n, TickType_t wait)
             off += (size_t)r;
             continue;
         }
-        if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+        if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            s_kick = true;
             return 0;
+        }
         {
             TickType_t used = xTaskGetTickCount() - t0;
             struct timeval tv;
             fd_set wf;
 
-            if (used >= wait)
+            if (used >= wait) {
+                s_kick = true;          /* replies cannot get through: the host would stall silently */
                 return 0;
+            }
             tv.tv_sec = 0;
             tv.tv_usec = (suseconds_t)(wait - used) * portTICK_PERIOD_MS * 1000;
             FD_ZERO(&wf);
             FD_SET(fd, &wf);
-            if (select(fd + 1, NULL, &wf, NULL, &tv) <= 0)
+            if (select(fd + 1, NULL, &wf, NULL, &tv) <= 0) {
+                s_kick = true;
                 return 0;
+            }
         }
     }
     return (int)n;
@@ -113,8 +119,13 @@ static void server_task(void *arg)
     for (;;) {
         fd_set rf;
         struct timeval tv = { 0, SELECT_MS * 1000 };
-        int fd = s_fd, mx;
+        int fd, mx;
 
+        if (s_kick) {
+            s_kick = false;
+            drop_client();              /* link lost or stopped, or replies cannot be delivered */
+        }
+        fd = s_fd;
         if (ls < 0) {
             ls = listen_socket();
             if (ls < 0) {
@@ -131,11 +142,6 @@ static void server_task(void *arg)
             FD_SET(fd, &rf);
             if (fd > mx)
                 mx = fd;
-        }
-        if (s_kick) {
-            s_kick = false;
-            drop_client();              /* WiFi link lost or stopped: the client cannot be reached */
-            fd = -1;
         }
         if (select(mx + 1, &rf, NULL, NULL, &tv) <= 0)
             continue;

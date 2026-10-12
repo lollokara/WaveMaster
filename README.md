@@ -247,9 +247,10 @@ Rules to know:
 - **Network settings only over USB.** `$WIFI=ssid,password` and `$WIFI=CLEAR` are refused from a WiFi client (the
   password would travel in clear). `$WIFI` alone (status) works from either host.
 - **Losing the WiFi client stops the job.** If the active TCP client disappears, the firmware does what Ctrl-X does:
-  stop, gate off, disarm. USB becomes the active host again. When the controller itself loses the access point, or
-  WiFi is switched off, this happens at once; when only the client vanishes, TCP keepalive notices after about 6 s,
-  and the job keeps marking until then. A WiFi client that stops reading for 200 ms counts as dead for replies.
+  stop, gate off, disarm. USB becomes the active host again. This happens at once when WiFi is switched off or the
+  access point says goodbye. If the access point or the client just disappears, it takes as long as the WiFi driver or
+  TCP keepalive needs to notice (about 6 s or more), and the job keeps marking until then. A client that stops
+  reading replies for 200 ms is treated as lost.
 - **No authentication.** Anyone on the same network who can reach port 23 can send G-code. Keep the controller on a
   trusted or separate network. The laser still has to be armed, and the ATmega interlocks are unchanged.
 - Settings changes (`$240`, credentials) apply within about a second, no reboot needed.

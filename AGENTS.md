@@ -90,6 +90,9 @@ When modifying firmware code:
    make -C test/host              # trajectory generator: 58808 checks, expect 0 failures
    make -C test/host/gcode        # G-code parser: expect "gcode tests passed"
    ```
+   After changing `src/host_serial.c` (host arbitration, Ctrl-X handling, the TCP transport) run
+   `make -C test/host/hostlink`, which compiles the real file against a small FreeRTOS shim and expects 0 failures.
+   It checks the logic, not the races between tasks.
    The tests build with `-std=c99 -Wall -Wextra -Werror`. `motion.c` has no ESP-IDF dependencies, so keep it that way.
 
 6. **Hardware changes**: hardware bring-up is in `STATUS.md`. Do not claim a hardware behaviour is verified until it has been checked on the scope or the laser.
