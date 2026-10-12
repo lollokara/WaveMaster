@@ -48,6 +48,7 @@
 #include "laser_io.h"
 #include "motion.h"
 #include "motion_task.h"
+#include "net_server.h"
 #include "net_wifi.h"
 
 static const char *TAG = "grbl";
@@ -570,6 +571,12 @@ static void print_stats(void)
                     io.gate_on, io.killed, io.active_low, (unsigned long)io.prr_hz);
         host_printf("[MSG:dac config_repairs=%lu]\r\n",
                     (unsigned long)ad3552r_board_guard_repairs());
+    }
+    {
+        char line[200];
+
+        net_server_stats(line, sizeof(line));
+        host_puts(line);
     }
 }
 

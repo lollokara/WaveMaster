@@ -118,3 +118,7 @@ Known and left as is:
 - Reset marks: if the stream is full for 100 ms when a Ctrl-X mark is queued, `grbl.c` keeps discarding input until the
   next reboot. This predates the WiFi work and is unchanged.
 - `!`, `?` and `~` are GRBL realtime bytes and cannot appear in a `$WIFI=` line; `$WIFIH=<hex>,<hex>` carries them (found when the first real SSID had a `!`).
+- The "drop the client when a reply cannot be sent within 200 ms" rule added after review (N4) was wrong at low signal: every `ok` was a tiny
+  TCP segment, lwIP's send queue filled and healthy connections were killed. Replaced by an 8 KB TX ring with its own sender task; the
+  client is dropped only after 1 s without progress or a full ring. `$S` now prints a `net` line (drop counters with reason, ring
+  high-water, internal heap free and minimum).

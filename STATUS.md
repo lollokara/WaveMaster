@@ -46,11 +46,20 @@ Verified on hardware:
 - Over TCP: `?` status, `$I`, `$WIFI` all answer like on USB. `$WIFI=...` from the TCP client is refused (`error:3`). A second client gets `[MSG:busy: another host is connected]`.
 - `$WIFIH=<hex>,<hex>` sets credentials with `!` in the SSID. The plain `$WIFI=Casa!,...` form cannot: `!` is GRBL's feed-hold byte.
 
+Stress test (2026-10-13, signal -53 to -61 dBm): 3 runs of a 6406-line, 77 KB preview job (`M66`, nothing fires) streamed over WiFi
+with a `?` every 200 ms, as Rayforge does with polling on. All 19218 `ok` replies arrived, no errors, no dropped client, `underruns=0`,
+`rx_dropped=0`, longest silence 0.81 s, TX ring high-water 387 of 8192 bytes. Internal heap after the runs: 76 KB free, minimum ever 26 KB
+(includes the WiFi start-up peak; that is tight, do not add buffers).
+
+Found and fixed on the bench: the first version sent every `ok` straight to the socket and dropped the client when one could not be sent
+within 200 ms. At -78 dBm that killed a job 3 s in (`Connection reset by peer`; Rayforge then showed `Run` forever with its controls locked).
+Replies now go through an 8 KB ring and a separate sender task.
+
 Not measured yet, all in phase 4 of [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md):
 
 - SCLK gap at chunk boundaries and gate-to-DAC offset with WiFi traffic (decides whether core 1 pinning is enough; `esp_timer` and `sys_evt` still run on core 0).
 - Internal heap free with WiFi up, a client connected and a job running.
-- `underruns=0` on a dense raster over WiFi.
+- `underruns=0` on a dense raster over WiFi with the laser firing (the test above is a preview).
 - Ctrl-X latency over WiFi.
 - Abort and disarm after the client vanishes mid-job.
 - Whether Rayforge's Telnet driver completes its handshake and runs a job (not tried yet).

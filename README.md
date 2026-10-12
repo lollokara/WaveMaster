@@ -254,8 +254,8 @@ Rules to know:
 - **Losing the WiFi client stops the job.** If the active TCP client disappears, the firmware does what Ctrl-X does:
   stop, gate off, disarm. USB becomes the active host again. This happens at once when WiFi is switched off or the
   access point says goodbye. If the access point or the client just disappears, it takes as long as the WiFi driver or
-  TCP keepalive needs to notice (about 6 s or more), and the job keeps marking until then. A client that stops
-  reading replies for 200 ms is treated as lost.
+  TCP keepalive needs to notice (about 6 s or more), and the job keeps marking until then. Replies are queued in an 8 KB ring and sent by a
+  separate task, so a slow WiFi link never stalls the G-code task; a client that takes nothing for 1 s is treated as lost.
 - **No authentication.** Anyone on the same network who can reach port 23 can send G-code. Keep the controller on a
   trusted or separate network. The laser still has to be armed, and the ATmega interlocks are unchanged.
 - Settings changes (`$240`, credentials) apply within about a second, no reboot needed.
