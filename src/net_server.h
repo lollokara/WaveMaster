@@ -19,6 +19,9 @@
 /* Starts the server task on core 1. Idempotent. */
 bool net_server_start(void);
 
+/* Asks the server task to drop the client (aborts like a lost connection). */
+void net_server_drop_client(void);
+
 /* True while a client is connected. */
 bool net_server_has_client(void);
 

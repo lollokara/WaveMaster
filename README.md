@@ -242,9 +242,14 @@ Quick check from a shell: `nc <ip> 23`, then type `$I`. Streaming test: `python3
 Rules to know:
 
 - **One host at a time.** USB and WiFi feed the same stream. Replies go to the host that spoke last while the machine
-  was idle. While a job runs, input from the other host is ignored, except **Ctrl-X**, which always works.
-- **Losing the WiFi client stops the job.** If the active TCP client disappears (about 6 s after the link breaks), the
-  firmware does what Ctrl-X does: stop, gate off, disarm. USB becomes the active host again.
+  was idle. While a job runs, or within 1 s of the active host's last G-code line, input from the other host is
+  ignored, except **Ctrl-X**, which always works and never waits for a lock.
+- **Network settings only over USB.** `$WIFI=ssid,password` and `$WIFI=CLEAR` are refused from a WiFi client (the
+  password would travel in clear). `$WIFI` alone (status) works from either host.
+- **Losing the WiFi client stops the job.** If the active TCP client disappears, the firmware does what Ctrl-X does:
+  stop, gate off, disarm. USB becomes the active host again. When the controller itself loses the access point, or
+  WiFi is switched off, this happens at once; when only the client vanishes, TCP keepalive notices after about 6 s,
+  and the job keeps marking until then. A WiFi client that stops reading for 200 ms counts as dead for replies.
 - **No authentication.** Anyone on the same network who can reach port 23 can send G-code. Keep the controller on a
   trusted or separate network. The laser still has to be armed, and the ATmega interlocks are unchanged.
 - Settings changes (`$240`, credentials) apply within about a second, no reboot needed.

@@ -98,3 +98,21 @@ Each result goes into `STATUS.md` under "Verified on hardware". Anything not mea
   it with `nc` first, and phase 3 with Rayforge itself.
 - Rayforge's `raydriver` session is a compiled dependency, so its exact handling of the `Bf:` and `[OPT:` replies over TCP is read from the
   Python side only. Phase 3 is where this is really tested.
+
+## Review follow-up (code review of phases 2 and 3)
+
+Fixed after review: Ctrl-X no longer waits behind a `?` that holds the receive lock; a CRLF line no longer leaves the
+machine "busy" for the other host; WiFi event handlers only set flags (they run on core 0 above `dac_task`); log lines
+from the lwIP and event-loop tasks are dropped instead of written to a host; the netif is created once and WiFi gives up
+after 3 failed starts; the TCP client is dropped at once when the link is lost or WiFi is stopped; network settings only
+over USB; a 1 s hand-over hold; the `$WIFI` status output cannot break its own framing.
+
+Known and left as is:
+- `sys_evt` (the default event loop task) still lives on core 0; the phase 4 scope test covers it, like `esp_timer`.
+- The TCP server task runs at priority 10, like `host_rx`, so a flood from the LAN is served above `motion`. There is no
+  authentication or rate limit (decision 9).
+- A silent client is not detected by traffic: Rayforge does not poll during jobs, so only TCP keepalive (about 6 s) and
+  link loss end a job whose client disappeared without a FIN.
+- The SSID is split at the first comma, so it cannot contain one.
+- Reset marks: if the stream is full for 100 ms when a Ctrl-X mark is queued, `grbl.c` keeps discarding input until the
+  next reboot. This predates the WiFi work and is unchanged.

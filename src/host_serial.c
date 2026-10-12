@@ -22,7 +22,8 @@
 #define LOG_MUTEX_MS     10
 #define LOG_TX_WAIT_MS   5
 #define LOG_LINE_MAX     200
-#define SWITCH_MUTEX_MS  20
+#define SWITCH_MUTEX_MS  1100   /* idle hand-over may wait for one stuck write (PROTO_TX_WAIT_MS) */
+#define HANDOVER_HOLD_MS 1000   /* the host that last sent G-code keeps the machine this long */
 
 static StreamBufferHandle_t s_rx_stream;
 static SemaphoreHandle_t s_tx_mutex;
@@ -50,6 +51,8 @@ static const struct host_transport s_usb = { .write = usb_write };
 static struct host_transport s_net;         /* .write set while a client is attached */
 static const struct host_transport *volatile s_active = &s_usb;
 static bool (*s_busy_fn)(void);
+static volatile TickType_t s_last_data;     /* last G-code byte from the active host */
+static volatile bool s_data_seen;
 
 /* ---------------------------------------------------------------- TX --- */
 
@@ -118,6 +121,15 @@ static int host_vprintf(const char *fmt, va_list ap)
 
     if (xPortInIsrContext())
         return 0;
+    {
+        /* The lwIP and event-loop tasks must never write to a host: with TCP
+         * active that would be a send() from the tcpip thread itself, and it
+         * would hold the TX mutex while the network stack is stalled. */
+        const char *tn = pcTaskGetName(NULL);
+
+        if (tn && (strcmp(tn, "tiT") == 0 || strcmp(tn, "sys_evt") == 0))
+            return 0;
+    }
     n = vsnprintf(text, LOG_LINE_MAX, fmt, ap);
     if (n <= 0)
         return n;
@@ -177,7 +189,7 @@ static void rx_flush(uint8_t *batch, size_t *len)
 }
 
 /* Makes src the host that gets replies and logs. Fails (false) if the TX
- * mutex is not free quickly: a stuck write must not delay realtime input. */
+ * mutex stays busy for SWITCH_MUTEX_MS (a stuck write). */
 static bool switch_active(const struct host_transport *src)
 {
     if (xSemaphoreTakeRecursive(s_tx_mutex, pdMS_TO_TICKS(SWITCH_MUTEX_MS)) != pdTRUE)
@@ -188,13 +200,25 @@ static bool switch_active(const struct host_transport *src)
     return true;
 }
 
+/* True while the other host must not take over: a job or partial line is in
+ * progress, or the active host sent G-code a moment ago (the motion queue can
+ * run dry between two lines of a job). */
+static bool machine_busy(void)
+{
+    if (s_busy_fn && s_busy_fn())
+        return true;
+    return s_data_seen && (TickType_t)(xTaskGetTickCount() - s_last_data) < pdMS_TO_TICKS(HANDOVER_HOLD_MS);
+}
+
 /* Parses one block of host input: realtime bytes act at once, everything
- * else goes into the stream. s_rx_mutex must be held.
+ * else goes into the stream. s_rx_mutex must be held. reset_done: the reset
+ * handler already ran for this block (see rx_ingest), only the mark is queued.
  *
  * One host at a time: input from the transport that is not active is
  * ignored while the machine is busy, except Ctrl-X, which always works.
  * While idle, input from the other transport makes it the active one. */
-static void rx_ingest_locked(const struct host_transport *src, const uint8_t *in, int got)
+static void rx_ingest_locked(const struct host_transport *src, const uint8_t *in, int got,
+                             bool reset_done)
 {
     uint8_t batch[128];
     uint8_t reset_only = HOST_RX_RESET_MARK;
@@ -203,7 +227,7 @@ static void rx_ingest_locked(const struct host_transport *src, const uint8_t *in
     if (src != s_active) {
         bool switched = false;
 
-        if (!(s_busy_fn && s_busy_fn()))
+        if (!machine_busy())
             switched = switch_active(src);
         if (!switched) {
             bool has_reset = false;
@@ -241,7 +265,7 @@ static void rx_ingest_locked(const struct host_transport *src, const uint8_t *in
             uint8_t mark = HOST_RX_RESET_MARK;
 
             rx_flush(batch, &bl);       /* earlier bytes stay ahead of the mark */
-            if (s_h.reset)
+            if (s_h.reset && !reset_done)
                 s_h.reset();
             /* The mark must not be lost: wait briefly if the stream is
              * (pathologically) full - the GRBL task is draining it. */
@@ -253,6 +277,8 @@ static void rx_ingest_locked(const struct host_transport *src, const uint8_t *in
             if (c >= 0x80)
                 break;                  /* other GRBL realtime/override bytes: ignored */
             batch[bl++] = c;
+            s_last_data = xTaskGetTickCount();
+            s_data_seen = true;
             break;
         }
     }
@@ -261,8 +287,21 @@ static void rx_ingest_locked(const struct host_transport *src, const uint8_t *in
 
 static void rx_ingest(const struct host_transport *src, const uint8_t *in, int got)
 {
+    bool reset_done = false;
+
+    /* Ctrl-X never waits: an earlier '?' in the other host's block can sit in
+     * the status reply (TX mutex, up to a write timeout) while holding the RX
+     * mutex. The handler is quick and takes no host lock; the mark still goes
+     * into the stream in order, under the mutex, below. */
+    for (int i = 0; i < got && !reset_done; i++) {
+        if (in[i] == HOST_RX_RESET_MARK) {
+            if (s_h.reset)
+                s_h.reset();
+            reset_done = true;
+        }
+    }
     xSemaphoreTake(s_rx_mutex, portMAX_DELAY);
-    rx_ingest_locked(src, in, got);
+    rx_ingest_locked(src, in, got, reset_done);
     xSemaphoreGive(s_rx_mutex);
 }
 
@@ -293,6 +332,11 @@ uint32_t host_rx_accepted(void)
 uint32_t host_rx_dropped(void)
 {
     return s_dropped;
+}
+
+bool host_active_is_usb(void)
+{
+    return s_active == &s_usb;
 }
 
 void host_serial_set_busy_fn(bool (*busy)(void))
@@ -337,7 +381,7 @@ void host_link_net_down(void)
          * disarm). A reconnecting Rayforge cannot resume a job anyway. */
         uint8_t reset = HOST_RX_RESET_MARK;
 
-        rx_ingest_locked(&s_usb, &reset, 1);
+        rx_ingest_locked(&s_usb, &reset, 1, false);
     }
     xSemaphoreGive(s_rx_mutex);
 }

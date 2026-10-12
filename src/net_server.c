@@ -13,11 +13,13 @@
 #define SRV_TASK_PRIO  10               /* same as host_rx: '!' and Ctrl-X latency */
 #define RX_CHUNK       128
 #define SELECT_MS      100
+#define WRITE_CAP_MS   200              /* a WiFi client that does not drain in this time is gone */
 
 static const char *TAG = "net_server";
 
 static volatile int s_fd = -1;
 static volatile bool s_started;
+static volatile bool s_kick;            /* drop the client from the server task */
 
 /* Full write or 0. Called under the host TX mutex, so writers never overlap;
  * a socket that does not drain within the wait counts as a dead link. */
@@ -29,6 +31,8 @@ static int net_write(const char *s, size_t n, TickType_t wait)
 
     if (fd < 0)
         return 0;
+    if (wait > pdMS_TO_TICKS(WRITE_CAP_MS))
+        wait = pdMS_TO_TICKS(WRITE_CAP_MS);
     while (off < n) {
         int r = send(fd, s + off, n - off, MSG_DONTWAIT);
 
@@ -128,6 +132,11 @@ static void server_task(void *arg)
             if (fd > mx)
                 mx = fd;
         }
+        if (s_kick) {
+            s_kick = false;
+            drop_client();              /* WiFi link lost or stopped: the client cannot be reached */
+            fd = -1;
+        }
         if (select(mx + 1, &rf, NULL, NULL, &tv) <= 0)
             continue;
 
@@ -169,6 +178,11 @@ bool net_server_start(void)
         return false;
     s_started = true;
     return true;
+}
+
+void net_server_drop_client(void)
+{
+    s_kick = true;
 }
 
 bool net_server_has_client(void)

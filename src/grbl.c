@@ -721,8 +721,14 @@ static int exec_dollar(char *line)
 
     /* $WIFI carries a case-sensitive password: handle it before the line is
      * upper-cased below. */
-    if (strncasecmp(p, "$WIFI", 5) == 0)
+    if (strncasecmp(p, "$WIFI", 5) == 0) {
+        /* Reading the status is fine from either host; changing the network
+         * (credentials travel in clear, and a LAN host could redirect the
+         * controller) only over USB. */
+        if (p[5] != '\0' && !host_active_is_usb())
+            return 3;
         return net_wifi_command(p + 5, out_line);
+    }
 
     for (len = 0; p[len]; len++)
         if (p[len] >= 'a' && p[len] <= 'z')
@@ -1011,6 +1017,7 @@ static void grbl_task(void *arg)
                 continue;                /* received before a reset: discard */
             if (c == '\n' && last_cr) {  /* second half of CRLF */
                 last_cr = false;
+                s_acked = s_consumed;    /* the host counted it too; also keeps host_busy() false */
                 continue;
             }
             last_cr = (c == '\r');

@@ -36,6 +36,10 @@ static esp_netif_t *s_netif;
 static bool s_inited;                   /* driver initialised (manager task only) */
 static bool s_running;                  /* esp_wifi_start() done (manager task only) */
 static volatile bool s_want_connect;
+static volatile bool s_ev_lost;         /* set by the event handler, logged by mgr_task */
+static volatile bool s_ev_ip;
+static int s_init_fails;
+#define INIT_FAILS_MAX 3
 static volatile int s_rssi;
 static char s_ip[16];
 
@@ -88,9 +92,11 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 {
     (void)arg;
     (void)data;
+    /* Runs in the default event loop task (core 0, above dac_task's priority):
+     * flags only, no logging, no host I/O. mgr_task does the rest. */
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         if (s_state == ST_UP)
-            ESP_LOGW(TAG, "link lost");
+            s_ev_lost = true;
         s_state = ST_CONNECTING;
         s_ip[0] = '\0';
         s_want_connect = true;
@@ -99,7 +105,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
         s_state = ST_UP;
-        ESP_LOGI(TAG, "connected, ip %s", s_ip);
+        s_ev_ip = true;
     }
 }
 
@@ -120,10 +126,15 @@ static bool driver_init(void)
         ESP_LOGE(TAG, "event loop: %s", esp_err_to_name(e));
         return false;
     }
-    s_netif = esp_netif_create_default_wifi_sta();
-    if (!s_netif)
-        return false;
-    esp_netif_set_hostname(s_netif, HOSTNAME);
+    /* The "sta ip" line esp_netif logs from the event task would be a host
+     * write on core 0. */
+    esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
+    if (!s_netif) {
+        s_netif = esp_netif_create_default_wifi_sta();    /* once: a second create asserts */
+        if (!s_netif)
+            return false;
+        esp_netif_set_hostname(s_netif, HOSTNAME);
+    }
     e = esp_wifi_init(&cfg);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(e));
@@ -152,6 +163,7 @@ static void apply_config(void)
 
 static void driver_stop(void)
 {
+    net_server_drop_client();           /* no network: the job must not keep marking */
     if (s_running) {
         esp_wifi_disconnect();
         esp_wifi_stop();
@@ -175,23 +187,45 @@ static void mgr_task(void *arg)
 
         if (seen_gen != s_creds_gen) {
             seen_gen = s_creds_gen;
+            s_init_fails = 0;
             have = creds_load();
             if (s_running)
                 driver_stop();          /* restarts below with the new credentials */
         }
+        if (s_ev_lost) {
+            s_ev_lost = false;
+            ESP_LOGW(TAG, "link lost");
+            net_server_drop_client();   /* do not wait for TCP keepalive to notice */
+        }
+        if (s_ev_ip) {
+            s_ev_ip = false;
+            ESP_LOGI(TAG, "connected, ip %s", s_ip);
+        }
         if (enabled && have) {
-            if (!s_running) {
+            if (!s_running && s_init_fails < INIT_FAILS_MAX) {
                 if (driver_init()) {
+                    esp_err_t e;
+
                     apply_config();
-                    esp_wifi_start();
-                    esp_wifi_set_ps(WIFI_PS_NONE);      /* power save adds ~100 ms latency */
-                    s_running = true;
-                    s_state = ST_CONNECTING;
-                    s_want_connect = true;
-                    backoff = BACKOFF_MIN_MS;
-                    wait = 0;
+                    e = esp_wifi_start();
+                    if (e == ESP_OK) {
+                        esp_wifi_set_ps(WIFI_PS_NONE);  /* power save adds ~100 ms latency */
+                        s_running = true;
+                        s_state = ST_CONNECTING;
+                        s_want_connect = true;
+                        backoff = BACKOFF_MIN_MS;
+                        wait = 0;
+                    } else {
+                        ESP_LOGE(TAG, "esp_wifi_start: %s", esp_err_to_name(e));
+                        s_init_fails++;
+                    }
+                } else {
+                    s_init_fails++;
                 }
-            } else if (s_want_connect && s_state != ST_UP) {
+                if (s_init_fails == INIT_FAILS_MAX)
+                    ESP_LOGE(TAG, "WiFi start failed %d times, giving up until the credentials change",
+                             INIT_FAILS_MAX);
+            } else if (s_running && s_want_connect && s_state != ST_UP) {
                 if (wait <= 0) {
                     s_want_connect = false;
                     esp_wifi_connect();
@@ -236,8 +270,18 @@ static void print_status(void (*out)(const char *))
     int o = snprintf(line, sizeof(line), "[WIFI:enabled=%d creds=%d state=%s",
                      calib_get(CAL_WIFI_EN) != 0.0f, s_ssid[0] != '\0', st);
 
-    if (s_ssid[0] && o < (int)sizeof(line))
-        o += snprintf(line + o, sizeof(line) - (size_t)o, " ssid=%s", s_ssid);
+    if (s_ssid[0] && o < (int)sizeof(line)) {
+        char safe[SSID_MAX + 1];
+        size_t i;
+
+        for (i = 0; s_ssid[i] && i < SSID_MAX; i++) {
+            unsigned char c = (unsigned char)s_ssid[i];
+
+            safe[i] = (c < 0x20 || c == 0x7f || c == ']') ? '?' : (char)c;   /* keep the [WIFI:...] framing */
+        }
+        safe[i] = '\0';
+        o += snprintf(line + o, sizeof(line) - (size_t)o, " ssid=%s", safe);
+    }
     if (s_state == ST_UP && o < (int)sizeof(line))
         o += snprintf(line + o, sizeof(line) - (size_t)o, " ip=%s rssi=%d", s_ip, s_rssi);
     if (o < (int)sizeof(line))
@@ -252,6 +296,8 @@ int net_wifi_command(const char *arg, void (*out)(const char *line))
     char ssid[SSID_MAX + 1];
     size_t sl, pl;
 
+    while (*arg == ' ')
+        arg++;
     if (*arg == '\0') {
         print_status(out);
         return 0;
@@ -259,7 +305,10 @@ int net_wifi_command(const char *arg, void (*out)(const char *line))
     if (*arg != '=')
         return 3;
     arg++;
-    if (strcasecmp(arg, "CLEAR") == 0) {
+    pl = strlen(arg);
+    while (pl && arg[pl - 1] == ' ')    /* trailing blanks from a paste are not part of the password */
+        pl--;
+    if (pl == 5 && strncasecmp(arg, "CLEAR", 5) == 0) {
         if (creds_store(NULL, NULL) != 0)
             return 3;
         s_creds_gen++;
@@ -269,13 +318,19 @@ int net_wifi_command(const char *arg, void (*out)(const char *line))
     if (!comma)
         return 3;
     sl = (size_t)(comma - arg);
-    pl = strlen(comma + 1);
+    pl = (size_t)((arg + pl) - (comma + 1));
     if (sl == 0 || sl > SSID_MAX || pl < PASS_MIN || pl > PASS_MAX)
         return 3;                       /* WPA2 needs 8..63 characters */
-    memcpy(ssid, arg, sl);
-    ssid[sl] = '\0';
-    if (creds_store(ssid, comma + 1) != 0)
-        return 3;
+    {
+        char pass[PASS_MAX + 1];
+
+        memcpy(ssid, arg, sl);
+        ssid[sl] = '\0';
+        memcpy(pass, comma + 1, pl);
+        pass[pl] = '\0';
+        if (creds_store(ssid, pass) != 0)
+            return 3;
+    }
     s_creds_gen++;                      /* the manager reloads and reconnects */
     return 0;
 }

@@ -24,7 +24,8 @@
  *  Second host (WiFi, net_server.c): a TCP client is a second transport into
  *  the same stream. One host at a time: replies, status and logs go to the
  *  active host. Input from the other host is ignored while the machine is
- *  busy (see host_serial_set_busy_fn), except Ctrl-X, which always works; while
+ *  busy (see host_serial_set_busy_fn) or the active host sent G-code in the last
+ *  second, except Ctrl-X, which always works and never waits for any lock; while
  *  idle, input from the other host makes it the active one. When the TCP
  *  client goes away while it is the active host, a soft reset (Ctrl-X) is
  *  injected and USB becomes active again.
@@ -54,6 +55,9 @@ bool host_serial_init(void);
 
 /* Predicate: true while a job or a partial line is in progress. */
 void host_serial_set_busy_fn(bool (*busy)(void));
+
+/* True while USB is the active host (used to keep WiFi credentials off the network). */
+bool host_active_is_usb(void);
 
 /* TCP client transport (called from the net server task only).
  *   up:   a client is attached; write() sends to it (full write or 0).
