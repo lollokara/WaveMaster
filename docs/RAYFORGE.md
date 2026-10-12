@@ -178,7 +178,7 @@ firmware does not support that.
 2. Install `docs/rayforge/wavemaster-machine-wifi.yaml` as `<config>/machines/wavemaster-wifi.yaml` and put the IP
    address into `driver_args: host:`. Or in Rayforge: Machine Settings > **General** > driver **GRBL (Telnet)**,
    hostname = the IP, port = 23.
-3. Keep **Poll device status during jobs** and **Deadlock detection** off, as for USB, and `rx_buffer_size` 1024.
+3. Turn **Poll device status during jobs** **on** (the WiFi profile does), keep **Deadlock detection** off and `rx_buffer_size` 1024. With polling off, Rayforge only learns the machine state from its own pause and resume commands, so after a job that ended while paused or resumed it can stay in `Run` forever with all controls disabled although the board reports `Idle` (seen on 2026-10-13). The firmware answers `?` at any time.
 4. Close any other program that holds the controller (a `nc` session counts). A second connection is refused with
    `[MSG:busy: another host is connected]`.
 
