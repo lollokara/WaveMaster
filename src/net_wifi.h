@@ -14,6 +14,9 @@
  *
  * Credentials live in their own NVS namespace, set over the host link with
  *   $WIFI=<ssid>,<password>   (first comma splits; password 8..63 characters)
+ *   $WIFIH=<hex>,<hex>        the same, both parts hex-encoded. Needed when either holds
+ *                             ! ? ~ (or Ctrl-X): GRBL acts on those as realtime bytes
+ *                             anywhere in the input, so a typed line can never carry them.
  *   $WIFI=CLEAR               (forget them)
  *   $WIFI                     (status line)
  * The password is never printed or logged.

@@ -37,17 +37,23 @@ new stream engine has not been measured yet.
 
 ## WiFi host link (branch `feature/wifi-ota-printing`)
 
-Built, not run. Flash use grew from 343 KB to 859 KB (82 % of the 1 MB app partition). `src/` builds with zero warnings.
-`tools/stream_test.py host:port` was checked against a mock GRBL server on loopback only.
+Flashed on 2026-10-12 and checked on the bench. Flash use is 860 KB (82 % of the 1 MB app partition).
 
-Not measured, all in phase 4 of [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md):
+Verified on hardware:
 
-- SCLK gap at chunk boundaries and gate-to-DAC offset with WiFi traffic (decides whether core 1 pinning is enough; `esp_timer` still runs on core 0).
+- The station joins the network (`Casa!`, WPA2) and gets an address by DHCP (RSSI about -55 dBm). Ping 8 to 16 ms.
+- The WiFi driver task starts on core 1 (boot log: `wifi driver task ... core=1`), the server listens on port 23.
+- Over TCP: `?` status, `$I`, `$WIFI` all answer like on USB. `$WIFI=...` from the TCP client is refused (`error:3`). A second client gets `[MSG:busy: another host is connected]`.
+- `$WIFIH=<hex>,<hex>` sets credentials with `!` in the SSID. The plain `$WIFI=Casa!,...` form cannot: `!` is GRBL's feed-hold byte.
+
+Not measured yet, all in phase 4 of [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md):
+
+- SCLK gap at chunk boundaries and gate-to-DAC offset with WiFi traffic (decides whether core 1 pinning is enough; `esp_timer` and `sys_evt` still run on core 0).
 - Internal heap free with WiFi up, a client connected and a job running.
 - `underruns=0` on a dense raster over WiFi.
 - Ctrl-X latency over WiFi.
-- Abort and disarm after the client vanishes mid-job (about 6 s expected).
-- Whether Rayforge's Telnet driver completes its handshake with this firmware.
+- Abort and disarm after the client vanishes mid-job.
+- Whether Rayforge's Telnet driver completes its handshake and runs a job (not tried yet).
 
 ## Not verified on hardware
 

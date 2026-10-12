@@ -117,3 +117,4 @@ Known and left as is:
 - Another `?` can still hold the receive lock while it writes its reply (up to the 200 ms network write cap), so a `!` from the other host can wait that long. Ctrl-X cannot.
 - Reset marks: if the stream is full for 100 ms when a Ctrl-X mark is queued, `grbl.c` keeps discarding input until the
   next reboot. This predates the WiFi work and is unchanged.
+- `!`, `?` and `~` are GRBL realtime bytes and cannot appear in a `$WIFI=` line; `$WIFIH=<hex>,<hex>` carries them (found when the first real SSID had a `!`).

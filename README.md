@@ -236,6 +236,11 @@ $WIFI                           status: [WIFI:enabled=1 creds=1 state=connected 
 $WIFI=CLEAR                     forget the credentials
 ```
 
+`!`, `?` and `~` cannot be typed in a `$` line: GRBL acts on them as realtime bytes (feed hold, status, resume) wherever
+they appear, so `$WIFI=Casa!,secret` arrives as `Casa` plus a feed hold. If the SSID or the password contains one of
+them, send both parts hex-encoded: `$WIFIH=<hex ssid>,<hex password>`, for example
+`python3 -c "print('Casa!'.encode().hex(), 'my?pass~word'.encode().hex())"`.
+
 The SSID is split at the first comma, so it cannot contain one. The password is never printed or logged.
 Quick check from a shell: `nc <ip> 23`, then type `$I`. Streaming test: `python3 tools/stream_test.py <ip>:23 grid`.
 

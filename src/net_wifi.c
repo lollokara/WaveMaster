@@ -290,6 +290,58 @@ static void print_status(void (*out)(const char *))
     out(line);
 }
 
+static int hex_val(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* Decodes hex text of exactly n_hex digits into out (NUL-terminated).
+ * Returns the byte count, or -1 on a bad digit or a decoded NUL. */
+static int hex_decode(const char *h, size_t n_hex, char *out, size_t cap)
+{
+    size_t n = n_hex / 2;
+
+    if (n_hex % 2 || n >= cap)
+        return -1;
+    for (size_t i = 0; i < n; i++) {
+        int hi = hex_val(h[2 * i]), lo = hex_val(h[2 * i + 1]);
+
+        if (hi < 0 || lo < 0 || (hi == 0 && lo == 0))
+            return -1;
+        out[i] = (char)(hi << 4 | lo);
+    }
+    out[n] = '\0';
+    return (int)n;
+}
+
+/* "H=<hexssid>,<hexpass>" (the part after "$WIFI") */
+static int command_hex(const char *arg)
+{
+    const char *comma = strchr(arg, ',');
+    size_t hl = strlen(arg);
+    char ssid[SSID_MAX + 1], pass[PASS_MAX + 1];
+    int sl, pl;
+
+    while (hl && arg[hl - 1] == ' ')
+        hl--;
+    if (!comma || comma >= arg + hl)
+        return 3;
+    sl = hex_decode(arg, (size_t)(comma - arg), ssid, sizeof(ssid));
+    pl = hex_decode(comma + 1, (size_t)((arg + hl) - (comma + 1)), pass, sizeof(pass));
+    if (sl <= 0 || pl < PASS_MIN)
+        return 3;
+    if (creds_store(ssid, pass) != 0)
+        return 3;
+    s_creds_gen++;
+    return 0;
+}
+
 int net_wifi_command(const char *arg, void (*out)(const char *line))
 {
     const char *comma;
@@ -302,6 +354,8 @@ int net_wifi_command(const char *arg, void (*out)(const char *line))
         print_status(out);
         return 0;
     }
+    if ((arg[0] == 'H' || arg[0] == 'h') && arg[1] == '=')
+        return command_hex(arg + 2);
     if (*arg != '=')
         return 3;
     arg++;
