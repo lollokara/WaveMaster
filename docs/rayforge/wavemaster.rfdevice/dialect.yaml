@@ -33,6 +33,7 @@ preamble:
 postscript:
 - G4 P0 ;Wait until all queued motion is done
 - M5 ;Marking laser off
+- M11 ;Disarm the laser (waits for queued motion; the next job re-arms by itself, $226)
 - M67 ;Preview off (also switches the guide laser off)
 inject_wcs_after_preamble: true
 can_g0_with_speed: false
