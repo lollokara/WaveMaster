@@ -31,6 +31,10 @@ static int net_write(const char *s, size_t n, TickType_t wait)
 
     if (fd < 0)
         return 0;
+    /* Only a real reply (long wait) that cannot be delivered drops the client;
+     * a log line (5 ms wait) that does not fit is just lost. */
+    bool reply = wait >= pdMS_TO_TICKS(WRITE_CAP_MS);
+
     if (wait > pdMS_TO_TICKS(WRITE_CAP_MS))
         wait = pdMS_TO_TICKS(WRITE_CAP_MS);
     while (off < n) {
@@ -50,7 +54,8 @@ static int net_write(const char *s, size_t n, TickType_t wait)
             fd_set wf;
 
             if (used >= wait) {
-                s_kick = true;          /* replies cannot get through: the host would stall silently */
+                if (reply)
+                    s_kick = true;      /* replies cannot get through: the host would stall silently */
                 return 0;
             }
             tv.tv_sec = 0;
@@ -58,7 +63,8 @@ static int net_write(const char *s, size_t n, TickType_t wait)
             FD_ZERO(&wf);
             FD_SET(fd, &wf);
             if (select(fd + 1, NULL, &wf, NULL, &tv) <= 0) {
-                s_kick = true;
+                if (reply)
+                    s_kick = true;
                 return 0;
             }
         }
