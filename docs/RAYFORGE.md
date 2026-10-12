@@ -182,6 +182,18 @@ firmware does not support that.
 4. Close any other program that holds the controller (a `nc` session counts). A second connection is refused with
    `[MSG:busy: another host is connected]`.
 
+**macOS: "No route to host (os error 65)" although the board answers a ping.** Rayforge's own connect is refused by
+macOS' Local Network privacy rule, with or without the switch in System Settings > Privacy & Security > Local Network
+(the system log then says `Local network allowed by preference for Rayforge.bin ... but received prompt. Clearing
+cached UUIDs`; the app is ad-hoc signed, so macOS keeps discarding its cached permission). The failure is instant:
+Rayforge's log (`~/Library/Logs/rayforge/session-*.log`) shows it about 2 ms after "rebuilding driver". Things to try, in
+order:
+
+1. Switch Rayforge off in the Local Network list, quit Rayforge, switch it on, start Rayforge again.
+2. Use the loopback relay, which does not need the permission (connections to 127.0.0.1 are not covered):
+   run `python3 tools/tcp_relay.py <controller ip>` in a terminal and keep it open, then set the machine's host to
+   `127.0.0.1` and the port to `2323`.
+
 Behaviour that differs from USB:
 
 - If the WiFi link breaks mid-job, the firmware aborts the job about 6 s later (laser off, disarmed). Reconnecting
