@@ -54,7 +54,7 @@
 static const char *TAG = "grbl";
 
 #define LINE_MAX_LEN    256
-#define RX_WINDOW       1024
+#define RX_WINDOW       3072   /* advertised in $I [OPT:...]; must stay below the 4096-byte RX stream buffer */
 #define GRBL_TASK_STACK 6144
 #define GRBL_TASK_PRIO  9
 #define E_ABORT         (-1)     /* line interrupted by a reset / abort */
@@ -557,6 +557,14 @@ static void print_stats(void)
                     (unsigned)gs.chunks, (unsigned)gs.underruns, (unsigned)gs.barriers,
                     (unsigned long long)gs.ticks, (double)galvo_out_tick_us(), (unsigned)gs.clipped);
     }
+    {
+        struct motion_stats ms;
+
+        motion_task_get_stats(&ms);
+        host_printf("[MSG:motion dry_closes=%u prebuffers=%u prebuffer_ms=%u qdepth_min=%u]\r\n",
+                    (unsigned)ms.dry_closes, (unsigned)ms.prebuffers, (unsigned)ms.prebuffer_ms,
+                    (unsigned)ms.depth_min);
+    }
     atmega_link_get_status(&as);
     host_printf("[MSG:atmega link=%d armed=%d ready=%d guide=%d power=%u stat=0x%02x vdet=%umV err=%u]\r\n",
                 as.link_ok, as.armed, as.ready, as.guide_on, (unsigned)as.power,
@@ -573,7 +581,7 @@ static void print_stats(void)
                     (unsigned long)ad3552r_board_guard_repairs());
     }
     {
-        char line[200];
+        char line[280];
 
         net_server_stats(line, sizeof(line));
         host_puts(line);

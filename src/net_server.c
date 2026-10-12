@@ -15,10 +15,11 @@
 #define SRV_TASK_STACK 4096
 #define TX_TASK_STACK  4096
 #define TASK_PRIO      10               /* same as host_rx: '!' and Ctrl-X latency */
-#define RX_CHUNK       128
+#define RX_CHUNK       512
 #define SELECT_MS      100
 #define TX_RING        8192             /* power of two */
 #define TX_SEGMENT     1440             /* one TCP segment */
+#define TX_GAP_MS      4                /* at most one send per this long: replies pile up and go out together */
 #define TX_STALL_MS    1000             /* nothing sent for this long with data waiting: client is gone */
 #define OVERFLOW_MS    1000             /* ring full for this long: client is gone */
 
@@ -40,6 +41,7 @@ static volatile TickType_t s_overflow_since;
 
 /* Counters for $S. */
 static volatile uint32_t s_kicks_tx, s_kicks_link, s_peer_closed, s_recv_err, s_ring_max;
+static volatile uint32_t s_sends, s_sent_bytes;
 static volatile int s_last_errno;
 
 /* Called under the host TX mutex; never blocks. */
@@ -77,10 +79,21 @@ static void tx_task(void *arg)
 {
     static uint8_t seg[TX_SEGMENT];
     TickType_t stall_since = 0;
+    TickType_t last_send = 0;
 
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(SELECT_MS));
+        /* One tiny send() per "ok" costs about 3 ms in lwIP and the WiFi driver and,
+         * because this task outranks the GRBL task, nothing would ever pile up:
+         * the link topped out near 350 lines/s. Sparse replies (a status, a lone
+         * ok) still go out at once; during streaming they go out in batches. */
+        {
+            TickType_t since = xTaskGetTickCount() - last_send;
+
+            if (since < pdMS_TO_TICKS(TX_GAP_MS))
+                vTaskDelay(pdMS_TO_TICKS(TX_GAP_MS) - since);
+        }
         for (;;) {
             uint32_t t = s_tail;
             uint32_t avail = __atomic_load_n(&s_head, __ATOMIC_ACQUIRE) - t;
@@ -104,6 +117,9 @@ static void tx_task(void *arg)
             if (r > 0) {
                 __atomic_store_n(&s_tail, t + (uint32_t)r, __ATOMIC_RELEASE);
                 stall_since = 0;
+                last_send = xTaskGetTickCount();
+                s_sends++;
+                s_sent_bytes += (uint32_t)r;
             } else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 struct timeval tv = { 0, 50 * 1000 };
                 TickType_t now = xTaskGetTickCount();
@@ -290,9 +306,10 @@ void net_server_stats(char *buf, size_t n)
 {
     snprintf(buf, n,
              "[MSG:net client=%d kicks tx=%u link=%u peer_closed=%u recv_err=%u errno=%d ring_max=%u/%u"
-             " heap_free=%u heap_min=%u]\r\n",
+             " sends=%u sent=%uB heap_free=%u heap_min=%u]\r\n",
              s_fd >= 0, (unsigned)s_kicks_tx, (unsigned)s_kicks_link, (unsigned)s_peer_closed,
              (unsigned)s_recv_err, s_last_errno, (unsigned)s_ring_max, (unsigned)TX_RING,
+             (unsigned)s_sends, (unsigned)s_sent_bytes,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 }

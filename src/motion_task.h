@@ -27,6 +27,7 @@
  */
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stddef.h>
 #include "motion.h"
 
@@ -55,6 +56,16 @@ bool motion_busy(void);
 
 /* Free slots in the segment queue (for the status report's Bf: field). */
 size_t motion_queue_free(void);
+
+/* Starvation counters, for $S. dry_closes: times the host fell so far behind that an
+ * open polyline was closed (the machine stops until data arrives again);
+ * prebuffers / prebuffer_ms: start-up waits and their total length;
+ * depth_min: lowest segment-queue depth seen while a job was running since the
+ * last call (reset by this call). A healthy job keeps it well above zero. */
+struct motion_stats {
+    uint32_t dry_closes, prebuffers, prebuffer_ms, depth_min;
+};
+void motion_task_get_stats(struct motion_stats *out);
 
 /* Re-read motion parameters from calib.h (call after a $ setting change). */
 void motion_reload_params(void);

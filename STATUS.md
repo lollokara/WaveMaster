@@ -51,9 +51,27 @@ with a `?` every 200 ms, as Rayforge does with polling on. All 19218 `ok` replie
 `rx_dropped=0`, longest silence 0.81 s, TX ring high-water 387 of 8192 bytes. Internal heap after the runs: 76 KB free, minimum ever 26 KB
 (includes the WiFi start-up peak; that is tight, do not add buffers).
 
-Found and fixed on the bench: the first version sent every `ok` straight to the socket and dropped the client when one could not be sent
-within 200 ms. At -78 dBm that killed a job 3 s in (`Connection reset by peer`; Rayforge then showed `Run` forever with its controls locked).
-Replies now go through an 8 KB ring and a separate sender task.
+Found and fixed on the bench:
+
+- The first version sent every `ok` straight to the socket and dropped the client when one could not be sent within 200 ms. At -78 dBm that
+  killed a job 3 s in (`Connection reset by peer`; Rayforge then showed `Run` forever with its controls locked). Replies now go through an
+  8 KB ring and a sender task.
+- That sender outranked the GRBL task, so every `ok` became its own `send()` (about 3 ms each through lwIP and the WiFi driver) and the link
+  topped out near 350 lines/s. It now sends at most once per 4 ms, so replies go out in batches (337 sends for 7509 `ok`s).
+- `$S` has a `motion` line: `dry_closes` counts how often the host fell so far behind that the machine stopped mid-job and had to
+  prebuffer again. Same 7509-line raster preview (0.5 mm segments, power changing on every line):
+
+  | | time | dry_closes | prebuffer_ms |
+  |---|---|---|---|
+  | USB | 8.4 s | 2 | 40 |
+  | WiFi, first version, window 1024 | 23-33 s | 91-110 | 2100-2300 |
+  | WiFi, batched replies, window 1024 | 11-14 s | 49-56 | ~200 |
+  | WiFi, batched replies, window 3072, batched client writes | 9.5 s | 13 | ~20 |
+  | WiFi, batched replies, window 3072, one write per line | 16-21 s | 43-79 | 250-430 |
+
+  Round trip over WiFi is 6-8 ms median (up to ~100 ms). The advertised RX window is now 3072 (`[OPT:V,512,3072]`).
+  The remaining gap to USB is the per-packet cost of many tiny segments on the board's receive side plus link jitter.
+- `ATmega err=` (UART error counter in the `atmega` line) rose from 5 to 13 during these runs. Not investigated.
 
 Not measured yet, all in phase 4 of [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md):
 

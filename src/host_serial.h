@@ -9,7 +9,7 @@
  *      ('?' '!' '~' 0x18 0x85) immediately through the handlers below and
  *      appends everything else to a byte stream buffer that grbl.c drains
  *      line by line (host_rx_read()). It never blocks on that buffer: with
- *      the host limited to 1024 unacknowledged bytes (character counting)
+ *      the host limited to 3072 unacknowledged bytes (character counting)
  *      it cannot fill; if it ever would, bytes are dropped and counted.
  *
  *      A soft reset (0x18) additionally leaves HOST_RX_RESET_MARK in the

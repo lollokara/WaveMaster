@@ -125,14 +125,39 @@ static void process(const struct qitem *it)
     s_need_flush = true;
 }
 
+static volatile uint32_t s_dry_closes, s_prebuffers, s_prebuffer_ms;
+static volatile uint32_t s_depth_min = UINT32_MAX;
+
+static void sample_depth(void)
+{
+    uint32_t d = (uint32_t)uxQueueMessagesWaiting(s_queue);
+
+    if (d < s_depth_min)
+        s_depth_min = d;
+}
+
+void motion_task_get_stats(struct motion_stats *out)
+{
+    out->dry_closes = s_dry_closes;
+    out->prebuffers = s_prebuffers;
+    out->prebuffer_ms = s_prebuffer_ms;
+    out->depth_min = s_depth_min == UINT32_MAX ? 0 : s_depth_min;
+    s_depth_min = UINT32_MAX;
+}
+
 /* Idle start-up prebuffer. Called with the first segment peeked. */
 static void prebuffer(void)
 {
     UBaseType_t last = uxQueueMessagesWaiting(s_queue);
     TickType_t last_change = xTaskGetTickCount();
+    TickType_t began = last_change;
+
+    s_prebuffers++;
     for (;;) {
-        if (abort_pending() || last >= MOTION_PREBUFFER_SEGS)
+        if (abort_pending() || last >= MOTION_PREBUFFER_SEGS) {
+            s_prebuffer_ms += (uint32_t)((xTaskGetTickCount() - began) * portTICK_PERIOD_MS);
             return;
+        }
         vTaskDelay(1);
         UBaseType_t n = uxQueueMessagesWaiting(s_queue);
         TickType_t now = xTaskGetTickCount();
@@ -140,6 +165,7 @@ static void prebuffer(void)
             last = n;
             last_change = now;
         } else if ((now - last_change) >= pdMS_TO_TICKS(MOTION_PREBUFFER_IDLE_MS)) {
+            s_prebuffer_ms += (uint32_t)((now - began) * portTICK_PERIOD_MS);
             return;
         }
     }
@@ -169,6 +195,7 @@ static void motion_task(void *arg)
         } else {
             /* A polyline / jump chain is open. */
             if (xQueueReceive(s_queue, &it, 0) == pdTRUE) {
+                sample_depth();
                 s_processing = true;
                 process(&it);
                 s_processing = false;
@@ -186,6 +213,7 @@ static void motion_task(void *arg)
             int wait_ms = (int)(allowed_us * 0.001f);
             if (wait_ms < 1) {
                 /* Ring about to run dry: close the polyline cleanly. */
+                s_dry_closes++;
                 s_processing = true;
                 motion_gen_finish(&s_gen);
                 s_need_flush = true;
@@ -201,6 +229,7 @@ static void motion_task(void *arg)
 
         /* An item was peeked (s_processing set): drain what is queued. */
         while (!abort_pending() && xQueueReceive(s_queue, &it, 0) == pdTRUE) {
+            sample_depth();
             process(&it);
             if (uxQueueMessagesWaiting(s_queue) == 0)
                 break;
