@@ -1,6 +1,6 @@
 # WiFi host link: plan
 
-Branch: `feature/wifi-ota-printing`. Status: phase 1 in progress.
+Branch: `feature/wifi-ota-printing`. Status: phases 1 to 3 implemented and built; phase 4 (measurements on the hardware) not done.
 
 Goal: Rayforge connects to the WaveMaster over WiFi and runs jobs with the stock
 Rayforge driver, with no change to the streaming path, its timing or its safety

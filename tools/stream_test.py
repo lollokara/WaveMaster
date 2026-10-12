@@ -20,17 +20,21 @@ Patterns:
 Safety: by default the run is wrapped in M66/M67 (preview: guide laser on,
 marking laser forced off), so nothing fires. Pass --fire to actually mark.
 
+The port can also be a TCP address (WiFi host link, see docs/WIFI_PLAN.md),
+"host:port" or "tcp://host[:port]" (default port 23). Same protocol, so the
+same patterns and the same $S check apply.
+
 Usage:
     python3 tools/stream_test.py /dev/ttyACM0 grid
     python3 tools/stream_test.py /dev/ttyACM0 circles --fire --power 300
+    python3 tools/stream_test.py 192.168.1.50:23 grid
 """
 import argparse
 import math
 import re
+import socket
 import sys
 import time
-
-import serial
 
 RX_WINDOW_DEFAULT = 127
 
@@ -83,9 +87,52 @@ PATTERNS = {'grid': pattern_grid, 'circles': pattern_circles,
             'ladder': pattern_ladder, 'square': pattern_square}
 
 
+class TcpPort:
+    """The few pyserial calls Grbl uses, over a TCP socket."""
+
+    def __init__(self, host, port):
+        self.sock = socket.create_connection((host, port), timeout=5)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.sock.settimeout(0.05)
+
+    def write(self, data):
+        self.sock.settimeout(5)
+        try:
+            self.sock.sendall(data)
+        finally:
+            self.sock.settimeout(0.05)
+
+    def read(self, n):
+        try:
+            data = self.sock.recv(n)
+        except socket.timeout:
+            return b''
+        if not data:
+            raise RuntimeError('connection closed by the controller')
+        return data
+
+    def reset_input_buffer(self):
+        self.sock.settimeout(0)
+        try:
+            while self.sock.recv(4096):
+                pass
+        except (BlockingIOError, socket.timeout):
+            pass
+        finally:
+            self.sock.settimeout(0.05)
+
+
+def open_port(spec):
+    m = re.match(r'^(?:tcp://)?([A-Za-z0-9_.\-]+)(?::(\d+))?$', spec)
+    if m and (spec.startswith('tcp://') or m.group(2)) and not spec.startswith('/'):
+        return TcpPort(m.group(1), int(m.group(2) or 23))
+    import serial
+    return serial.Serial(spec, 115200, timeout=0.05)
+
+
 class Grbl:
     def __init__(self, port):
-        self.s = serial.Serial(port, 115200, timeout=0.05)
+        self.s = open_port(port)
         self.buf = b''
         self.rx_window = RX_WINDOW_DEFAULT
 

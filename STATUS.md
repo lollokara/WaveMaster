@@ -35,6 +35,20 @@ new stream engine has not been measured yet.
 - UART0 TX and RX are swapped relative to the IOMUX defaults. The ATmega link is TX on GPIO44 and RX on GPIO43.
 - The level shifter must be powered. The CH340 on the Arduino board sits on the same TX and RX lines, so do not leave a serial monitor connected.
 
+## WiFi host link (branch `feature/wifi-ota-printing`)
+
+Built, not run. Flash use grew from 343 KB to 859 KB (82 % of the 1 MB app partition). `src/` builds with zero warnings.
+`tools/stream_test.py host:port` was checked against a mock GRBL server on loopback only.
+
+Not measured, all in phase 4 of [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md):
+
+- SCLK gap at chunk boundaries and gate-to-DAC offset with WiFi traffic (decides whether core 1 pinning is enough; `esp_timer` still runs on core 0).
+- Internal heap free with WiFi up, a client connected and a job running.
+- `underruns=0` on a dense raster over WiFi.
+- Ctrl-X latency over WiFi.
+- Abort and disarm after the client vanishes mid-job (about 6 s expected).
+- Whether Rayforge's Telnet driver completes its handshake with this firmware.
+
 ## Not verified on hardware
 
 - Gate timing against the DAC output (`START_LATENCY_COUNTS` in `src/dac_task.c` is 0 and is unmeasured).

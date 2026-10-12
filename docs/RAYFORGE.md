@@ -20,6 +20,7 @@ You need three things from [`docs/rayforge/`](rayforge/):
 |:---|:---|:---|
 | `wavemaster-machine.yaml` | `<config>/machines/wavemaster.yaml` | The machine: GRBL serial driver, 100 x 100 mm, Bottom Left origin, fiber laser head (max power 1000), no Z, arcs on (0.01 mm), no homing, 8 macros. |
 | `wavemaster-dialect.yaml` | `<config>/dialects/wavemaster.yaml` | The G-code dialect "WaveMaster Galvo". |
+| `wavemaster-machine-wifi.yaml` | `<config>/machines/wavemaster-wifi.yaml` | (optional) The same machine over WiFi: `GrblTelnetDriver`, `host` and `port: 23`. See *Connection over WiFi* below. |
 | `wavemaster.rfdevice/` | (optional) zipped, imported in the wizard | The same machine and dialect as a Rayforge device profile. No port, no macros. |
 
 `<config>` is Rayforge's config directory:
@@ -165,6 +166,32 @@ Why there is no hook that sends `M66` / `M67` around framing: the frame job is b
 - **Port:** on macOS `/dev/cu.usbmodem*`.
 - **RX buffer:** **RX Buffer Size Override** `0` auto-detects it from `$I`, which reports `[OPT:V,512,1024]`. The 1024 is the RX buffer. If you enter it by hand, use **1024** (the field's maximum).
 - **Poll device status during jobs** and **Deadlock detection** stay off (Rayforge's defaults). Do not turn polling on, it only adds traffic.
+
+### Connection over WiFi
+
+The firmware speaks the same GRBL protocol on TCP port 23, and Rayforge ships a driver for that: **GRBL (Telnet)**
+(`GrblTelnetDriver`). It is a raw TCP connection with the same character-counting stream as the serial driver. It is
+not the **GRBL (Network)** driver, which uploads a file over HTTP and runs it from the controller's storage; the
+firmware does not support that.
+
+1. Over USB, set the network and enable it: `$WIFI=<ssid>,<password>`, `$240=1`, then `$WIFI` to read the IP address.
+2. Install `docs/rayforge/wavemaster-machine-wifi.yaml` as `<config>/machines/wavemaster-wifi.yaml` and put the IP
+   address into `driver_args: host:`. Or in Rayforge: Machine Settings > **General** > driver **GRBL (Telnet)**,
+   hostname = the IP, port = 23.
+3. Keep **Poll device status during jobs** and **Deadlock detection** off, as for USB, and `rx_buffer_size` 1024.
+4. Close any other program that holds the controller (a `nc` session counts). A second connection is refused with
+   `[MSG:busy: another host is connected]`.
+
+Behaviour that differs from USB:
+
+- If the WiFi link breaks mid-job, the firmware aborts the job about 6 s later (laser off, disarmed). Reconnecting
+  starts clean; a job cannot be resumed.
+- Ctrl-X, feed hold and status travel over the network, so their latency is the network's. Do not rely on the USB
+  stop time (target about 60 ms) over WiFi; it has not been measured.
+- Nothing authenticates the connection. See the WiFi section of the README.
+
+Validation: the profile's argument names were read from the Rayforge source (`rayforge/machine/driver/grbl/grbl_telnet.py`,
+clone of 2026-10-12). It has not been run against a real Rayforge install or the controller.
 
 ## 2. Dialect
 

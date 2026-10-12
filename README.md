@@ -100,7 +100,7 @@ transcript). Settings backups can be restored with
 - **Jump trapezoids:** `G0` uses a trapezoidal profile (`$201` speed, `$120` acceleration) and a settle delay.
 - **EZCAD-style delays:** laser-on / laser-off, jump, mark and polygon-corner delays (`$210`-`$216`).
 - **Power modes:** analog power word over the ATmega link (`$223=0`), or pulse-density modulation at fixed power (`$223=1`).
-- **GRBL 1.1 over USB** with character counting, 1024-byte RX window, realtime `?` `!` `~` Ctrl-X and jog cancel.
+- **GRBL 1.1 over USB or WiFi** (raw TCP, port 23) with character counting, 1024-byte RX window, realtime `?` `!` `~` Ctrl-X and jog cancel.
 - **ATmega protocol v2:** CRC-8 framed, with a heartbeat. The ATmega disarms within 1 s if the ESP32 goes silent.
 - **Stream statistics:** `$S` reports underruns, barriers and ATmega link state. `$RB` reads back the DAC registers when idle. `$GT` and `$LT` test the gate line and the laser without motion.
 
@@ -133,6 +133,8 @@ Flow control is end to end. `motion_submit()` blocks while the segment queue is 
 |:---|:---|
 | `src/main.c` | Boot sequence: early gate-off, NVS, UART, DAC, motion, GRBL. |
 | `src/host_serial.{c,h}` | USB-Serial-JTAG driver, host RX task, realtime bytes, `[MSG:...]` logging. |
+| `src/net_wifi.{c,h}` | WiFi station manager (core 1), credentials in NVS, the `$WIFI` command. Off unless `$240=1`. |
+| `src/net_server.{c,h}` | Raw TCP host link on port 23: one client, keepalive, second transport for `host_serial`. |
 | `src/grbl.{c,h}` | GRBL 1.1 front end: line parser, modal state, `$` commands, status reports, reset handling. |
 | `src/gcode_parse.{c,h}` | Word parser, arc linearisation, feed and power mapping. |
 | `src/calib.{c,h}` | Settings table (`s_defs`), NVS persistence, `$$` dump. |
@@ -148,7 +150,7 @@ Flow control is end to end. `motion_submit()` blocks while the segment queue is 
 | `ArduinoCompanion/` | ATmega328P firmware: power word, arm, guide, status inputs, watchdog. See its [README](ArduinoCompanion/README.md). |
 | `test/host/` | Host unit tests for the trajectory generator. |
 | `test/host/gcode/` | Host unit tests for the G-code parser. |
-| `tools/` | Host helpers: `stream_test.py` (character-counting bring-up and tuning patterns, preview unless `--fire`), `jog.py`. |
+| `tools/` | Host helpers: `stream_test.py` (character-counting bring-up and tuning patterns, preview unless `--fire`; the port can be `host:port` for WiFi), `jog.py`. |
 
 ---
 
@@ -216,6 +218,37 @@ A number in brackets is an alias that writes the same value.
 | `$240` | WiFi host link on (0/1). Needs credentials from `$WIFI=ssid,password`. See the WiFi section. | 0 | 0 … 1 | `wifien` |
 
 Read-only GRBL values (`$0`, `$1`, `$2`, `$4`-`$6`, `$10`, `$11`, `$20`-`$27`, `$31`, `$32`, `$102`, `$112`, `$122`, `$132`) are reported for sender compatibility and ignored when set.
+
+---
+
+## 📶 WiFi host link
+
+The controller can also talk GRBL over WiFi, so Rayforge connects without a cable. It is the same protocol as
+USB, carried on a raw TCP socket (port 23), and Rayforge uses its stock **GRBL (Telnet)** driver. Plan and
+reasons: [docs/WIFI_PLAN.md](docs/WIFI_PLAN.md). Rayforge setup: [docs/RAYFORGE.md](docs/RAYFORGE.md).
+
+Set it up once over USB:
+
+```
+$WIFI=MyNetwork,my-password     store the network (WPA2 or better, password 8..63 characters)
+$240=1                          turn WiFi on (off by default)
+$WIFI                           status: [WIFI:enabled=1 creds=1 state=connected ssid=MyNetwork ip=192.168.1.50 ...]
+$WIFI=CLEAR                     forget the credentials
+```
+
+The SSID is split at the first comma, so it cannot contain one. The password is never printed or logged.
+Quick check from a shell: `nc <ip> 23`, then type `$I`. Streaming test: `python3 tools/stream_test.py <ip>:23 grid`.
+
+Rules to know:
+
+- **One host at a time.** USB and WiFi feed the same stream. Replies go to the host that spoke last while the machine
+  was idle. While a job runs, input from the other host is ignored, except **Ctrl-X**, which always works.
+- **Losing the WiFi client stops the job.** If the active TCP client disappears (about 6 s after the link breaks), the
+  firmware does what Ctrl-X does: stop, gate off, disarm. USB becomes the active host again.
+- **No authentication.** Anyone on the same network who can reach port 23 can send G-code. Keep the controller on a
+  trusted or separate network. The laser still has to be armed, and the ATmega interlocks are unchanged.
+- Settings changes (`$240`, credentials) apply within about a second, no reboot needed.
+- Not verified on hardware yet: see [STATUS.md](STATUS.md).
 
 ---
 
