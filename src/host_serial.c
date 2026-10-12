@@ -32,6 +32,21 @@ static volatile TickType_t s_tx_dead_until;
 static volatile bool s_tx_dead;
 static volatile bool s_up;
 
+/* A transport is where host bytes go out. RX needs no hook: each transport
+ * calls rx_ingest() with what it received. USB is the only one for now. */
+struct host_transport {
+    /* Bytes written (0 on timeout). May block up to wait ticks. */
+    int (*write)(const char *s, size_t n, TickType_t wait);
+};
+
+static int usb_write(const char *s, size_t n, TickType_t wait)
+{
+    return usb_serial_jtag_write_bytes(s, n, wait);
+}
+
+static const struct host_transport s_usb = { .write = usb_write };
+static const struct host_transport *s_active = &s_usb;
+
 /* ---------------------------------------------------------------- TX --- */
 
 static void tx_locked(const char *s, size_t n, TickType_t wait)
@@ -44,7 +59,7 @@ static void tx_locked(const char *s, size_t n, TickType_t wait)
     while (n) {
         size_t c = n > TX_CHUNK ? TX_CHUNK : n;
 
-        if (usb_serial_jtag_write_bytes(s, c, wait) == 0) {
+        if (s_active->write(s, c, wait) <= 0) {
             s_tx_dead_until = xTaskGetTickCount() + pdMS_TO_TICKS(TX_DEAD_MS);
             s_tx_dead = true;
             return;
@@ -157,59 +172,69 @@ static void rx_flush(uint8_t *batch, size_t *len)
     }
 }
 
+/* Parses one block of host input: realtime bytes act at once, everything
+ * else goes into the stream. Called from the RX task of the transport that
+ * received it; with a second transport the callers must be serialised, since
+ * a stream buffer has a single writer. */
+static void rx_ingest(const uint8_t *in, int got)
+{
+    uint8_t batch[128];
+    size_t bl = 0;
+
+    s_tx_dead = false;                  /* the host is alive */
+    for (int i = 0; i < got; i++) {
+        uint8_t c = in[i];
+
+        switch (c) {
+        case '?':
+            if (s_h.status)
+                s_h.status();
+            break;
+        case '!':
+            if (s_h.hold)
+                s_h.hold();
+            break;
+        case '~':
+            if (s_h.resume)
+                s_h.resume();
+            break;
+        case 0x85:
+            if (s_h.jog_cancel)
+                s_h.jog_cancel();
+            break;
+        case HOST_RX_RESET_MARK: {
+            uint8_t mark = HOST_RX_RESET_MARK;
+
+            rx_flush(batch, &bl);       /* earlier bytes stay ahead of the mark */
+            if (s_h.reset)
+                s_h.reset();
+            /* The mark must not be lost: wait briefly if the stream is
+             * (pathologically) full - the GRBL task is draining it. */
+            if (xStreamBufferSend(s_rx_stream, &mark, 1, pdMS_TO_TICKS(100)) != 1)
+                s_dropped++;
+            break;
+        }
+        default:
+            if (c >= 0x80)
+                break;                  /* other GRBL realtime/override bytes: ignored */
+            batch[bl++] = c;
+            break;
+        }
+    }
+    rx_flush(batch, &bl);
+}
+
 static void rx_task(void *arg)
 {
     uint8_t in[128];
-    uint8_t batch[128];
 
     (void)arg;
     for (;;) {
         int got = usb_serial_jtag_read_bytes(in, sizeof(in), pdMS_TO_TICKS(100));
-        size_t bl = 0;
 
         if (got <= 0)
             continue;
-        s_tx_dead = false;                  /* the host is alive */
-        for (int i = 0; i < got; i++) {
-            uint8_t c = in[i];
-
-            switch (c) {
-            case '?':
-                if (s_h.status)
-                    s_h.status();
-                break;
-            case '!':
-                if (s_h.hold)
-                    s_h.hold();
-                break;
-            case '~':
-                if (s_h.resume)
-                    s_h.resume();
-                break;
-            case 0x85:
-                if (s_h.jog_cancel)
-                    s_h.jog_cancel();
-                break;
-            case HOST_RX_RESET_MARK: {
-                uint8_t mark = HOST_RX_RESET_MARK;
-
-                rx_flush(batch, &bl);       /* earlier bytes stay ahead of the mark */
-                if (s_h.reset)
-                    s_h.reset();
-                /* The mark must not be lost: wait briefly if the stream is
-                 * (pathologically) full - the GRBL task is draining it. */
-                if (xStreamBufferSend(s_rx_stream, &mark, 1, pdMS_TO_TICKS(100)) != 1)
-                    s_dropped++;
-                break;
-            }
-            default:
-                if (c >= 0x80)
-                    break;                  /* other GRBL realtime/override bytes: ignored */
-                batch[bl++] = c;
-                break;
-            }
-        }
-        rx_flush(batch, &bl);
+        rx_ingest(in, got);
     }
 }
 

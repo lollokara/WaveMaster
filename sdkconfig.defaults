@@ -35,3 +35,11 @@ CONFIG_GPTIMER_ISR_CACHE_SAFE=y
 
 # 4 MB flash module (see platformio.ini board_upload.flash_size).
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# WiFi host link (docs/WIFI_PLAN.md): core 0 belongs to dac_task and the gate
+# ISRs, so the network stack runs on core 1. The esp_timer task stays on
+# core 0: moving it needs ESP_TIMER_SHOW_EXPERIMENTAL, which ESP-IDF warns
+# may break other features. Its callbacks are short; the WiFi scope test in
+# the plan decides whether that is acceptable.
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y

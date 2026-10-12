@@ -1,6 +1,6 @@
 # WiFi host link: plan
 
-Branch: `feature/wifi-ota-printing`. Status: plan only, no code yet.
+Branch: `feature/wifi-ota-printing`. Status: phase 1 in progress.
 
 Goal: Rayforge connects to the WaveMaster over WiFi and runs jobs with the stock
 Rayforge driver, with no change to the streaming path, its timing or its safety
@@ -17,7 +17,7 @@ rules (`AGENTS.md` section 2).
 | 5 | **Credentials are set over USB and stored in their own NVS namespace.** | `calib.c` holds numeric settings only. Strings do not fit its table, so do not stretch it. The enable flag is a normal `$` setting. |
 | 6 | **One host at a time.** USB and TCP feed the same stream buffer. Replies and logs go to the active host. The active host can change only when the machine is idle. Ctrl-X from either transport always works. | Two hosts must never interleave G-code or replies. |
 | 7 | **TCP disconnect during a job = abort, same path as Ctrl-X** (gate off, disarm). | Rayforge's session cannot resume a job after reconnecting, and a buffered job must not keep marking with nobody attached. `poll_status_while_running` is false in the shipped profile, so silence is not a usable watchdog. Detect loss with TCP keepalive instead. |
-| 8 | **Everything WiFi runs on core 1.** | Core 0 belongs to `dac_task` and the gate ISRs. |
+| 8 | **The WiFi task and the lwIP task run on core 1.** `esp_timer` stays on core 0. | Core 0 belongs to `dac_task` and the gate ISRs. Moving `esp_timer` needs `ESP_TIMER_SHOW_EXPERIMENTAL`, which ESP-IDF warns may break other features, so it is left alone and covered by the phase 4 scope test. |
 | 9 | **No authentication in phase 1; say so in the docs.** | Raw GRBL over TCP has no auth. Anyone on the LAN can send G-code. Mitigations: off by default, one client, laser disarmed unless armed, and a note to put the controller on its own network. |
 
 ## Architecture
@@ -51,9 +51,9 @@ Every phase must build with `pio run` and zero warnings in `src/`. If `motion.c`
 two host test suites. Nothing below counts as verified until the listed measurement was done.
 
 ### Phase 1. Build config and transport split (USB behaviour unchanged)
-1. `sdkconfig.defaults`: pin the WiFi task and the lwIP `tcpip_thread` to core 1, and move the `esp_timer` task to core 1.
-   Use RAM storage for WiFi config. Trim WiFi and lwIP buffer counts. Add the IRAM options for WiFi RX and lwIP only if the
-   heap allows it. Confirm each option name in menuconfig for ESP-IDF 5.5 when doing this; I have not checked them.
+1. `sdkconfig.defaults`: pin the WiFi task and the lwIP `tcpip_thread` to core 1 (done; the option names were checked against the
+   generated sdkconfig). `esp_timer` stays on core 0 (decision 8). Use RAM storage for WiFi config and trim the WiFi and lwIP buffer counts
+   in phase 2, when WiFi is first started and the heap can be measured. `ESP_WIFI_IRAM_OPT` and `ESP_WIFI_RX_IRAM_OPT` are already on by default.
 2. Split the USB code in `host_serial.c` behind the transport interface.
 3. **Gate:** with WiFi still disabled, the firmware behaves exactly as before. Run the USB checks from `STATUS.md` (`$S`, `$RB`, a job with
    `underruns=0`).
