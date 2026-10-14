@@ -10,6 +10,9 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
+#include <math.h>
+
+#include "calib.h"
 #include "net_wifi.h"
 #include "zbro_proto.h"
 
@@ -22,6 +25,7 @@ static const char *TAG = "zbro";
 #define REPLY_MS        2000     /* the C3 answers every request at once; longer = dead */
 #define SILENCE_MS      4500     /* PING is answered every second */
 #define CONNECT_MS      3000
+#define DONE_TOL_MM     0.05f    /* EVT DONE counts as arrival only this close to the MOVE target */
 
 enum slot_state { SLOT_IDLE, SLOT_QUEUED, SLOT_SENT, SLOT_DONE };
 enum expect { EXP_NONE, EXP_SLOT, EXP_DISCARD, EXP_POS_DISCARD };
@@ -49,6 +53,8 @@ static char s_ip[16], s_fw[24];
 static volatile bool s_evt_armed;
 static volatile int s_evt_code;
 static volatile bool s_stop_req;
+static volatile bool s_op_home;      /* the armed operation is HOME (completes on EVT HOMED only) */
+static volatile float s_op_target;   /* MOVE target, mm */
 static volatile bool s_stopped;      /* a STOP was requested during the armed operation */
 static bool (*s_abort_fn)(void);
 
@@ -118,9 +124,14 @@ static enum expect handle_line(const char *line, size_t len, enum expect exp)
         return exp;
     switch (r->kind) {
     case ZBRO_R_EVT_HOMED:
+        s_pos = r->pos;
+        if (s_op_home)
+            evt_fire(0);
+        return exp;
     case ZBRO_R_EVT_DONE:
         s_pos = r->pos;
-        evt_fire(0);
+        if (!s_op_home)                  /* a DONE short of the target is an interrupted move */
+            evt_fire(fabsf(r->pos - s_op_target) <= DONE_TOL_MM ? 0 : ZBRO_E_STOPPED);
         return exp;
     case ZBRO_R_EVT_ERR:
         evt_fire(r->code);
@@ -208,9 +219,18 @@ static bool pump_rx(int fd, enum expect *exp, int64_t *last_rx)
         const char *line;
         size_t len;
 
-        if (zbro_lines_feed(&s_lines, (char)buf[i], &line, &len) == 1) {
+        int f = zbro_lines_feed(&s_lines, (char)buf[i], &line, &len);
+
+        if (f == 1) {
             *last_rx = now_ms();
             *exp = handle_line(line, len, *exp);
+        } else if (f < 0) {
+            /* Overlong line: the C3 is alive, only this line is lost. Resync instead of dropping the link. */
+            *last_rx = now_ms();
+            if (*exp == EXP_SLOT)
+                slot_finish(ZBRO_ERR_TIMEOUT, "");
+            if (*exp != EXP_NONE)
+                *exp = EXP_NONE;
         }
     }
     return true;
@@ -265,7 +285,7 @@ static bool session(const char *ip, int port)
     exp = EXP_POS_DISCARD;
     t_sent = now_ms();
 
-    while (net_wifi_up()) {
+    while (net_wifi_up() && calib_get(CAL_ZBRO_EN) > 0.5f) {
         int64_t t = now_ms();
 
         if (exp == EXP_NONE) {
@@ -348,9 +368,12 @@ static void link_task(void *arg)
     (void)arg;
     for (;;) {
         char pkt[96], ip[16], host[32];
+        struct sockaddr_in src;
+        socklen_t sl = sizeof(src);
+        struct in_addr ann;
         int port, n;
 
-        if (!net_wifi_up()) {
+        if (!net_wifi_up() || calib_get(CAL_ZBRO_EN) < 0.5f) {
             if (udp >= 0) {
                 close(udp);
                 udp = -1;
@@ -364,13 +387,16 @@ static void link_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
-        n = recvfrom(udp, pkt, sizeof(pkt) - 1, 0, NULL, NULL);
+        n = recvfrom(udp, pkt, sizeof(pkt) - 1, 0, (struct sockaddr *)&src, &sl);
         if (n <= 0)
             continue;
         while (n > 0 && (pkt[n - 1] == '\n' || pkt[n - 1] == '\r'))
             n--;
         pkt[n] = '\0';
         if (!zbro_parse_beacon(pkt, (size_t)n, ip, sizeof(ip), &port, host, sizeof(host)))
+            continue;
+        /* Only the C3 itself may announce itself: the sender must be the announced address. */
+        if (inet_pton(AF_INET, ip, &ann) != 1 || ann.s_addr != src.sin_addr.s_addr)
             continue;
         close(udp);                      /* drop queued beacons, listen again after the session */
         udp = -1;
@@ -424,6 +450,7 @@ void zbro_set_abort_fn(bool (*fn)(void))
 
 void zbro_stop(void)
 {
+    /* Not armed yet: a reset in that gap is caught by run_op's abort check after arming. */
     if (!s_evt_armed)
         return;
     s_stopped = true;
@@ -494,7 +521,7 @@ int zbro_request(const char *line, char *reply, size_t n, uint32_t timeout_ms)
 }
 
 /* Sends HOME / MOVE (replied OK at once) and waits for the matching EVT. */
-static int run_op(const char *line, int timeout_s)
+static int run_op(const char *line, int timeout_s, bool home, float target)
 {
     char rep[ZBRO_MAX_LINE];
     int64_t t0;
@@ -506,9 +533,22 @@ static int run_op(const char *line, int timeout_s)
     s_evt_code = ZBRO_ERR_LINK;
     s_stopped = false;
     s_stop_req = false;
+    s_op_home = home;
+    s_op_target = target;
     s_evt_armed = true;
+    if (aborted()) {                 /* reset between the caller's drain and the arming: do not start */
+        s_evt_armed = false;
+        return ZBRO_ERR_ABORTED;
+    }
     r = zbro_request(line, rep, sizeof(rep), 3000);
+    if (r == ZBRO_ERR_OFFLINE || (r > 0 && r < ZBRO_ERR_OFFLINE)) {
+        s_evt_armed = false;         /* never sent, or the C3 refused it: nothing is moving */
+        return r;
+    }
     if (r) {
+        /* ABORTED / TIMEOUT / LINK: the line may have reached the C3, so stop it and swallow the EVT. */
+        s_stop_req = true;
+        xSemaphoreTake(s_evt, pdMS_TO_TICKS(1500));
         s_evt_armed = false;
         return r;
     }
@@ -533,7 +573,7 @@ static int run_op(const char *line, int timeout_s)
         xSemaphoreTake(s_evt, pdMS_TO_TICKS(1500));
         break;
     }
-    if (r == 0 && s_stopped)
+    if ((r == 0 || r == ZBRO_E_STOPPED) && s_stopped)
         r = ZBRO_ERR_ABORTED;        /* hold / reset stopped it short of the target */
     s_evt_armed = false;
     return r;
@@ -541,7 +581,7 @@ static int run_op(const char *line, int timeout_s)
 
 int zbro_home(int timeout_s)
 {
-    return run_op("HOME", timeout_s);
+    return run_op("HOME", timeout_s, true, 0.0f);
 }
 
 int zbro_move(float mm, float speed, int timeout_s)
@@ -552,5 +592,5 @@ int zbro_move(float mm, float speed, int timeout_s)
     if (n < 2)
         return ZBRO_E_ARG;
     b[n - 1] = '\0';                 /* drop the '\n' */
-    return run_op(b, timeout_s);
+    return run_op(b, timeout_s, false, mm);
 }

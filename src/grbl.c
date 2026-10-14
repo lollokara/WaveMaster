@@ -93,6 +93,7 @@ static uint32_t s_gen_seen;               /* GRBL task only */
 static volatile float s_jc_x, s_jc_y;
 static volatile bool s_jc_pending;
 static volatile bool s_jog_active;
+static volatile bool s_z_alarm;           /* a Z op failed or was stopped: Alarm until $X / reset, G-code locked out */
 static volatile bool s_z_busy;            /* grbl task is waiting for a Z-Bro move / home */
 static volatile uint32_t s_acked;         /* bytes the host may consider free */
 static uint32_t s_consumed;               /* GRBL task only */
@@ -207,6 +208,7 @@ static int z_fail(int e)
     case ZBRO_ERR_TIMEOUT: why = "timeout"; break;
     case ZBRO_ERR_ABORTED: why = "stopped"; break;
     case ZBRO_ERR_LINK:    why = "link lost"; break;
+    case ZBRO_E_STOPPED:   why = "move interrupted"; break;
     case ZBRO_E_BUSY:      why = "axis busy"; break;
     case ZBRO_E_NOT_HOMED: why = "not homed ($HZ)"; break;
     case ZBRO_E_RANGE:     why = "target out of range"; break;
@@ -224,6 +226,26 @@ static int z_fail(int e)
     if (e == ZBRO_E_ARG)
         return 3;
     return 20;
+}
+
+/* A Z operation that may have left the axis at the wrong height must stop the job: raise an Alarm (the host
+ * stops streaming; GRBL-style lockout until $X or a reset). Rejections before any motion (offline, busy, not
+ * homed, bad argument, out of range) stay plain errors. A reset already discards the line. */
+static int z_fail_alarm(int e)
+{
+    int r = z_fail(e);
+
+    if (e == 0 || r == E_ABORT)
+        return r;
+    switch (e) {
+    case ZBRO_ERR_OFFLINE: case ZBRO_E_BUSY: case ZBRO_E_NOT_HOMED: case ZBRO_E_RANGE: case ZBRO_E_ARG:
+        return r;
+    default:
+        break;
+    }
+    s_z_alarm = true;
+    host_puts("ALARM:3\r\n");
+    return r;
 }
 
 static bool submit(uint8_t type, float x, float y, uint8_t power, float speed, float dwell_us)
@@ -528,16 +550,25 @@ static int exec_gcode(const char *line, bool jog)
     /* Z-Bro axis: only after the XY queue has drained (laser gated off, stream closed). With $250=0 the Z
      * word is ignored, as before. */
     if (have_z && !jog && (motion == 0 || motion == 1) && calib_get(CAL_ZBRO_EN) > 0.5f) {
-        float tz = (s_m.relative && !g53) ? zbro_pos() + to_mm(az) : to_mm(az);
-        int ze;
+        float tz = to_mm(az);
+        int ze = 0;
 
         if (!wait_idle())
             return E_ABORT;
         s_z_busy = true;
-        ze = zbro_move(tz, calib_get(CAL_ZBRO_SPEED), (int)calib_get(CAL_ZBRO_TIMEOUT_S));
+        if (!s_fault && galvo_out_is_held())
+            ze = ZBRO_ERR_ABORTED;           /* Hold arrived between the drain and here: do not start */
+        if (!ze && s_m.relative && !g53) {
+            char rep[ZBRO_MAX_LINE];
+
+            ze = zbro_request("POS", rep, sizeof(rep), 3000);   /* fresh position, not the cached one */
+            tz += zbro_pos();
+        }
+        if (!ze)
+            ze = zbro_move(tz, calib_get(CAL_ZBRO_SPEED), (int)calib_get(CAL_ZBRO_TIMEOUT_S));
         s_z_busy = false;
         if (ze)
-            return z_fail(ze);
+            return z_fail_alarm(ze);
     }
 
     if (end_prog) {
@@ -841,7 +872,7 @@ static int exec_zbro(char *p)
         s_z_busy = true;
         e = zbro_home((int)calib_get(CAL_ZBRO_TIMEOUT_S));
         s_z_busy = false;
-        return z_fail(e);
+        return z_fail_alarm(e);
     }
     if (strcmp(cmd, "ZSTOP") == 0)
         return z_proxy("STOP");
@@ -1013,6 +1044,14 @@ static int process_line(char *line)
 
     while (*p == ' ' || *p == '\t')
         p++;
+    if (s_z_alarm) {
+        if (strncasecmp(p, "$X", 2) == 0 && (p[2] == '\0' || p[2] == ' ')) {
+            s_z_alarm = false;
+            return 0;
+        }
+        if (*p != '$' || strncasecmp(p, "$J", 2) == 0)
+            return 9;                        /* GRBL error 9: G-code locked out during alarm */
+    }
     if (*p == '$')
         return exec_dollar(p);
     return exec_gcode(p, false);
@@ -1033,6 +1072,9 @@ static void report_status(void)
         state = "Alarm";
         mx = s_m.x;
         my = s_m.y;
+    } else if (s_z_alarm) {
+        state = "Alarm";
+        galvo_out_position(&mx, &my);
     } else {
         busy = motion_busy() || s_z_busy;
         if (s_jog_active && !busy)
@@ -1080,7 +1122,7 @@ static void on_hold(void)
 {
     if (!s_fault)
         galvo_out_hold(true);
-    zbro_stop();                         /* a Z move cannot be paused: decelerate and report it stopped */
+    zbro_stop();                         /* a Z move cannot be paused: the stop ends the Z line with an Alarm */
 }
 
 static void on_resume(void)
@@ -1136,6 +1178,7 @@ static void reply(int err)
 static void handle_reset_mark(void)
 {
     s_gen_seen++;
+    s_z_alarm = false;
     if (!s_fault) {
         float x, y;
 

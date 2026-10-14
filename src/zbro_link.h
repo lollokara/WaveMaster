@@ -10,7 +10,8 @@
  *
  * One task on core 1 (prio 4) owns the socket. It listens for the UDP :7701
  * beacon, connects TCP :7700, sends HELLO, PINGs once a second and reconnects
- * with backoff. Only active while the WiFi station is up.
+ * with backoff. Only active while the WiFi station is up and $250=1; a beacon is accepted only from the
+ * address it announces.
  *
  * The blocking calls below are for the grbl task only (they sleep on
  * semaphores). Never call them from dac_task, the motion task or an ISR.
@@ -43,7 +44,7 @@ void zbro_get_info(struct zbro_info *out);
 void zbro_set_abort_fn(bool (*fn)(void));
 
 int zbro_home(int timeout_s);                 /* waits for EVT HOMED */
-int zbro_move(float mm, float speed, int timeout_s);   /* absolute; speed <= 0 = C3 default; waits for EVT DONE */
+int zbro_move(float mm, float speed, int timeout_s);   /* absolute; speed <= 0 = C3 default; waits for EVT DONE at the target (a DONE elsewhere or EVT ERR 9 = failure) */
 void zbro_stop(void);                         /* non-blocking: STOP if a move/home is in progress */
 
 /* Sends one request line (no newline) and returns the C3's reply line in reply. 0 unless the C3 answered ERR. */
