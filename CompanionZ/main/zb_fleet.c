@@ -31,7 +31,7 @@
  *   EVT s3_link state=up|down
  *   EVT cal_start tests=<n>            EVT cal_test name=<t> status=<s> limit=<x> unit=<u> working=<x>
  *   EVT cal_done ok=<n> failed=<n>     EVT cal_error msg="<text>"
- *   EVT fleet_cmd cmd=<cmd> rc=<n>     EVT identify host=<name> state=<state> moving=0
+ *   EVT fleet_cmd cmd=<cmd> rc=<n>   (hub commands: identify, stop, estop, calstatus, health)     EVT identify host=<name> state=<state> moving=0
  * Plus the hub's own recognised lines: "WiFi connected, IP: x", "WiFi disconnected, reason: n",
  * "Booting firmware <ver>", "OTA partition marked valid", "Heap: free=n, min=n". */
 
@@ -74,7 +74,7 @@ static char s_cal_status[CAL_TESTS][10];
 void zb_fleet_on_event(enum zb_evt_type type, float pos_mm, int err)
 {
     if (type == ZB_EVT_DONE) s_moves++;
-    if (type == ZB_EVT_ERR) {
+    if (type == ZB_EVT_ERR && err != ZB_E_STOPPED) {   /* a commanded stop is not a motion error */
         s_errors++;
         s_last_err = (uint32_t)err;
     }
@@ -104,17 +104,16 @@ void zb_fleet_note_estop(void)
 
 /* Called by the agent task before flash writes ("ota"), a hub reboot ("reboot") and the restart after a
  * good OTA ("restart"). Flash writes stall the cache and would disturb step generation, so an update is
- * only accepted while the axis is idle, and the driver is switched off first. */
+ * only accepted while the axis is idle; from then on motion is refused until reboot (zb_fw_update_begin). */
 static bool gate_cb(const char *what)
 {
     struct zb_status st;
     zb_motion_status(&st);
     if (strcmp(what, "ota") == 0) {
-        if (st.state != ZB_IDLE) {
+        if (!zb_fw_update_begin()) {            /* atomic idle check + motion lockout until reboot */
             ESP_LOGW(EVT_TAG, "EVT fleet_cmd cmd=ota rc=busy state=%d", (int)st.state);
             return false;
         }
-        zb_driver_enable(false);
         ESP_LOGW(EVT_TAG, "EVT fleet_cmd cmd=ota rc=0 driver=off");
         return true;
     }
@@ -150,9 +149,7 @@ static bool command_cb(const char *cmd, const char *arg)
         zb_estop();
         rc = 0;
         ok = true;
-    } else if (strcmp(cmd, "home") == 0) {
-        rc = (st.state == ZB_IDLE) ? zb_home() : ZB_E_BUSY;
-        ok = rc == 0;
+    /* The hub may only identify / stop / estop (plus read-only status): never start motion. */
     } else if (strcmp(cmd, "calstatus") == 0) {
         s_cal_dirty = true;
         if (s_task) xTaskNotifyGive(s_task);
@@ -203,10 +200,9 @@ static void on_net_event(void *arg, esp_event_base_t base, int32_t id, void *dat
 
 static void cal_update(void)
 {
-    char *js = zb_cal_json();
-    if (!js) return;
+    static char js[ZB_CAL_COMPACT_MAX + 1];       /* glue task only; compact form: no trials, no allocation */
+    if (zb_cal_json_compact(js, sizeof(js)) == 0) return;
     cJSON *root = cJSON_Parse(js);
-    free(js);
     if (!root) return;
 
     bool running = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "running"));

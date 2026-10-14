@@ -64,7 +64,10 @@ static char  s_fatal[48];
 
 static void lock(void)   { xSemaphoreTake(s_mu, portMAX_DELAY); }
 static void unlock(void) { xSemaphoreGive(s_mu); }
+static unsigned s_phase;     /* bumped when running/current/status/error change, not on progress ticks */
 static void notify(void) { if (s_cb) s_cb(); }
+static void notify_phase(void) { s_phase++; notify(); }
+unsigned zb_cal_phase(void) { return s_phase; }
 
 void zb_cal_set_cb(zb_cal_cb cb) { s_cb = cb; }
 
@@ -288,7 +291,7 @@ static void finish(const char *err)
     for (int i = 0; i < T_COUNT; i++)
         if (s_st.t[i].status == S_RUNNING) s_st.t[i].status = S_FAILED;
     unlock();
-    notify();
+    notify_phase();
 }
 
 static void cal_task(void *arg)
@@ -303,7 +306,7 @@ static void cal_task(void *arg)
         int rc;
         if (!s_sel[i]) continue;
         lock(); s_st.current = i; s_st.t[i].status = S_RUNNING; unlock();
-        notify();
+        notify_phase();
         if (i == T_ENDSTOP) {
             rc = run_endstop_test(i);
             referenced = (rc == 0);
@@ -326,42 +329,44 @@ static void cal_task(void *arg)
     zb_set_set(ZS_CAL_TIME, (float)time(NULL), true);
     zb_set_save();
 
-    if (aborted) {
-        finish(s_fatal[0] ? s_fatal : "aborted");
-    } else {
-        /* park at the safe position near the endstop (true coordinates), after a last sync */
-        if (referenced) {
-            float d;
-            if (probe_and_park(&d) == 0 && fabsf(s_off) > TOL_MM) s_st.needs_home = true;
-        }
-        finish(s_fatal[0] ? s_fatal : NULL);
+    /* Final sync probe: the position is only trusted (and corrected by the measured offset) if it
+     * succeeded. After an abort or a fatal error the zero is unknown, so the axis is unhomed. */
+    bool trusted = false;
+    float corr = 0.0f;
+    if (!aborted && referenced) {
+        float d;
+        if (probe_and_park(&d) == 0) { trusted = true; corr = -s_off; }
     }
-    if (entered) zb_cal_leave();
+    if (entered) zb_cal_leave(trusted, corr);
+    lock(); s_st.needs_home = entered && !trusted; unlock();
+    finish(aborted ? (s_fatal[0] ? s_fatal : "aborted") : (s_fatal[0] ? s_fatal : NULL));
     vTaskDelete(NULL);
 }
 
 /* ---- public API ---- */
 
-bool zb_cal_start(const char *const *tests, int n)
+int zb_cal_start(const char *const *tests, int n)
 {
     struct zb_status st;
     bool sel[T_COUNT] = { false };
     bool run;
 
     if (!s_mu) s_mu = xSemaphoreCreateMutex();
-    if (!s_mu) return false;
+    if (!s_mu) return ZB_E_FAULT;
     if (n <= 0 || !tests) {
         for (int i = 0; i < T_COUNT; i++) sel[i] = true;
     } else {
         for (int k = 0; k < n; k++) {
             int i;
             for (i = 0; i < T_COUNT; i++) if (tests[k] && !strcmp(tests[k], k_names[i])) break;
-            if (i == T_COUNT) return false;
+            if (i == T_COUNT) return ZB_E_ARG;
             sel[i] = true;
         }
     }
     zb_motion_status(&st);
-    if (!st.homed || st.state != ZB_IDLE) return false;
+    if (st.state == ZB_FAULT) return ZB_E_FAULT;
+    if (st.state != ZB_IDLE) return ZB_E_BUSY;
+    if (!st.homed) return ZB_E_NOT_HOMED;
 
     lock();
     run = s_st.running;
@@ -376,12 +381,12 @@ bool zb_cal_start(const char *const *tests, int n)
         s_fatal[0] = 0;
     }
     unlock();
-    if (run) return false;
+    if (run) return ZB_E_BUSY;
     if (xTaskCreate(cal_task, "zb_cal", 4096, NULL, 4, NULL) != pdPASS) {
         finish("no memory");
-        return false;
+        return ZB_E_FAULT;
     }
-    return true;
+    return ZB_E_NONE;
 }
 
 void zb_cal_abort(void)
@@ -431,4 +436,44 @@ char *zb_cal_json(void)
     out = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return out;
+}
+
+/* Compact status for the COM link and the fleet glue: same shape as zb_cal_json() but no "trials", no
+ * allocation, bounded by n. Returns the length, or 0 if it does not fit. */
+size_t zb_cal_json_compact(char *buf, size_t n)
+{
+    size_t len = 0;
+    if (!s_mu) s_mu = xSemaphoreCreateMutex();
+    if (!buf || n < 2 || !s_mu) return 0;
+#define PUT(...) do { int w_ = snprintf(buf + len, n - len, __VA_ARGS__); \
+                      if (w_ < 0 || (size_t)w_ >= n - len) { unlock(); buf[0] = 0; return 0; } len += (size_t)w_; } while (0)
+    lock();
+    PUT("{\"running\":%s,\"current\":\"%s\"", s_st.running ? "true" : "false",
+        s_st.current >= 0 ? k_names[s_st.current] : "");
+    if (s_st.error[0]) {
+        char e[sizeof s_st.error];
+        size_t k = 0;
+        for (; s_st.error[k] && k < sizeof e - 1; k++) {
+            char c = s_st.error[k];
+            e[k] = (c == '"' || c == '\\' || (unsigned char)c < 0x20) ? '_' : c;
+        }
+        e[k] = 0;
+        PUT(",\"error\":\"%s\"", e);
+    }
+    if (s_st.needs_home) PUT(",\"needs_home\":true");
+    PUT(",\"tests\":[");
+    for (int i = 0; i < T_COUNT; i++) {
+        const struct test *t = &s_st.t[i];
+        PUT("%s{\"name\":\"%s\",\"status\":\"%s\",\"progress\":%.3g,", i ? "," : "", k_names[i], k_status[t->status],
+            (double)t->progress);
+        if (t->has_result)
+            PUT("\"result\":{\"limit\":%.6g,\"unit\":\"%s\",\"working\":%.6g}}", (double)t->limit, k_units[i],
+                (double)t->working);
+        else
+            PUT("\"result\":null}");
+    }
+    PUT("]}");
+#undef PUT
+    unlock();
+    return len;
 }

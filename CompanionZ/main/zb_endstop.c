@@ -10,7 +10,7 @@
 #include "zb_settings.h"
 
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
-static volatile int32_t *s_cap_src;
+static int32_t (*s_cap_fn)(void);
 static volatile bool     s_latched;
 static volatile int32_t  s_cap;
 static volatile uint32_t s_edge_us;     /* time of the most recent edge (wraps, differences only) */
@@ -34,14 +34,14 @@ static void IRAM_ATTR es_isr(void *arg)
     (void)arg;
     s_edge_us = (uint32_t)esp_timer_get_time();
     if (level_active() && !s_latched) {
-        s_cap = s_cap_src ? *s_cap_src : 0;
+        s_cap = s_cap_fn ? s_cap_fn() : 0;
         s_latched = true;
     }
 }
 
-void zb_endstop_init(volatile int32_t *capture_src)
+void zb_endstop_init(int32_t (*capture_fn)(void))
 {
-    s_cap_src = capture_src;
+    s_cap_fn = capture_fn;
     refresh_settings();
     gpio_config_t io = {
         .pin_bit_mask = 1ULL << ZB_PIN_ENDSTOP,
@@ -68,7 +68,7 @@ void zb_endstop_rearm(void)
     s_latched = false;
     s_edge_us = (uint32_t)esp_timer_get_time();
     if (level_active()) {
-        s_cap = s_cap_src ? *s_cap_src : 0;
+        s_cap = s_cap_fn ? s_cap_fn() : 0;
         s_latched = true;
     }
     portEXIT_CRITICAL(&s_mux);

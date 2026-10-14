@@ -129,6 +129,12 @@ static void test_fmt(void)
     CHECK(strcmp(b, "EVT DONE -1.500\n") == 0);
     zbro_fmt_evt_err(b, sizeof b, 3);
     CHECK(strcmp(b, "EVT ERR 3\n") == 0);
+    zbro_fmt_evt_err(b, sizeof b, ZBRO_E_STOPPED);
+    CHECK(strcmp(b, "EVT ERR 9\n") == 0);
+    {
+        struct zbro_reply rp;
+        CHECK(zbro_parse_reply("EVT ERR 9", 9, &rp) && rp.kind == ZBRO_R_EVT_ERR && rp.code == ZBRO_E_STOPPED);
+    }
     zbro_fmt_val(b, sizeof b, "accel", 100.0f);
     CHECK(strcmp(b, "VAL accel 100\n") == 0);
     zbro_fmt_err(b, sizeof b, 4, "bad argument");

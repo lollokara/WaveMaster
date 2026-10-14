@@ -55,6 +55,10 @@ void zbc_range(const float *vals, enum zb_set_id id, float *lo, float *hi)
     float h = d->max;
     int c = cap_id(id);
     if (c >= 0 && vals[c] > 0.0f && vals[c] < h) h = vals[c];
+    if (id == ZS_HOME_FAST && vals[ZS_DECEL] > 0.0f && vals[ZS_HOME_BACKOFF] > 0.0f) {
+        float v = sqrtf(2.0f * vals[ZS_DECEL] * vals[ZS_HOME_BACKOFF]);   /* braking distance <= back-off */
+        if (v < h) h = v;
+    }
     if (lo) *lo = d->min;
     if (hi) *hi = h;
 }
@@ -76,6 +80,11 @@ int zbc_validate(const float *vals, enum zb_set_id id, float v)
         return (v >= lo && v <= hi * 1.000001f) ? 0 : 4;
     }
     }
+}
+
+int zbc_is_scale_key(enum zb_set_id id)
+{
+    return id == ZS_MICROSTEP || id == ZS_STEPS_REV || id == ZS_LEAD_MM || id == ZS_PULSE_US || id == ZS_DIR_INVERT;
 }
 
 int zbc_hostname_valid(const char *name)

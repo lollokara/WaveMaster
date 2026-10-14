@@ -16,6 +16,7 @@
 #include "zb_cal.h"
 #include "zb_fleet.h"
 #include "zb_net.h"
+#include "zb_setcore.h"
 #include "zb_settings.h"
 #include "zbro_proto.h"
 
@@ -52,18 +53,23 @@ static esp_err_t send_rc(httpd_req_t *req, int rc)
     return send_error(req, rc == ZBRO_E_BUSY ? "409 Conflict" : "400 Bad Request", zb_err_text(rc), NULL, rc);
 }
 
-/* Reads the body into a malloc'd, NUL-terminated buffer. NULL on error or when empty and !allow_empty. */
-static char *read_body(httpd_req_t *req)
+/* Reads the body into a malloc'd, NUL-terminated buffer. NULL on error; *timed_out is set when the client
+ * stalled (bounded retries: the single httpd task must never hang on one slow client). */
+#define RECV_RETRIES 2
+static char *read_body(httpd_req_t *req, bool *timed_out)
 {
     size_t len = req->content_len;
+    *timed_out = false;
     if (len > BODY_MAX) return NULL;
     char *b = malloc(len + 1);
     if (!b) return NULL;
     size_t got = 0;
+    int retries = 0;
     while (got < len) {
         int r = httpd_req_recv(req, b + got, len - got);
         if (r <= 0) {
-            if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            if (r == HTTPD_SOCK_ERR_TIMEOUT && ++retries <= RECV_RETRIES) continue;
+            *timed_out = r == HTTPD_SOCK_ERR_TIMEOUT;
             free(b);
             return NULL;
         }
@@ -76,8 +82,13 @@ static char *read_body(httpd_req_t *req)
 /* Parses the request body as a JSON object; replies 400 and returns NULL on failure. */
 static cJSON *body_json(httpd_req_t *req, bool allow_empty)
 {
-    char *b = read_body(req);
+    bool timed_out;
+    char *b = read_body(req, &timed_out);
     cJSON *j = NULL;
+    if (timed_out) {
+        httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, NULL);
+        return NULL;
+    }
     if (b) {
         if (b[0] == '\0' && allow_empty) j = cJSON_CreateObject();
         else j = cJSON_Parse(b);
@@ -104,7 +115,7 @@ static int status_json(char *b, size_t n)
     struct zb_status s;
     zb_motion_status(&s);
     return snprintf(b, n,
-        "{\"pos\":%.3f,\"state\":\"%s\",\"homed\":%s,\"endstop\":%s,\"fw\":\"%s\",\"rssi\":%d,\"s3\":%s,"
+        "{\"pos\":%.3f,\"state\":\"%s\",\"homed\":%s,\"endstop\":%s,\"fw\":\"%s\",\"rssi\":%d,\"client\":%s,"
         "\"uptime\":%lld}",
         (double)s.pos, zbro_state_name((int)s.state), s.homed ? "true" : "false", s.endstop ? "true" : "false",
         ZB_FW_VERSION, zb_net_rssi(), zb_net_s3_connected() ? "true" : "false",
@@ -228,33 +239,69 @@ static esp_err_t h_settings_get(httpd_req_t *req)
     return e;
 }
 
+static void bad_key_reply(httpd_req_t *req, const char *status, const char *what, const char *bad, int code)
+{
+    char key[ZBRO_KEY_MAX + 1];
+    snprintf(key, sizeof(key), "%.24s", bad);
+    for (char *c = key; *c; c++)
+        if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) *c = '_';
+    send_error(req, status, what, key, code);
+}
+
+/* Atomic: validate every key, then apply, rolling back on a late failure, then save once. */
 static esp_err_t h_settings_put(httpd_req_t *req)
 {
     cJSON *j = body_json(req, false);
     if (!j) return ESP_OK;
-    esp_err_t e = ESP_OK;
+    if (!zb_flash_write_ok()) {
+        cJSON_Delete(j);
+        return send_rc(req, ZBRO_E_BUSY);
+    }
+    struct zb_status st;
+    zb_motion_status(&st);
+    float vals[ZS_COUNT], old[ZS_COUNT];
+    for (int i = 0; i < ZS_COUNT; i++) old[i] = vals[i] = zb_set_get((enum zb_set_id)i);
+    const cJSON *host = NULL;
     const char *bad = NULL;
+    int bad_code = ZBRO_E_ARG;
     for (cJSON *i = j->child; i && !bad; i = i->next) {
         const char *k = i->string ? i->string : "";
         if (strcmp(k, "hostname") == 0 && cJSON_IsString(i)) {
-            if (zb_hostname_set(i->valuestring) != 0) bad = k;
-        } else if (zb_set_find(k) < 0 || !(cJSON_IsNumber(i) || cJSON_IsBool(i))) {
-            bad = k;
-        } else {
-            float v = cJSON_IsBool(i) ? (cJSON_IsTrue(i) ? 1.0f : 0.0f) : (float)i->valuedouble;
-            if (zb_set_set_by_key(k, v, false) != 0) bad = k;
+            if (!zbc_hostname_valid(i->valuestring)) bad = k;
+            else host = i;
+            continue;
         }
-        if (bad) {
-            char key[ZBRO_KEY_MAX + 1];
-            snprintf(key, sizeof(key), "%.24s", bad);
-            for (char *c = key; *c; c++)
-                if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) *c = '_';
-            e = send_error(req, "400 Bad Request", "invalid", key, ZBRO_E_ARG);
-        }
+        int id = zb_set_find(k);
+        if (id < 0 || !(cJSON_IsNumber(i) || cJSON_IsBool(i))) { bad = k; continue; }
+        float v = cJSON_IsBool(i) ? (cJSON_IsTrue(i) ? 1.0f : 0.0f) : (float)i->valuedouble;
+        if (zbc_validate(vals, (enum zb_set_id)id, v) != 0) { bad = k; continue; }
+        if (zbc_is_scale_key((enum zb_set_id)id) && v != vals[id] && st.state != ZB_IDLE) { bad = k; bad_code = ZBRO_E_BUSY; continue; }
+        vals[id] = v;
     }
-    zb_set_save();
+    if (!bad) {
+        int applied = 0, failed = -1;
+        for (int i = 0; i < ZS_COUNT && failed < 0; i++) {
+            if (vals[i] == old[i]) continue;
+            if (zb_set_set((enum zb_set_id)i, vals[i], false) != 0) failed = i;
+            else applied++;
+        }
+        if (failed >= 0) {                              /* interdependent caps: undo everything */
+            for (int i = 0; i < ZS_COUNT; i++) if (zb_set_get((enum zb_set_id)i) != old[i]) zb_set_set((enum zb_set_id)i, old[i], false);
+            bad = zb_set_key((enum zb_set_id)failed);
+        }
+        (void)applied;
+    }
+    esp_err_t e;
+    if (bad) {
+        bad_key_reply(req, bad_code == ZBRO_E_BUSY ? "409 Conflict" : "400 Bad Request", bad_code == ZBRO_E_BUSY ? "busy" : "invalid", bad, bad_code);
+        e = ESP_OK;
+    } else {
+        if (host) zb_hostname_set(host->valuestring);
+        zb_set_save();
+        e = send_json(req, NULL, "{\"ok\":true}");
+    }
     cJSON_Delete(j);
-    return bad ? e : send_json(req, NULL, "{\"ok\":true}");
+    return e;
 }
 
 static esp_err_t h_move(httpd_req_t *req)
@@ -316,8 +363,7 @@ static esp_err_t h_cal_start(httpd_req_t *req)
     }
     esp_err_t e;
     if (!ok) e = send_rc(req, ZBRO_E_ARG);
-    else if (!zb_cal_start(n ? t : NULL, n)) e = send_error(req, "409 Conflict", "cannot start", NULL, ZBRO_E_BUSY);
-    else e = send_rc(req, 0);
+    else e = send_rc(req, zb_cal_start(n ? t : NULL, n));
     cJSON_Delete(j);
     return e;
 }
@@ -347,13 +393,18 @@ static esp_err_t h_wifi_put(httpd_req_t *req)
 {
     cJSON *j = body_json(req, false);
     if (!j) return ESP_OK;
+    if (!zb_flash_write_ok()) {
+        cJSON_Delete(j);
+        return send_rc(req, ZBRO_E_BUSY);
+    }
     const cJSON *s = cJSON_GetObjectItemCaseSensitive(j, "ssid");
     const cJSON *p = cJSON_GetObjectItemCaseSensitive(j, "pass");
     const cJSON *fh = cJSON_GetObjectItemCaseSensitive(j, "fleet_hub");
     esp_err_t e;
     if (fh) {                                    /* ESPFleet hub URL: "", "off" or http(s)://...; applied on next boot */
-        if (!cJSON_IsString(fh) || zb_fleet_hub_set(fh->valuestring) != 0) {
-            e = send_rc(req, ZBRO_E_ARG);
+        int hrc = cJSON_IsString(fh) ? zb_fleet_hub_set(fh->valuestring) : ZBRO_E_ARG;
+        if (hrc != 0) {
+            e = send_rc(req, hrc);
             cJSON_Delete(j);
             return e;
         }
@@ -469,9 +520,12 @@ void zb_web_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_uri_handlers = 24;
-    cfg.max_open_sockets = 6;
+    cfg.max_open_sockets = 10;         /* a browser opens ~6 parallel connections; LWIP_MAX_SOCKETS is 20 */
+    cfg.backlog_conn = 8;
+    cfg.recv_wait_timeout = 3;         /* s: a stalled client costs the single httpd task seconds, not forever */
+    cfg.send_wait_timeout = 3;
     cfg.stack_size = 6144;
-    cfg.lru_purge_enable = true;
+    cfg.lru_purge_enable = true;       /* idle keep-alive sockets are recycled for new connections */
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     if (httpd_start(&s_srv, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed");

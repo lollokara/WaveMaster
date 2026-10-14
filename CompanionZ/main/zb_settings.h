@@ -19,13 +19,14 @@ enum zb_set_id {
 
 void  zb_settings_init(void);                     /* nvs_flash_init + load */
 float zb_set_get(enum zb_set_id id);
-/* 0 ok; 4 bad argument (unknown key / out of range / above calibrated limit). */
+/* 0 ok; 4 bad argument (unknown key / out of range / above calibrated limit); 1 busy (scale/timing keys
+ * microstep, steps_rev, lead_mm, pulse_us, dir_invert only while the axis is idle). */
 int   zb_set_set(enum zb_set_id id, float v, bool persist);
 int   zb_set_set_by_key(const char *key, float v, bool persist);
 int   zb_set_find(const char *key);               /* id or -1 */
 const char *zb_set_key(enum zb_set_id id);
 bool  zb_set_get_by_key(const char *key, float *v);
-void  zb_set_save(void);                          /* commit pending writes */
+int   zb_set_save(void);                          /* commit pending writes; 1 = busy (axis not at rest) */
 /* Effective range now (max may be capped by a calibrated limit). */
 void  zb_set_range(enum zb_set_id id, float *lo, float *hi);
 /* JSON for GET /api/settings (grouped, see plan §6). Returns malloc'd string, caller frees. */
@@ -34,7 +35,7 @@ unsigned zb_set_generation(void);                 /* bumped on every change */
 
 /* Hostname (string, own NVS key). */
 void zb_hostname_get(char *buf, size_t n);
-int  zb_hostname_set(const char *name);
+int  zb_hostname_set(const char *name);          /* 0 ok, 4 bad, 1 busy */
 
 /* ESPFleet hub URL (string, own NVS key "fleet_hub", applied on next boot). "" = discover via mDNS
  * _espfleet._tcp, "off" = agent disabled, otherwise http(s)://host[:port]. Unset = ZB_FLEET_HUB_DEFAULT.

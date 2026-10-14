@@ -8,6 +8,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include "zb_motion.h"
 #include "zb_setcore.c"   /* pure table/validation/JSON, also built by the host test */
 
 #define NVS_NS "zbro"
@@ -86,13 +87,17 @@ float zb_set_get(enum zb_set_id id)
 
 int zb_set_set(enum zb_set_id id, float v, bool persist)
 {
+    struct zb_status st;
+    zb_motion_status(&st);
     lock();
     int r = zbc_validate(s_val, id, v);
+    /* scale / timing keys would shift the position scale under a running move */
+    if (r == 0 && s_val[id] != v && id < ZS_COUNT && zbc_is_scale_key(id) && st.state != ZB_IDLE) r = 1;
     if (r == 0 && s_val[id] != v) {
         s_val[id] = v;
         s_dirty |= 1u << id;
         s_gen++;
-        if (persist) {
+        if (persist && zb_flash_write_ok()) {
             nvs_put(id);
             if (s_nvs_ok) nvs_commit(s_nvs);
         }
@@ -128,13 +133,15 @@ bool zb_set_get_by_key(const char *key, float *v)
     return true;
 }
 
-void zb_set_save(void)
+int zb_set_save(void)
 {
+    if (!zb_flash_write_ok()) return 1;           /* NVS commit stalls the cache: not while stepping */
     lock();
     for (int i = 0; i < ZS_COUNT; i++)
         if (s_dirty & (1u << i)) nvs_put(i);
     if (s_nvs_ok) nvs_commit(s_nvs);
     unlock();
+    return 0;
 }
 
 void zb_set_range(enum zb_set_id id, float *lo, float *hi)
@@ -167,6 +174,7 @@ void zb_hostname_get(char *buf, size_t n)
 int zb_hostname_set(const char *name)
 {
     if (!zbc_hostname_valid(name)) return 4;
+    if (!zb_flash_write_ok()) return 1;
     lock();
     strcpy(s_host, name);
     s_gen++;
@@ -187,6 +195,7 @@ void zb_fleet_hub_get(char *buf, size_t n)
 int zb_fleet_hub_set(const char *url)
 {
     if (!fleet_valid(url)) return 4;
+    if (!zb_flash_write_ok()) return 1;
     lock();
     strcpy(s_fleet, url);
     s_gen++;

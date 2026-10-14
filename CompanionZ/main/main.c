@@ -1,8 +1,10 @@
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "zb_cal.h"
 #include "zb_fleet.h"
 #include "zb_motion.h"
 #include "zb_net.h"
+#include "zb_pins.h"
 #include "zb_settings.h"
 #include "zb_web.h"
 
@@ -22,6 +24,10 @@ static void on_cal_change(void)
 
 void app_main(void)
 {
+    /* Driver ENABLE (active low) high before anything else, NVS init included: until now the pin
+     * floats and the A4988 would be energised. The external 10k pull-up stays a hardware requirement. */
+    gpio_set_level(ZB_PIN_ENABLE, 1);
+    gpio_set_direction(ZB_PIN_ENABLE, GPIO_MODE_OUTPUT);
     /* Settings first (NVS), then motion: zb_motion_start() configures the A4988 pins and leaves the driver
      * disabled before any radio or network code runs. */
     zb_settings_init();

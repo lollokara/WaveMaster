@@ -24,6 +24,8 @@ void zbc_range(const float *vals, enum zb_set_id id, float *lo, float *hi);
 int  zbc_validate(const float *vals, enum zb_set_id id, float v);
 /* snprintf-style: returns the length the JSON needs (excluding NUL), writes at most n bytes. */
 size_t zbc_json(const float *vals, char *buf, size_t n);
+/* Keys that change the position scale or step timing: writable only while the axis is idle. */
+int  zbc_is_scale_key(enum zb_set_id id);
 /* Hostname: 1..31 chars of [A-Za-z0-9-], no leading/trailing '-'. */
 int  zbc_hostname_valid(const char *name);
 

@@ -9,7 +9,7 @@
 
 enum zb_state { ZB_IDLE, ZB_MOVING, ZB_HOMING, ZB_CAL, ZB_FAULT };
 
-/* Error codes shared with the COM protocol (EVT ERR <code>). */
+/* Error codes shared with the COM protocol (EVT ERR <code>). STOP/ESTOP that interrupts an operation ends it with ZB_E_STOPPED, never DONE. */
 enum zb_err { ZB_E_NONE = 0, ZB_E_BUSY = 1, ZB_E_NOT_HOMED = 2, ZB_E_RANGE = 3, ZB_E_ARG = 4,
               ZB_E_ENDSTOP = 5, ZB_E_HOME_FAIL = 6, ZB_E_FAULT = 7, ZB_E_UNKNOWN = 8, ZB_E_STOPPED = 9 };
 
@@ -29,6 +29,11 @@ int  zb_move_rel(float dmm, float speed_mm_s);
 int  zb_stop(void);                            /* controlled decel (uses decel) */
 void zb_estop(void);                           /* halt now, STEP low, axis becomes unhomed; callable from any task */
 
+/* OTA gate: true (and motion refused from now on, until reboot) only if the axis is idle. */
+bool zb_fw_update_begin(void);
+/* Flash (NVS) writes stall the cache and can disturb step generation: only with the axis at rest. */
+bool zb_flash_write_ok(void);
+
 /* Driver. */
 void zb_driver_enable(bool on);                /* ENABLE pin, honours sleep_idle on disable */
 void zb_driver_set_microstep(int ms);          /* 1/2/4/8/16; only while idle */
@@ -36,7 +41,7 @@ void zb_driver_set_microstep(int ms);          /* 1/2/4/8/16; only while idle */
 /* Primitives for calibration (zb_cal.c). All blocking, called from the cal task while state == ZB_CAL.
  * Return ZB_E_NONE or an error; they obey zb_cal_abort_requested(). */
 bool zb_cal_enter(void);                       /* needs IDLE+homed; sets state ZB_CAL */
-void zb_cal_leave(void);
+void zb_cal_leave(bool trusted, float pos_correction_mm);   /* untrusted -> axis unhomed */
 void zb_cal_request_abort(void);
 bool zb_cal_abort_requested(void);
 /* Move with explicit parameters (bypasses the saved settings), blocks until done. stop_on_endstop: stop

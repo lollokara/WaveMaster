@@ -69,7 +69,44 @@ uint32_t zb_period_ticks(float rate, int pulse_us)
 
 int32_t zb_mm_to_steps(float mm, float spm)
 {
-    return (int32_t)lroundf(mm * spm);
+    float v = mm * spm;
+    if (!(v == v)) return 0;                       /* NaN */
+    if (v >= 1.0e9f) return 1000000000;            /* saturate: the float -> int32 cast must never overflow */
+    if (v <= -1.0e9f) return -1000000000;
+    return (int32_t)lroundf(v);
+}
+
+void zb_soft_limits(int32_t max_steps, int32_t back, bool home_to_max, int32_t *lo, int32_t *hi)
+{
+    if (back < 0) back = 0;
+    if (back > max_steps / 2) back = max_steps / 2;
+    if (lo) *lo = home_to_max ? 0 : back;
+    if (hi) *hi = home_to_max ? max_steps - back : max_steps;
+}
+
+int zb_plan_move(float target_mm, bool relative, bool homed, int32_t pos, float spm,
+                 float max_range_mm, float backoff_mm, bool home_to_max, int32_t *delta)
+{
+    if (!isfinite(target_mm) || !(spm > 0.0f) || !(max_range_mm > 0.0f)) return 4;
+    if (relative ? fabsf(target_mm) > max_range_mm
+                 : (target_mm < 0.0f || target_mm > max_range_mm)) return 3;
+    int64_t d = zb_mm_to_steps(target_mm, spm);
+    int64_t tgt = relative ? (int64_t)pos + d : d;
+    if (homed) {
+        int32_t lo, hi;
+        zb_soft_limits(zb_mm_to_steps(max_range_mm, spm), zb_mm_to_steps(backoff_mm, spm), home_to_max, &lo, &hi);
+        if (tgt < lo || tgt > hi) return 3;
+    } else if (tgt > 1000000000 || tgt < -1000000000) {
+        return 3;
+    }
+    if (delta) *delta = (int32_t)(tgt - pos);
+    return 0;
+}
+
+float zb_home_speed_limit(float decel, float backoff)
+{
+    if (!(decel > 0.0f) || !(backoff > 0.0f)) return 0.0f;
+    return sqrtf(2.0f * decel * backoff);
 }
 
 float zb_steps_to_mm(int32_t steps, float spm)

@@ -57,6 +57,9 @@ static rmt_channel_handle_t s_chan;
 static rmt_encoder_handle_t s_enc;
 static rmt_symbol_word_t s_buf[RING][CHUNK_MAX];
 static int32_t s_chunk_n[RING];
+static uint32_t s_chunk_us[RING];         /* duration of each chunk in us (sum of its STEP periods) */
+static volatile uint32_t s_t0;            /* us timestamp (low 32 bits) when the running chunk started */
+static volatile bool s_running;           /* a profile is being transmitted */
 
 static volatile int32_t s_pos_steps;      /* updated by the RMT done callback */
 static volatile int s_dir_sign = 1;
@@ -65,6 +68,7 @@ static volatile enum zb_state s_state = ZB_IDLE;
 static volatile bool s_homed;
 static volatile float s_speed;            /* mm/s of the last generated step */
 static volatile bool s_stop_req, s_estop, s_cal_abort;
+static volatile bool s_fw_update;         /* OTA in progress: no motion accepted until reboot */
 static float s_homed_spm;
 static int64_t s_last_active_us;
 
@@ -74,9 +78,25 @@ static bool IRAM_ATTR on_chunk_done(rmt_channel_handle_t ch, const rmt_tx_done_e
     int32_t n = s_chunk_n[s_cb_idx % RING];
     s_pos_steps = s_pos_steps + s_dir_sign * n;
     s_cb_idx = s_cb_idx + 1;
+    s_t0 = (uint32_t)esp_timer_get_time();   /* queued chunks run back to back: the next one starts now */
     BaseType_t hp = pdFALSE;
     xSemaphoreGiveFromISR(s_done_sem, &hp);
     return hp == pdTRUE;
+}
+
+/* Step position at this instant: completed chunks plus the linear share of the chunk in flight (endstop
+ * capture, ISR context). Exact when the chunk is 1 step (slow probes); otherwise within about a step. */
+static int32_t IRAM_ATTR pos_now(void)
+{
+    int32_t base = s_pos_steps;
+    if (!s_running) return base;
+    uint32_t idx = s_cb_idx % RING;
+    int32_t n = s_chunk_n[idx];
+    uint32_t dur = s_chunk_us[idx];
+    if (n <= 0 || dur == 0) return base;
+    uint32_t dt = (uint32_t)esp_timer_get_time() - s_t0;
+    int32_t k = dt >= dur ? n : (int32_t)((uint32_t)n * dt / dur);
+    return base + s_dir_sign * k;
 }
 
 static bool chan_create(void)
@@ -136,6 +156,11 @@ static void run_profile(const struct run *r, struct run_res *res)
 {
     memset(res, 0, sizeof *res);
     if (r->total <= 0 && !s_estop) return;
+    if (!s_chan) {                       /* a failed chan_reset() must not be permanent: retry */
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        if (!s_chan) chan_create();
+        xSemaphoreGive(s_lock);
+    }
     if (!s_chan) { res->err = ZB_E_FAULT; return; }
 
     struct zb_gen g;
@@ -148,6 +173,7 @@ static void run_profile(const struct run *r, struct run_res *res)
 
     s_dir_sign = r->dir;
     s_cb_idx = 0;
+    s_running = false;
     while (xSemaphoreTake(s_done_sem, 0) == pdTRUE) {}
     zb_driver_set_dir(r->dir > 0);
     zb_driver_enable(true);
@@ -178,13 +204,17 @@ static void run_profile(const struct run *r, struct run_res *res)
             if (n > CHUNK_MAX) n = CHUNK_MAX;
             if (n > g.n - g.i) n = g.n - g.i;
             rmt_symbol_word_t *b = s_buf[issued % RING];
+            uint32_t dur = 0;
             for (int32_t k = 0; k < n; k++) {
                 rate = zb_gen_next(&g);
                 uint32_t t = zb_period_ticks(rate, r->pulse);
                 b[k].level0 = 1; b[k].duration0 = (uint32_t)r->pulse;
                 b[k].level1 = 0; b[k].duration1 = t - (uint32_t)r->pulse;
+                dur += t;
             }
             s_chunk_n[issued % RING] = n;
+            s_chunk_us[issued % RING] = dur;
+            if (issued == 0) { s_t0 = (uint32_t)esp_timer_get_time(); s_running = true; }
             s_speed = rate / spm_now();
             if (rmt_transmit(s_chan, s_enc, b, (size_t)n * sizeof(rmt_symbol_word_t), &tc) != ESP_OK) {
                 faulted = true; res->err = ZB_E_FAULT;
@@ -204,6 +234,7 @@ static void run_profile(const struct run *r, struct run_res *res)
         }
     }
     s_speed = 0;
+    s_running = false;
     if (res->halted) chan_reset();
     s_last_active_us = esp_timer_get_time();
 }
@@ -215,14 +246,30 @@ static void set_state(enum zb_state st)
     xSemaphoreGive(s_lock);
 }
 
-/* End of every command: clear request flags, go idle, then tell the world. */
-static void finish_idle(void)
+/* End of every command: clear request flags and go idle. True if an ESTOP was pending. */
+static bool finish_idle(void)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_stop_req = false;
+    bool es = s_estop;
     s_estop = false;
     if (s_state != ZB_FAULT) s_state = ZB_IDLE;
     xSemaphoreGive(s_lock);
+    return es;
+}
+
+/* Go idle, then tell the world. An ESTOP that landed after the profile ended (zb_estop() already
+ * disabled the RMT channel) still rebuilds the channel and wins over DONE/HOMED: the axis is unhomed. */
+static void finish_report(enum zb_evt_type t, int err)
+{
+    bool es = finish_idle();
+    if (es) {
+        s_homed = false;
+        chan_reset();
+        zb_driver_enable(false);
+        if (t != ZB_EVT_ERR) { t = ZB_EVT_ERR; err = ZB_E_STOPPED; }
+    }
+    emit(t, err);
 }
 
 static void mk_run(struct run *r, int32_t total, int dir, float speed, float accel, float decel)
@@ -249,13 +296,15 @@ static bool handle_abnormal(const struct run_res *res)
 {
     if (res->halted) {
         s_homed = false;
-        finish_idle();
+        zb_driver_enable(false);             /* never leave the motor energised after ESTOP / FAULT */
+        finish_idle();                       /* run_profile already rebuilt the channel */
         if (res->err) { set_state(ZB_FAULT); emit(ZB_EVT_ERR, ZB_E_FAULT); }
-        else emit(ZB_EVT_DONE, 0);
+        else emit(ZB_EVT_ERR, ZB_E_STOPPED);
         return true;
     }
     if (res->err == ZB_E_FAULT) {
         s_homed = false;
+        zb_driver_enable(false);
         set_state(ZB_FAULT);
         emit(ZB_EVT_ERR, ZB_E_FAULT);
         return true;
@@ -275,19 +324,20 @@ static void exec_move(int32_t delta, float speed)
     if (handle_abnormal(&res)) return;
     if (res.err == ZB_E_ENDSTOP) {
         s_homed = false;
-        finish_idle();
-        emit(ZB_EVT_ERR, ZB_E_ENDSTOP);
+        finish_report(ZB_EVT_ERR, ZB_E_ENDSTOP);
         return;
     }
-    finish_idle();
-    emit(ZB_EVT_DONE, 0);
+    if (res.stopped) { finish_report(ZB_EVT_ERR, ZB_E_STOPPED); return; }
+    finish_report(ZB_EVT_DONE, 0);
 }
 
-static void home_fail(int err)
+/* Homing did not complete: unhomed, and the position counter is reset so the (meaningless) reading is a
+ * defined 0.000 instead of wherever the failed search ended. */
+static void home_abort(int err)
 {
     s_homed = false;
-    finish_idle();
-    emit(ZB_EVT_ERR, err);
+    s_pos_steps = 0;
+    finish_report(ZB_EVT_ERR, err);
 }
 
 static void exec_home(void)
@@ -298,7 +348,11 @@ static void exec_home(void)
     const int dir = es_dir();
     const float backoff = zb_set_get(ZS_HOME_BACKOFF);
     const float accel = zb_set_get(ZS_ACCEL), decel = zb_set_get(ZS_DECEL);
-    const float fast = zb_set_get(ZS_HOME_FAST), slow = zb_set_get(ZS_HOME_SLOW);
+    /* braking distance v^2/(2*decel) must fit in the back-off, or the stop overruns the switch travel */
+    const float vlim = zb_home_speed_limit(decel, backoff);
+    float fast = zb_set_get(ZS_HOME_FAST), slow = zb_set_get(ZS_HOME_SLOW);
+    if (fast > vlim) fast = vlim;
+    if (slow > vlim) slow = vlim;
     const int32_t back_steps = zb_mm_to_steps(backoff, spm);
     struct run r;
     struct run_res res;
@@ -308,18 +362,30 @@ static void exec_home(void)
         mk_run(&r, 2 * back_steps, -dir, fast, accel, decel);
         run_profile(&r, &res);
         if (handle_abnormal(&res)) return;
-        if (res.stopped) { finish_idle(); emit(ZB_EVT_DONE, 0); return; }
+        if (res.stopped) { home_abort(ZB_E_STOPPED); return; }
         vTaskDelay(pdMS_TO_TICKS((uint32_t)zb_set_get(ZS_ES_DEBOUNCE_US) / 1000 + 3));
-        if (zb_endstop_active()) { home_fail(ZB_E_HOME_FAIL); return; }
+        if (zb_endstop_active()) { home_abort(ZB_E_HOME_FAIL); return; }
     }
 
-    /* 1: fast approach, decelerating stop once the switch is confirmed */
-    mk_run(&r, zb_mm_to_steps(zb_set_get(ZS_MAX_RANGE) * 1.25f + 5.0f, spm), dir, fast, accel, decel);
+    /* 1: approach, decelerating stop once the switch is confirmed. The first 2*back-off of travel runs at
+     * home_slow (a missing or mis-wired switch then costs a slow crawl, not a full-speed crash), the rest
+     * at home_fast. */
+    int32_t appr = zb_mm_to_steps(zb_set_get(ZS_MAX_RANGE) * 1.25f + 5.0f, spm);
+    int32_t slow_n = 2 * back_steps;
+    if (slow_n > appr) slow_n = appr;
+    mk_run(&r, slow_n, dir, slow, accel, decel);
     r.es_decel = true;
     run_profile(&r, &res);
     if (handle_abnormal(&res)) return;
-    if (res.stopped) { finish_idle(); emit(ZB_EVT_DONE, 0); return; }
-    if (!res.es_hit) { home_fail(ZB_E_HOME_FAIL); return; }
+    if (res.stopped) { home_abort(ZB_E_STOPPED); return; }
+    if (!res.es_hit && appr > slow_n) {
+        mk_run(&r, appr - slow_n, dir, fast, accel, decel);
+        r.es_decel = true;
+        run_profile(&r, &res);
+        if (handle_abnormal(&res)) return;
+        if (res.stopped) { home_abort(ZB_E_STOPPED); return; }
+    }
+    if (!res.es_hit) { home_abort(ZB_E_HOME_FAIL); return; }
     int32_t over = s_pos_steps - res.es_pos;
     if (over < 0) over = -over;
 
@@ -327,35 +393,35 @@ static void exec_home(void)
     mk_run(&r, over + back_steps, -dir, fast, accel, decel);
     run_profile(&r, &res);
     if (handle_abnormal(&res)) return;
-    if (res.stopped) { finish_idle(); emit(ZB_EVT_DONE, 0); return; }
+    if (res.stopped) { home_abort(ZB_E_STOPPED); return; }
     vTaskDelay(pdMS_TO_TICKS((uint32_t)zb_set_get(ZS_ES_DEBOUNCE_US) / 1000 + 3));
-    if (zb_endstop_active()) { home_fail(ZB_E_HOME_FAIL); return; }
+    if (zb_endstop_active()) { home_abort(ZB_E_HOME_FAIL); return; }
 
-    /* 3: slow re-probe, abrupt stop, exact trigger position */
+    /* 3: slow re-probe, abrupt stop, trigger position */
     mk_run(&r, 2 * back_steps + 50, dir, slow, 1.0e6f, 1.0e6f);
     r.vs = r.vc;
     r.es_stop_now = true;
     run_profile(&r, &res);
     if (handle_abnormal(&res)) return;
-    if (res.stopped) { finish_idle(); emit(ZB_EVT_DONE, 0); return; }
-    if (!res.es_hit) { home_fail(ZB_E_HOME_FAIL); return; }
+    if (res.stopped) { home_abort(ZB_E_STOPPED); return; }
+    if (!res.es_hit) { home_abort(ZB_E_HOME_FAIL); return; }
 
     /* position space: the trigger point is the zero reference (or the max end if homing to max) */
-    int32_t ref = dir > 0 ? zb_mm_to_steps(zb_set_get(ZS_MAX_RANGE), spm) : 0;
+    int32_t maxs = zb_mm_to_steps(zb_set_get(ZS_MAX_RANGE), spm);
+    int32_t ref = dir > 0 ? maxs : 0;
     s_pos_steps = s_pos_steps + (ref - res.es_pos);
     s_homed_spm = spm;
     s_homed = true;
 
-    /* 4: park backoff mm inside the range */
-    int32_t park = ref - dir * back_steps;
-    int32_t maxs = zb_mm_to_steps(zb_set_get(ZS_MAX_RANGE), spm);
-    if (park < 0) park = 0;
-    if (park > maxs) park = maxs;
+    /* 4: park backoff mm inside the range (the soft limit) */
+    int32_t lo, hi;
+    zb_soft_limits(maxs, back_steps, dir > 0, &lo, &hi);
+    int32_t park = dir > 0 ? hi : lo;
     mk_run(&r, park - s_pos_steps, park < s_pos_steps ? -1 : 1, fast, accel, decel);
     run_profile(&r, &res);
     if (handle_abnormal(&res)) return;
-    finish_idle();
-    emit(ZB_EVT_HOMED, 0);
+    if (res.stopped) { finish_report(ZB_EVT_ERR, ZB_E_STOPPED); return; }
+    finish_report(ZB_EVT_HOMED, 0);
 }
 
 static void motion_task(void *arg)
@@ -373,13 +439,14 @@ static void motion_task(void *arg)
         switch (c.type) {
         case C_HOME: exec_home(); break;
         case C_MOVE:
-            if (c.delta == 0) { finish_idle(); emit(ZB_EVT_DONE, 0); }
+            if (c.delta == 0) finish_report(ZB_EVT_DONE, 0);
             else exec_move(c.delta, c.speed);
             break;
-        case C_NOP:
+        case C_NOP:                                  /* ESTOP out of FAULT: silent reset */
         default:
+            chan_reset();
+            zb_driver_enable(false);
             finish_idle();
-            emit(ZB_EVT_DONE, 0);
             break;
         }
         s_last_active_us = esp_timer_get_time();
@@ -394,7 +461,7 @@ bool zb_motion_start(zb_event_cb cb)
     s_done_sem = xSemaphoreCreateBinary();
     s_q = xQueueCreate(4, sizeof(struct cmd));
     if (!s_lock || !s_done_sem || !s_q) return false;
-    zb_endstop_init(&s_pos_steps);
+    zb_endstop_init(pos_now);
     if (!chan_create()) return false;
     s_last_active_us = esp_timer_get_time();
     return xTaskCreate(motion_task, "zb_motion", 4096, NULL, 10, NULL) == pdPASS;
@@ -417,7 +484,8 @@ static int accept(enum zb_state new_state, const struct cmd *c, bool allow_fault
 {
     int rc = ZB_E_NONE;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_state == ZB_FAULT && !allow_fault) rc = ZB_E_FAULT;
+    if (s_fw_update) rc = ZB_E_BUSY;                 /* flash update running: no motion until reboot */
+    else if (s_state == ZB_FAULT && !allow_fault) rc = ZB_E_FAULT;
     else if (s_state != ZB_IDLE && !(s_state == ZB_FAULT && allow_fault)) rc = ZB_E_BUSY;
     else {
         s_stop_req = false;
@@ -427,6 +495,21 @@ static int accept(enum zb_state new_state, const struct cmd *c, bool allow_fault
     }
     xSemaphoreGive(s_lock);
     return rc;
+}
+
+bool zb_fw_update_begin(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool ok = s_state == ZB_IDLE;
+    if (ok) s_fw_update = true;                      /* cleared only by the reboot after the update */
+    xSemaphoreGive(s_lock);
+    if (ok) zb_driver_enable(false);
+    return ok;
+}
+
+bool zb_flash_write_ok(void)
+{
+    return s_state == ZB_IDLE || s_state == ZB_CAL;  /* CAL saves between tests, with the axis at rest */
 }
 
 int zb_home(void)
@@ -445,13 +528,11 @@ static int move_common(float target_mm, bool relative, float speed)
     if (speed < 0.1f) speed = 0.1f;
     bool unhomed_ok = relative && zb_set_get(ZS_ALLOW_UNHOMED) != 0.0f;
     if (!s_homed && !unhomed_ok) return ZB_E_NOT_HOMED;
-    int32_t pos = s_pos_steps;
-    int32_t tgt = relative ? pos + zb_mm_to_steps(target_mm, spm) : zb_mm_to_steps(target_mm, spm);
-    if (s_homed) {
-        int32_t maxs = zb_mm_to_steps(zb_set_get(ZS_MAX_RANGE), spm);
-        if (tgt < 0 || tgt > maxs) return ZB_E_RANGE;
-    }
-    struct cmd c = { C_MOVE, tgt - pos, speed };
+    int32_t pos = s_pos_steps, delta = 0;
+    int rc = zb_plan_move(target_mm, relative, s_homed, pos, spm, zb_set_get(ZS_MAX_RANGE),
+                          zb_set_get(ZS_HOME_BACKOFF), zb_set_get(ZS_HOME_TO_MAX) != 0.0f, &delta);
+    if (rc != 0) return rc;
+    struct cmd c = { C_MOVE, delta, speed };
     return accept(ZB_MOVING, &c, false);
 }
 
@@ -460,11 +541,10 @@ int zb_move_rel(float dmm, float speed_mm_s) { return move_common(dmm, true, spe
 
 int zb_stop(void)
 {
-    struct cmd c = { C_NOP, 0, 0 };
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_state == ZB_MOVING || s_state == ZB_HOMING) s_stop_req = true;
+    if (s_state == ZB_MOVING || s_state == ZB_HOMING) s_stop_req = true;   /* the op ends with EVT ERR 9 */
     else if (s_state == ZB_CAL) s_cal_abort = true;
-    else if (s_state == ZB_IDLE) { s_state = ZB_MOVING; xQueueSend(s_q, &c, 0); }   /* reports DONE */
+    /* idle: nothing to stop, no event (a stray DONE would complete the next move early) */
     xSemaphoreGive(s_lock);
     return ZB_E_NONE;
 }
@@ -472,17 +552,21 @@ int zb_stop(void)
 void zb_estop(void)
 {
     struct cmd c = { C_NOP, 0, 0 };
+    bool disable = false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_homed = false;
-    if (s_state == ZB_IDLE || s_state == ZB_FAULT) {
-        s_state = ZB_MOVING;
-        xQueueSend(s_q, &c, 0);
+    if (s_state == ZB_IDLE) {
+        disable = true;
+    } else if (s_state == ZB_FAULT) {
+        s_state = ZB_MOVING;                 /* the motion task rebuilds the channel and goes idle */
+        if (xQueueSend(s_q, &c, 0) != pdTRUE) s_state = ZB_FAULT;
     } else if (!s_estop) {
         s_estop = true;
         s_cal_abort = true;
         if (s_chan) rmt_disable(s_chan);   /* halts the running transmission, STEP idles low */
     }
     xSemaphoreGive(s_lock);
+    if (disable) zb_driver_enable(false);
 }
 
 /* ---- calibration primitives ---- */
@@ -492,7 +576,7 @@ bool zb_cal_enter(void)
     bool ok = false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     check_homed_scale();
-    if (s_state == ZB_IDLE && s_homed) {
+    if (s_state == ZB_IDLE && s_homed && !s_fw_update) {
         s_state = ZB_CAL;
         s_cal_abort = false;
         s_stop_req = false;
@@ -504,14 +588,20 @@ bool zb_cal_enter(void)
     return ok;
 }
 
-void zb_cal_leave(void)
+/* trusted: the last sync probe succeeded, so the position is corrected by pos_correction_mm (true minus
+ * believed); otherwise the axis is unhomed (an aborted or failed run stopped somewhere unreferenced). */
+void zb_cal_leave(bool trusted, float pos_correction_mm)
 {
-    if (s_cal_abort) s_homed = false;   /* an aborted run may have stopped anywhere unreferenced */
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool es = s_estop, ab = s_cal_abort;
     s_estop = false;
+    s_cal_abort = false;
     s_stop_req = false;
     if (s_state == ZB_CAL) s_state = ZB_IDLE;
     xSemaphoreGive(s_lock);
+    if (es || ab || !trusted) s_homed = false;
+    else s_pos_steps = s_pos_steps + zb_mm_to_steps(pos_correction_mm, spm_now());
+    if (es) { chan_reset(); zb_driver_enable(false); }
     s_last_active_us = esp_timer_get_time();
 }
 
@@ -525,6 +615,10 @@ int zb_cal_move(float target_mm, float speed, float accel, float decel, bool sto
     if (trigger_mm) *trigger_mm = NAN;
     if (s_state != ZB_CAL || !isfinite(target_mm) || speed <= 0.0f || accel <= 0.0f || decel <= 0.0f)
         return ZB_E_ARG;
+    {   /* stay inside the travel envelope (plus the margin the homing trial needs to reach the switch) */
+        float m = 2.0f * zb_set_get(ZS_HOME_BACKOFF) + 1.0f, hi = zb_set_get(ZS_MAX_RANGE) + m;
+        target_mm = target_mm < -m ? -m : (target_mm > hi ? hi : target_mm);
+    }
     int32_t delta = zb_mm_to_steps(target_mm, spm) - s_pos_steps;
     if (fabsf(zb_steps_to_mm(delta, spm)) > zb_set_get(ZS_MAX_RANGE) + 10.0f) return ZB_E_RANGE;
     struct run r;

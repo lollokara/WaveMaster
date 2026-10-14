@@ -31,6 +31,8 @@
 #define PASS_MAX       63
 #define STA_FAIL_LIMIT 8              /* failed attempts before the provisioning AP comes up alongside */
 #define BEACON_MS      2000
+#define AP_WINDOW_MS   (10 * 60 * 1000)   /* fallback AP stays up this long after the STA gave up */
+#define PING_TIMEOUT_MS 3000              /* no traffic from the client for this long during its move: STOP */
 
 static const char *TAG = "zb_net";
 
@@ -39,6 +41,10 @@ static char s_ssid[SSID_MAX + 1], s_pass[PASS_MAX + 1];
 static bool s_have_creds;
 static volatile bool s_sta_up, s_ap_on;
 static volatile int s_fail_count;
+static bool s_ap_window_used;         /* the post-failure AP window opens once per boot */
+static esp_timer_handle_t s_ap_timer;
+static volatile bool s_client_op;     /* a MOVE/JOG/HOME requested over :7700 is in flight */
+static volatile int64_t s_last_rx_us;
 static char s_sta_ip[16];
 static char s_host[33];
 
@@ -126,6 +132,8 @@ void zb_net_ip(char *buf, size_t n)
     }
 }
 
+/* WPA2-PSK provisioning AP. Password "zbro" + 8 hex chars of the MAC (bytes 2..5), printed on the USB
+ * console at boot, so the owner can always compute it. */
 static void ap_config(wifi_config_t *c)
 {
     uint8_t mac[6];
@@ -133,9 +141,21 @@ static void ap_config(wifi_config_t *c)
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     int l = snprintf((char *)c->ap.ssid, sizeof(c->ap.ssid), "Z-Bro-%02X%02X", mac[4], mac[5]);
     c->ap.ssid_len = (uint8_t)l;
+    snprintf((char *)c->ap.password, sizeof(c->ap.password), "zbro%02x%02x%02x%02x", mac[2], mac[3], mac[4], mac[5]);
     c->ap.channel = 1;
     c->ap.max_connection = 3;
-    c->ap.authmode = WIFI_AUTH_OPEN;
+    c->ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ESP_LOGW(TAG, "provisioning AP '%s' password '%s'", (char *)c->ap.ssid, (char *)c->ap.password);
+}
+
+static void ap_window_end(void *arg)
+{
+    (void)arg;
+    if (s_ap_on && s_have_creds) {                /* window over: STA retries continue, AP off */
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        s_ap_on = false;
+        ESP_LOGW(TAG, "provisioning AP window closed");
+    }
 }
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -147,12 +167,18 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         s_sta_up = false;
         s_sta_ip[0] = '\0';
         if (s_have_creds) {
-            if (++s_fail_count == STA_FAIL_LIMIT && !s_ap_on) {
+            if (++s_fail_count >= STA_FAIL_LIMIT && !s_ap_on && !s_ap_window_used) {
                 wifi_config_t ap;
                 ap_config(&ap);
                 esp_wifi_set_config(WIFI_IF_AP, &ap);
                 esp_wifi_set_mode(WIFI_MODE_APSTA);
                 s_ap_on = true;
+                s_ap_window_used = true;
+                if (!s_ap_timer) {
+                    const esp_timer_create_args_t a = {.callback = ap_window_end, .name = "zb_ap_win"};
+                    esp_timer_create(&a, &s_ap_timer);
+                }
+                if (s_ap_timer) esp_timer_start_once(s_ap_timer, (uint64_t)AP_WINDOW_MS * 1000);
             }
             esp_wifi_connect();
         }
@@ -164,6 +190,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         if (s_ap_on && s_have_creds) {            /* fallback AP no longer needed */
             esp_wifi_set_mode(WIFI_MODE_STA);
             s_ap_on = false;
+            if (s_ap_timer) esp_timer_stop(s_ap_timer);
         }
     }
 }
@@ -197,7 +224,7 @@ static void wifi_start(void)
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
         s_ap_on = true;
-        ESP_LOGW(TAG, "no credentials: provisioning AP '%s'", (char *)ap.ap.ssid);
+        ESP_LOGW(TAG, "no credentials: provisioning AP up");
     }
     ESP_ERROR_CHECK(esp_wifi_start());
     esp_wifi_set_ps(WIFI_PS_NONE);                /* latency over power: motion commands */
@@ -250,6 +277,7 @@ const char *zb_err_text(int code)
     case ZBRO_E_ENDSTOP:   return "endstop";
     case ZBRO_E_HOME_FAIL: return "homing failed";
     case ZBRO_E_FAULT:     return "fault";
+    case ZBRO_E_STOPPED:   return "stopped";
     default:               return "unknown command";
     }
 }
@@ -273,6 +301,7 @@ void zb_net_on_event(enum zb_evt_type type, float pos_mm, int err)
 {
     char b[ZBRO_MAX_LINE];
     int n;
+    s_client_op = false;                          /* any terminal event ends the client's operation */
     switch (type) {
     case ZB_EVT_HOMED: n = zbro_fmt_evt_homed(b, sizeof(b), pos_mm); break;
     case ZB_EVT_DONE:  n = zbro_fmt_evt_done(b, sizeof(b), pos_mm); break;
@@ -281,20 +310,37 @@ void zb_net_on_event(enum zb_evt_type type, float pos_mm, int err)
     send_line(b, n);
 }
 
+/* Send the compact CAL summary (no trials, bounded) as one line: "EVT CAL <json>" or "CAL <json>". */
+static void cal_send(bool evt)
+{
+    const char *pre = evt ? "EVT CAL " : "CAL ";
+    size_t pl = strlen(pre);
+    char *o = malloc(pl + ZB_CAL_COMPACT_MAX + 2);
+    if (!o) return;
+    memcpy(o, pre, pl);
+    size_t n = zb_cal_json_compact(o + pl, ZB_CAL_COMPACT_MAX + 1);
+    if (n > 0) {
+        o[pl + n] = '\n';
+        send_line(o, (int)(pl + n + 1));
+    } else if (!evt) {
+        send_err(ZBRO_E_FAULT, "cal status too long");
+    }
+    free(o);
+}
+
 void zb_net_on_cal(void)
 {
-    char *json = zb_cal_json();
-    if (!json) return;
-    for (char *p = json; *p; p++)
-        if (*p == '\n' || *p == '\r') *p = ' ';
-    size_t sz = strlen(json) + 16;
-    char *b = malloc(sz);
-    if (b) {
-        int n = snprintf(b, sz, "EVT CAL %s\n", json);
-        if (n > 0 && (size_t)n < sz) send_line(b, n);
-        free(b);
-    }
-    free(json);
+    static unsigned last_phase = ~0u;
+    unsigned ph = zb_cal_phase();
+    if (ph == last_phase) return;                 /* progress ticks are not pushed over :7700 */
+    last_phase = ph;
+    if (s_cfd >= 0) cal_send(true);
+}
+
+static void client_op_rc(int rc)
+{
+    if (rc != 0) s_client_op = false;
+    reply_rc(rc);
 }
 
 static void handle_request(const struct zbro_req *r)
@@ -304,44 +350,36 @@ static void handle_request(const struct zbro_req *r)
     case ZBRO_C_HELLO: send_line(b, zbro_fmt_hello(b, sizeof(b), ZB_FW_VERSION)); break;
     case ZBRO_C_PING:  send_line(b, zbro_fmt_ok(b, sizeof(b))); break;
     case ZBRO_C_POS:   send_pos(); break;
-    case ZBRO_C_HOME:  reply_rc(zb_home()); break;
-    case ZBRO_C_MOVE:  reply_rc(zb_move_abs(r->a, r->has_b ? r->b : 0)); break;
-    case ZBRO_C_JOG:   reply_rc(zb_move_rel(r->a, r->has_b ? r->b : 0)); break;
-    case ZBRO_C_STOP:  reply_rc(zb_stop()); break;
-    case ZBRO_C_ESTOP: zb_fleet_note_estop(); zb_estop(); reply_rc(0); break;
+    case ZBRO_C_HOME:  s_client_op = true; client_op_rc(zb_home()); break;
+    case ZBRO_C_MOVE:  s_client_op = true; client_op_rc(zb_move_abs(r->a, r->has_b ? r->b : 0)); break;
+    case ZBRO_C_JOG:   s_client_op = true; client_op_rc(zb_move_rel(r->a, r->has_b ? r->b : 0)); break;
+    case ZBRO_C_STOP:  reply_rc(0); zb_stop(); break;               /* OK first, then the EVT ERR 9 */
+    case ZBRO_C_ESTOP: reply_rc(0); zb_fleet_note_estop(); zb_estop(); break;
     case ZBRO_C_GET: {
         float v;
         if (zb_set_get_by_key(r->key, &v)) send_line(b, zbro_fmt_val(b, sizeof(b), r->key, v));
         else send_err(ZBRO_E_ARG, "unknown key");
         break;
     }
-    case ZBRO_C_SET:
+    case ZBRO_C_SET: {
+        int rc;
         if (zb_set_find(r->key) < 0) send_err(ZBRO_E_ARG, "unknown key");
-        else if (zb_set_set_by_key(r->key, r->a, false) != 0) send_err(ZBRO_E_ARG, "value rejected");
+        else if ((rc = zb_set_set_by_key(r->key, r->a, false)) == ZBRO_E_BUSY) send_err(ZBRO_E_BUSY, "busy");
+        else if (rc != 0) send_err(ZBRO_E_ARG, "value rejected");
         else reply_rc(0);
         break;
-    case ZBRO_C_SAVE: zb_set_save(); reply_rc(0); break;
+    }
+    case ZBRO_C_SAVE: reply_rc(zb_set_save() == 0 ? 0 : ZBRO_E_BUSY); break;
     case ZBRO_C_CAL:
         if (r->cal_op == ZBRO_CAL_STATUS) {
-            char *json = zb_cal_json();
-            if (!json) { send_err(ZBRO_E_FAULT, "no memory"); break; }
-            for (char *p = json; *p; p++)
-                if (*p == '\n' || *p == '\r') *p = ' ';
-            size_t sz = strlen(json) + 16;
-            char *o = malloc(sz);
-            if (o) {
-                int n = zbro_fmt_cal(o, sz, json);
-                send_line(o, n);
-                free(o);
-            }
-            free(json);
+            cal_send(false);
         } else if (r->cal_op == ZBRO_CAL_ABORT) {
             zb_cal_abort();
             reply_rc(0);
         } else {
             const char *t[ZBRO_CAL_TESTS];
             for (int i = 0; i < r->ntests; i++) t[i] = r->tests[i];
-            reply_rc(zb_cal_start(t, r->ntests) ? 0 : ZBRO_E_BUSY);
+            reply_rc(zb_cal_start(t, r->ntests));
         }
         break;
     }
@@ -357,6 +395,15 @@ static void set_client_opts(int fd)
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 }
 
+/* The client is gone (or silent) while its move/home runs: nobody can stop it, so decelerate to a halt. */
+static void stop_orphan_op(const char *why)
+{
+    if (!s_client_op) return;
+    s_client_op = false;
+    ESP_LOGW(TAG, "%s during a move: stopping", why);
+    zb_stop();
+}
+
 static void drop_client(void)
 {
     xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
@@ -365,6 +412,7 @@ static void drop_client(void)
         s_cfd = -1;
     }
     xSemaphoreGive(s_tx_mtx);
+    stop_orphan_op("client disconnected");
 }
 
 static void tcp_task(void *arg)
@@ -413,6 +461,7 @@ static void tcp_task(void *arg)
                 zbro_lines_init(&lines);
                 xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
                 s_cfd = nfd;
+                s_last_rx_us = esp_timer_get_time();
                 xSemaphoreGive(s_tx_mtx);
                 cfd = nfd;
                 ESP_LOGI(TAG, "S3 connected");
@@ -425,6 +474,7 @@ static void tcp_task(void *arg)
                 ESP_LOGI(TAG, "S3 disconnected");
                 cfd = -1;
             }
+            if (r > 0) s_last_rx_us = esp_timer_get_time();
             for (int i = 0; i < r; i++) {
                 const char *line;
                 size_t len;
@@ -439,6 +489,9 @@ static void tcp_task(void *arg)
                 }
             }
         }
+
+        if (cfd >= 0 && s_client_op && esp_timer_get_time() - s_last_rx_us > (int64_t)PING_TIMEOUT_MS * 1000)
+            stop_orphan_op("no PING for 3 s");
 
         /* POS reports: every rpt_hz while moving, once more when the axis comes to rest. */
         if (cfd >= 0) {

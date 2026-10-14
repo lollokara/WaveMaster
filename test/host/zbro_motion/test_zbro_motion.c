@@ -165,8 +165,69 @@ static void test_settings(void)
     free(buf);
 }
 
+static void test_limits(void)
+{
+    int32_t d = 0;
+    const float spm = 400.0f;   /* 200 steps * 16 / 8 mm */
+
+    /* M3: no int32 overflow, whatever the input */
+    CHECK(zb_mm_to_steps(1.0e9f, 1.6e5f) == 1000000000);
+    CHECK(zb_mm_to_steps(-1.0e9f, 1.6e5f) == -1000000000);
+    CHECK(zb_mm_to_steps(NAN, spm) == 0);
+    CHECK(zb_mm_to_steps(2.5f, spm) == 1000);
+    CHECK(zb_plan_move(1.0e9f, false, true, 0, 1.6e5f, 50, 2, true, &d) == 3);
+    CHECK(zb_plan_move(1.0e9f, true, false, 0x7fffff00, 1.6e5f, 50, 2, true, &d) == 3);
+    CHECK(zb_plan_move(-1.0e9f, true, true, 0, 1.6e5f, 50, 2, true, &d) == 3);
+    CHECK(zb_plan_move(INFINITY, false, true, 0, spm, 50, 2, true, &d) == 4);
+    CHECK(zb_plan_move(NAN, true, false, 0, spm, 50, 2, true, &d) == 4);
+    CHECK(zb_plan_move(60.0f, true, false, 0, spm, 50, 2, true, &d) == 3);     /* jog larger than the range */
+    CHECK(zb_plan_move(10.0f, true, false, 0x7ffff000, spm, 50, 2, true, &d) == 3);   /* pos + delta would wrap */
+    CHECK(zb_plan_move(10.0f, true, false, 100, spm, 50, 2, true, &d) == 0 && d == 4000);
+
+    /* M4: soft limit stays `back` inside the trigger */
+    int32_t lo, hi;
+    zb_soft_limits(20000, 800, true, &lo, &hi);
+    CHECK(lo == 0 && hi == 19200);
+    zb_soft_limits(20000, 800, false, &lo, &hi);
+    CHECK(lo == 800 && hi == 20000);
+    zb_soft_limits(100, 800, true, &lo, &hi);                                  /* back-off larger than half the range */
+    CHECK(lo == 0 && hi == 50);
+    CHECK(zb_plan_move(50.0f, false, true, 0, spm, 50, 2, true, &d) == 3);     /* the trigger point itself */
+    CHECK(zb_plan_move(48.0f, false, true, 0, spm, 50, 2, true, &d) == 0 && d == 19200);
+    CHECK(zb_plan_move(48.01f, false, true, 0, spm, 50, 2, true, &d) == 3);
+    CHECK(zb_plan_move(0.0f, false, true, 5000, spm, 50, 2, true, &d) == 0 && d == -5000);
+    CHECK(zb_plan_move(0.0f, false, true, 5000, spm, 50, 2, false, &d) == 3);  /* homing to min: 0 is the trigger */
+    CHECK(zb_plan_move(2.0f, false, true, 5000, spm, 50, 2, false, &d) == 0 && d == -4200);
+    CHECK(zb_plan_move(-1.0f, false, true, 0, spm, 50, 2, true, &d) == 3);
+    CHECK(zb_plan_move(51.0f, false, true, 0, spm, 50, 2, true, &d) == 3);
+
+    /* M5: homing speed bound, and the settings range that enforces it */
+    CHECK(fabsf(zb_home_speed_limit(100.0f, 2.0f) - 20.0f) < 1e-3f);
+    CHECK(fabsf(zb_home_speed_limit(1.0f, 0.5f) - 1.0f) < 1e-3f);
+    CHECK(zb_home_speed_limit(0.0f, 2.0f) == 0.0f);
+    {
+        float v[ZS_COUNT] = {0}, l, h;
+        for (int i = 0; i < ZS_COUNT; i++) v[i] = zbc_defs[i].def;
+        zbc_range(v, ZS_HOME_FAST, &l, &h);
+        CHECK(h == 20.0f);                                   /* sqrt(2 * 100 * 2) */
+        CHECK(zbc_validate(v, ZS_HOME_FAST, 20.0f) == 0);
+        CHECK(zbc_validate(v, ZS_HOME_FAST, 21.0f) == 4);
+        v[ZS_DECEL] = 1.0f; v[ZS_HOME_BACKOFF] = 0.5f;
+        CHECK(zbc_validate(v, ZS_HOME_FAST, 2.0f) == 4);
+        CHECK(zbc_validate(v, ZS_HOME_FAST, 1.0f) == 0);
+        for (int i = 0; i < ZS_COUNT; i++) v[i] = 0.0f;      /* NVS load validates against an empty table */
+        CHECK(zbc_validate(v, ZS_HOME_FAST, 10.0f) == 0);
+    }
+
+    /* M12: scale/timing keys */
+    CHECK(zbc_is_scale_key(ZS_MICROSTEP) && zbc_is_scale_key(ZS_STEPS_REV) && zbc_is_scale_key(ZS_LEAD_MM) &&
+          zbc_is_scale_key(ZS_PULSE_US) && zbc_is_scale_key(ZS_DIR_INVERT));
+    CHECK(!zbc_is_scale_key(ZS_MAX_SPEED) && !zbc_is_scale_key(ZS_ACCEL));
+}
+
 int main(void)
 {
+    test_limits();
     test_profile();
     test_math();
     test_settings();
