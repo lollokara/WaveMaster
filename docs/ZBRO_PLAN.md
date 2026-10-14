@@ -58,13 +58,13 @@ Requests (S3 → C3), replies are in order, one per request:
 | `HOME` | `OK` (accepted) … later `EVT HOMED <mm>` or `EVT ERR <code>` |
 | `MOVE <mm> [<mm/s>]` (absolute) | `OK` … later `EVT DONE <mm>` or `EVT ERR <code>` |
 | `JOG <dmm> [<mm/s>]` (relative) | as MOVE |
-| `STOP` (decelerate with decel) / `ESTOP` (halt now, axis becomes unhomed) | `OK` then `EVT DONE <mm>` |
+| `STOP` (decelerate with decel) / `ESTOP` (halt now, axis becomes unhomed) | `OK` first, then (only if a MOVE/JOG/HOME was interrupted) `EVT ERR 9`; a STOP while idle only replies `OK` and emits nothing. ESTOP also disables the driver |
 | `GET <key>` / `SET <key> <value>` / `SAVE` | `VAL <key> <value>` / `OK` / `OK` ; invalid → `ERR <code> <text>` |
 | `CAL <start [tests…]\|abort\|status>` | `OK` / `CAL <json>` |
 
 `<state>` ∈ `IDLE MOVING HOMING CAL FAULT`. Unsolicited lines: `POS …` (every `rpt_hz` while moving, once on stop),
 `EVT HOMED|DONE|ERR|CAL …`. Error codes: 1 busy, 2 not homed, 3 out of range, 4 bad argument, 5 endstop hit
-unexpectedly, 6 homing failed (no trigger within range), 7 fault, 8 unknown command, 9 stopped (move interrupted by STOP/ESTOP/link loss; sent as `EVT ERR 9`, never as DONE). Position is in mm,
+unexpectedly, 6 homing failed (no trigger within range), 7 fault, 8 unknown command, 9 stopped (move interrupted by STOP/ESTOP/link loss; sent as `EVT ERR 9`, never as DONE; also sent after link loss or no traffic for 3 s during a move the client started). Position is in mm,
 0 = home reference (see `home_to_max`). Moves are rejected (`ERR 2`) while not homed, except `HOME`/`ESTOP`/`JOG` with
 `SET allow_unhomed 1`. Max line 128 bytes. The C3 never moves without a command.
 
@@ -85,10 +85,26 @@ working value to 80 %.
 Tests: `endstop` (10 probes → repeatability in µm, picks `es_debounce_us`), `speed` (max_speed, step-rate bound ≤ ~100 kHz),
 `accel`, `decel`, `homing` (home_fast: highest speed that still stops inside `home_backoff`). Progress/results via
 `/api/cal`, `/ws`, `CAL status`. Abort at any time (STOP + unhomed).
+After a successful run the final sync probe corrects the position by the measured offset and the axis stays
+homed; after an abort or a fatal error (motion error, probe failed) the zero is unknown and the axis is unhomed
+(`needs_home`). Over :7700 `CAL status` and `EVT CAL` carry a compact summary (no `trials`, bounded to under
+1 KB, `EVT CAL` only on state changes, not per trial); the full JSON with trials is web/WS only.
+Endstop position: the ISR captures the step counter plus a linear share of the chunk in flight (chunk start
+timestamp), so the trigger position is good to about one step at probe speeds (exactly one step for the 1-step
+chunks of the slow probe), not "exact"; `es_repeat_um` includes that uncertainty.
+
+Safety rules in the C3: the usable range is `[0, max_range - home_backoff]` when homing to max (`[home_backoff,
+max_range]` when homing to min), so a move to the end of travel never trips the endstop; homing speeds are clamped
+so the braking distance `v^2/(2*decel)` fits in `home_backoff` (also enforced by the `home_fast` range); homing
+approaches at `home_slow` for the first `2*home_backoff` of travel, then at `home_fast`; targets are range-checked
+in the float domain before conversion to steps; `microstep`, `steps_rev`, `lead_mm`, `pulse_us`, `dir_invert` can
+only change while IDLE; settings saves (NVS commits) and WiFi/hub writes are refused (`BUSY`) while the axis is
+moving, and the RMT/GPIO ISRs are IRAM-safe (`CONFIG_RMT_ISR_IRAM_SAFE`); ESTOP and FAULT disable the driver; a
+failed HOME leaves the position at 0.000 and unhomed; `PUT /api/settings` is all-or-nothing.
 
 ## 6. REST / WebSocket (web UI contract)
 
-`GET /api/status` → `{"pos":0,"state":"IDLE","homed":false,"endstop":false,"fw":"","rssi":-60,"s3":true,"uptime":0}`
+`GET /api/status` → `{"pos":0,"state":"IDLE","homed":false,"endstop":false,"fw":"","rssi":-60,"client":true,"uptime":0}`
 `GET /api/settings` → `{"groups":[{"name":"Motion","items":[{"key","label","value","min","max","step","unit","type":"number|bool|enum","options":[]}]}]}`
 `PUT /api/settings` `{key:value,…}` → saved (400 with `{"error","key"}` on invalid)
 `POST /api/move {"z","f"}` `/api/jog {"dz","f"}` `/api/home` `/api/stop` `/api/estop`
@@ -149,13 +165,12 @@ glue: `CompanionZ/main/zb_fleet.{c,h}`.
 - **Motion path**: untouched. The motion and cal tasks only bump counters and post to a 16-entry queue / task
   notification (never blocking); metrics, logging and HTTP are done by the `zb_fleet` and agent tasks.
 - **Commands** (hub `ALLOWED`: reboot, identify, ota, ping, factory_reset): `identify` logs and sets an extra (no
-  motion); `stop`, `estop`, `home` (only when IDLE), `health`, `calstatus` are accepted if a hub sends them; no
-  arbitrary moves; `factory_reset` is unsupported.
-- **OTA safety**: the agent calls the gate callback first. `ota` is refused unless the axis is IDLE (the driver is then
-  disabled before flash writes); `reboot`/`restart` E-stop a moving axis and disable the driver first. Rollback is on
+  motion); `stop`, `estop`, `health`, `calstatus` are accepted; `home`, moves and `factory_reset` are not (the hub
+  can never start motion).
+- **OTA safety**: the agent calls the gate callback first. `ota` is refused unless the axis is IDLE; once accepted the driver is disabled and the
+  C3 refuses all motion (`BUSY`) until the reboot (`s_fw_update`); `reboot`/`restart` E-stop a moving axis and disable the driver first. Rollback is on
   (`CONFIG_APP_ROLLBACK_ENABLE`): the agent confirms the image after the first hub heartbeat, `zb_fleet` after 90 s if
-  WiFi (or the provisioning AP) is up. Known gap: a move commanded by the S3 or the web UI during the ~20 s download
-  is not blocked; flash writes can disturb step timing, so do not move during an update.
+  WiFi (or the provisioning AP) is up.
 - **Partitions** (4 MB): `nvs` 24 KB, `otadata` 8 KB, `phy_init`, `ota_0`/`ota_1` 1.5 MB each, `storage` (LittleFS)
   256 KB, 0x360000-0x400000 spare. The layout changed from the single-app table, so the first flash must be a full
   USB flash: `pio run -t upload && pio run -t uploadfs` (OTA cannot change the partition table).
