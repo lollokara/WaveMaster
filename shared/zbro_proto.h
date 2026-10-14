@@ -11,7 +11,7 @@
 #define ZBRO_PORT_UDP   7701
 #define ZBRO_PROTO_VER  1
 #define ZBRO_MAX_LINE   128          /* max request length, bytes excluding the terminating '\n' */
-#define ZBRO_MAX_REPLY  512          /* max reply/line the assembler accepts (CAL json replies are long) */
+#define ZBRO_MAX_REPLY  1536         /* max reply/line the assembler accepts (CAL json replies are long) */
 #define ZBRO_KEY_MAX    24
 #define ZBRO_CAL_TESTS  8
 #define ZBRO_CAL_NAME   16
