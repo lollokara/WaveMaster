@@ -19,7 +19,7 @@
 /* Error codes (same numbers as enum zb_err in zb_motion.h). */
 enum {
     ZBRO_E_NONE = 0, ZBRO_E_BUSY = 1, ZBRO_E_NOT_HOMED = 2, ZBRO_E_RANGE = 3, ZBRO_E_ARG = 4,
-    ZBRO_E_ENDSTOP = 5, ZBRO_E_HOME_FAIL = 6, ZBRO_E_FAULT = 7, ZBRO_E_UNKNOWN = 8
+    ZBRO_E_ENDSTOP = 5, ZBRO_E_HOME_FAIL = 6, ZBRO_E_FAULT = 7, ZBRO_E_UNKNOWN = 8, ZBRO_E_STOPPED = 9
 };
 
 /* ---- requests (S3 -> C3) ---- */

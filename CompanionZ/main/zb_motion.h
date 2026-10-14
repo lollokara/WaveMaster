@@ -11,7 +11,7 @@ enum zb_state { ZB_IDLE, ZB_MOVING, ZB_HOMING, ZB_CAL, ZB_FAULT };
 
 /* Error codes shared with the COM protocol (EVT ERR <code>). */
 enum zb_err { ZB_E_NONE = 0, ZB_E_BUSY = 1, ZB_E_NOT_HOMED = 2, ZB_E_RANGE = 3, ZB_E_ARG = 4,
-              ZB_E_ENDSTOP = 5, ZB_E_HOME_FAIL = 6, ZB_E_FAULT = 7, ZB_E_UNKNOWN = 8 };
+              ZB_E_ENDSTOP = 5, ZB_E_HOME_FAIL = 6, ZB_E_FAULT = 7, ZB_E_UNKNOWN = 8, ZB_E_STOPPED = 9 };
 
 enum zb_evt_type { ZB_EVT_HOMED, ZB_EVT_DONE, ZB_EVT_ERR };
 /* Called from the motion task (not an ISR) on completion of HOME/MOVE/JOG/STOP or on error. */

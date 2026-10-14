@@ -54,7 +54,7 @@ Requests (S3 → C3), replies are in order, one per request:
 
 `<state>` ∈ `IDLE MOVING HOMING CAL FAULT`. Unsolicited lines: `POS …` (every `rpt_hz` while moving, once on stop),
 `EVT HOMED|DONE|ERR|CAL …`. Error codes: 1 busy, 2 not homed, 3 out of range, 4 bad argument, 5 endstop hit
-unexpectedly, 6 homing failed (no trigger within range), 7 fault, 8 unknown command. Position is in mm,
+unexpectedly, 6 homing failed (no trigger within range), 7 fault, 8 unknown command, 9 stopped (move interrupted by STOP/ESTOP/link loss; sent as `EVT ERR 9`, never as DONE). Position is in mm,
 0 = home reference (see `home_to_max`). Moves are rejected (`ERR 2`) while not homed, except `HOME`/`ESTOP`/`JOG` with
 `SET allow_unhomed 1`. Max line 128 bytes. The C3 never moves without a command.
 
