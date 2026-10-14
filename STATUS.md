@@ -121,6 +121,8 @@ Unverified on hardware:
 - `Z` in `G0` / `G1`, `$HZ`, `$ZSTOP`, `$ZGET` / `$ZSET` / `$ZSAVE` / `$ZCAL` against the real axis.
 - Hold / Ctrl-X sending `STOP` during a Z move, and the abort path after a reset (the grbl task waits up to 1.5 s for the
   `EVT` of the stop so a late event cannot complete the next move).
+- Alarm path (`ALARM:3`, `error:9` lockout, `$X`) with Rayforge, and `EVT ERR 9` / DONE-tolerance handling against the new C3 firmware.
+- Beacon source-address check and `$250` gating of the link.
 - Real Z in `MPos`, state `Run` during a Z move, stack use of the `zbro` task (4.5 KB).
 
 ## Open items

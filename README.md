@@ -278,7 +278,9 @@ let G-code drive it.
   arrive. `G90` / `G91` and `G20` / `G21` apply. `$252` sets the speed (`F` is not used for Z). Errors: the C3 is offline,
   out of range (`error:15`), timeout, not homed, link lost (`error:20`, the reason is in a `[MSG:]` line). With `$250=0` the `Z` word is ignored.
 - `MPos:x,y,z` in the status report shows the real Z position (0.000 when `$250=0`). While a Z move runs the state is `Run`.
-- Feed hold (`!`) or Ctrl-X during a Z move sends `STOP` (the axis decelerates); the Z line then ends with an error.
+- Feed hold (`!`) or Ctrl-X during a Z move sends `STOP` (the axis decelerates). A failed or stopped Z move ends with
+  `error:20` and `ALARM:3` (state `Alarm`, further G-code answers `error:9`) so the job stops; `$X` or Ctrl-X clears it.
+  A hold is not resumable for Z. Relative `G91 Z` reads the real position first.
 
 | Command | Action |
 |:---|:---|
@@ -290,7 +292,7 @@ let G-code drive it.
 | `$ZSAVE` | Store the C3 settings in its flash. |
 | `$ZCAL[=tests]` / `$ZCAL=ABORT` | Start calibration (all tests, or e.g. `$ZCAL=speed,accel`), abort it. `$ZCAL` alone prints the status JSON. |
 
-The `$Z` proxies work whenever the link is up, also with `$250=0`. Everything touching the real C3 is unverified on
+The link is only started with `$250=1`; with `$250=0` the `$Z` proxies report offline. Everything touching the real C3 is unverified on
 hardware: see [STATUS.md](STATUS.md).
 
 ---

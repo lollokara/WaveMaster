@@ -31,7 +31,17 @@ A4988 limits: 1/16 maximum microstep, min STEP high/low 1 µs, motor current set
   (`joltwallet/littlefs` component) for the gzipped Vite build.
 - Network: HTTP :80 (UI + REST + `/ws`), **TCP :7700 COM link**, **UDP :7701 beacon**
   (`ZBRO 1 <ip> 7700 <hostname>` broadcast every 2 s) so the S3 finds the C3 without config. mDNS `zbro.local`.
-  Provisioning: no stored credentials → SoftAP `Z-Bro-XXXX` with the same web UI (WiFi page).
+  Provisioning: SoftAP `Z-Bro-XXXX` with the same web UI (WiFi page), **WPA2-PSK**, password `zbro` + 8 hex
+  characters derived from the MAC (so the owner can compute it); printed on the USB console at boot and shown as a
+  hint on the UI's WiFi page while in AP mode. The AP is up only while no credentials are stored, or for a
+  10-minute window after the STA failed N reconnects, then it shuts off and STA retries resume. It never stays on
+  next to a working STA.
+- **Trust model: the LAN is trusted.** There is no authentication on TCP :7700, REST/WebSocket or OTA. Implications:
+  any host on the LAN (or on the provisioning AP) can move, home, stop, change settings (`max_range`, `es_invert`),
+  reconfigure WiFi / the fleet hub, reboot and push OTA; a second client on :7700 replaces the S3 link; OTA is
+  verified only by a hub-supplied SHA-256 over plain HTTP (no signature). The fleet hub may only send
+  identify / stop / estop. Keep the Z-Bro on a private network and do not expose :7700 / :80 beyond it.
+  (The C3 firmware side of the AP policy is tracked in `CompanionZ/`; this text is the design contract.)
 - S3: `zbro_link` task (core 1, prio 4) owns the socket; G-code Z moves are executed by the `grbl` task
   after `wait_idle()` (laser is gated off, XY pipeline empty), so the streaming path is never touched.
   Never call it from `dac_task`/`motion` tasks/ISRs.
@@ -92,8 +102,12 @@ gzipped into `CompanionZ/data/` for LittleFS. No UI kit, no stock gradients/emoj
 Settings: `$250` Z-Bro enable (0), `$251` Z move timeout s (60), `$252` default Z speed mm/s (0 = C3's max_speed).
 G-code: `Z<n>` in G0/G1 (absolute/relative follows G90/G91; metres/inches follow G20/G21) → barrier, `MOVE`, wait `DONE`.
 `$HZ` home, `$ZSTOP`, `$Z` status line, `$ZGET key` / `$ZSET key=value` / `$ZSAVE` / `$ZCAL[=tests|ABORT]` proxy to the C3.
-Status report shows the real Z in `MPos:x,y,z`. Hold/Ctrl-X during a Z move sends `STOP`. Link lost mid-move → alarm-style
-error for the job, never blocks `?`. Offline Z-Bro (not found) → Z words error out (`error:20`-class) only when `$250=1`;
+Status report shows the real Z in `MPos:x,y,z`. Hold/Ctrl-X during a Z move sends `STOP`. Any Z move / home that
+may have left the axis at the wrong height (stop, `EVT ERR 9`, DONE away from the target, timeout, link lost, C3
+fault) ends the line with `error:20` and raises `ALARM:3` (status `Alarm`, G-code lines answered `error:9`) so the host
+stops streaming; `$X` or a reset clears it. A Hold during a Z move is therefore an Alarm: the move is not resumed.
+Relative (G91) Z queries `POS` first. The link only runs with `$250=1`, and a beacon is accepted only from the address
+it announces. Aborted / timed-out / link-failed requests always send `STOP`. Never blocks `?`. Offline Z-Bro (not found) → Z words error out (`error:20`-class) only when `$250=1`;
 with `$250=0` Z words are ignored as today.
 
 ## 8. Work packages (parallel; each agent commits only its own paths, no co-author trailer)
