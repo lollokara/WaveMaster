@@ -135,6 +135,7 @@ Flow control is end to end. `motion_submit()` blocks while the segment queue is 
 | `src/host_serial.{c,h}` | USB-Serial-JTAG driver, host RX task, realtime bytes, `[MSG:...]` logging. |
 | `src/net_wifi.{c,h}` | WiFi station manager (core 1), credentials in NVS, the `$WIFI` command. Off unless `$240=1`. |
 | `src/net_server.{c,h}` | Raw TCP host link on port 23: one client, keepalive, second transport for `host_serial`. |
+| `src/zbro_link.{c,h}` | Z-Bro client (core 1, prio 4): finds the ESP32-C3 Z axis by its UDP beacon, TCP link, `HOME` / `MOVE` / `STOP`. |
 | `src/grbl.{c,h}` | GRBL 1.1 front end: line parser, modal state, `$` commands, status reports, reset handling. |
 | `src/gcode_parse.{c,h}` | Word parser, arc linearisation, feed and power mapping. |
 | `src/calib.{c,h}` | Settings table (`s_defs`), NVS persistence, `$$` dump. |
@@ -216,6 +217,9 @@ A number in brackets is an alias that writes the same value.
 | `$230` | Gate (EMISSION MODULATION) active low (0/1). Check `docs/WIRING.md` before changing. | 0 | 0 … 1 | `gatelow` |
 | `$231` | Auto guide laser for framing: guide on while moving with `M3 S0` (Rayforge's Frame), off at `M5` / `M4` / S>0 (0/1). | 1 | 0 … 1 | `autoguide` |
 | `$240` | WiFi host link on (0/1). Needs credentials from `$WIFI=ssid,password`. See the WiFi section. | 0 | 0 … 1 | `wifien` |
+| `$250` | Z-Bro wireless Z axis on (0/1). 0 = `Z` words are ignored. See the Z-Bro section. | 0 | 0 … 1 | `zbroen` |
+| `$251` | Z-Bro move / home timeout, s. | 60 | 1 … 600 | `zbrotmo` |
+| `$252` | Z-Bro speed for G-code Z moves, mm/s. 0 = the C3's `max_speed`. | 0 | 0 … 1000 | `zbrospd` |
 
 Read-only GRBL values (`$0`, `$1`, `$2`, `$4`-`$6`, `$10`, `$11`, `$20`-`$27`, `$31`, `$32`, `$102`, `$112`, `$122`, `$132`) are reported for sender compatibility and ignored when set.
 
@@ -260,6 +264,34 @@ Rules to know:
   trusted or separate network. The laser still has to be armed, and the ATmega interlocks are unchanged.
 - Settings changes (`$240`, credentials) apply within about a second, no reboot needed.
 - Not verified on hardware yet: see [STATUS.md](STATUS.md).
+
+---
+
+## 🧱 Z-Bro (wireless Z axis)
+
+An ESP32-C3 with an A4988 stepper driver on the same WiFi network (firmware in `CompanionZ/`, design in
+[docs/ZBRO_PLAN.md](docs/ZBRO_PLAN.md)). The S3 finds it by its UDP beacon on port 7701, connects to TCP port 7700 and
+keeps the link alive with a `PING` every second. It only runs while the WiFi station is up (`$240=1`). Set `$250=1` to
+let G-code drive it.
+
+- `G0` / `G1` with `Z<n>`: waits for the XY queue to drain (laser gated off), then moves the axis and waits for it to
+  arrive. `G90` / `G91` and `G20` / `G21` apply. `$252` sets the speed (`F` is not used for Z). Errors: the C3 is offline,
+  out of range (`error:15`), timeout, not homed, link lost (`error:20`, the reason is in a `[MSG:]` line). With `$250=0` the `Z` word is ignored.
+- `MPos:x,y,z` in the status report shows the real Z position (0.000 when `$250=0`). While a Z move runs the state is `Run`.
+- Feed hold (`!`) or Ctrl-X during a Z move sends `STOP` (the axis decelerates); the Z line then ends with an error.
+
+| Command | Action |
+|:---|:---|
+| `$Z` | Status line: `[ZBRO:enabled=1 link=up ip=... fw=... pos=... state=IDLE homed=1 endstop=0]` |
+| `$HZ` | Home the axis (waits up to `$251` s). |
+| `$ZSTOP` | `STOP` (decelerate). |
+| `$ZGET key` | Read a C3 setting: `[ZBRO:VAL key value]`. |
+| `$ZSET key=value` | Write a C3 setting (case of the value is kept). |
+| `$ZSAVE` | Store the C3 settings in its flash. |
+| `$ZCAL[=tests]` / `$ZCAL=ABORT` | Start calibration (all tests, or e.g. `$ZCAL=speed,accel`), abort it. `$ZCAL` alone prints the status JSON. |
+
+The `$Z` proxies work whenever the link is up, also with `$250=0`. Everything touching the real C3 is unverified on
+hardware: see [STATUS.md](STATUS.md).
 
 ---
 

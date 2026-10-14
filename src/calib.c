@@ -60,6 +60,9 @@ static const struct calib_def s_defs[CAL_COUNT] = {
     [CAL_GATE_ACTIVE_LOW]    = { 230,  -1, "gatelow",   0.0f,      0.0f,        1.0f },
     [CAL_AUTO_GUIDE]         = { 231,  -1, "autoguide", 1.0f,      0.0f,        1.0f },
     [CAL_WIFI_EN]            = { 240,  -1, "wifien",    0.0f,      0.0f,        1.0f },
+    [CAL_ZBRO_EN]            = { 250,  -1, "zbroen",    0.0f,      0.0f,        1.0f },
+    [CAL_ZBRO_TIMEOUT_S]     = { 251,  -1, "zbrotmo",   60.0f,     1.0f,        600.0f },
+    [CAL_ZBRO_SPEED]         = { 252,  -1, "zbrospd",   0.0f,      0.0f,        1000.0f },
 };
 
 /* Read-only GRBL settings reported for sender compatibility. */
@@ -83,7 +86,7 @@ static bool flags_are_integral(enum calib_id id)
 {
     return id == CAL_AXIS_INVERT || id == CAL_SWAP_XY || id == CAL_ORIGIN_CENTER ||
            id == CAL_POWER_MODE || id == CAL_AUTO_ARM || id == CAL_GATE_ACTIVE_LOW ||
-           id == CAL_AUTO_GUIDE ||
+           id == CAL_AUTO_GUIDE || id == CAL_ZBRO_EN || id == CAL_ZBRO_TIMEOUT_S ||
            id == CAL_PD_PERIOD;
 }
 

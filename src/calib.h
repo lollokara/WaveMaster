@@ -53,6 +53,10 @@
  *        M3 S0 (Rayforge's Frame), off at M5 / M4 / S>0 (0/1)       [1]
  *  $240  WiFi host link on (0/1): needs credentials set with $WIFI=ssid,password
  *        (see README); read at runtime, off by default                [0]
+ *  $250  Z-Bro (wireless Z axis) on (0/1): Z words in G0/G1 move it;
+ *        0 = Z words are ignored                                      [0]
+ *  $251  Z-Bro move / home timeout, s                                 [60]
+ *  $252  Z-Bro speed for G-code Z moves, mm/s, 0 = the C3's max_speed [0]
  */
 
 #include <stdbool.h>
@@ -95,6 +99,9 @@ enum calib_id {
     CAL_GATE_ACTIVE_LOW,
     CAL_AUTO_GUIDE,
     CAL_WIFI_EN,
+    CAL_ZBRO_EN,
+    CAL_ZBRO_TIMEOUT_S,
+    CAL_ZBRO_SPEED,
     CAL_COUNT
 };
 

@@ -10,6 +10,7 @@
 #include "laser_io.h"
 #include "motion_task.h"
 #include "net_wifi.h"
+#include "zbro_link.h"
 
 static const char *TAG = "wavemaster";
 
@@ -39,6 +40,8 @@ void app_main(void)
         ESP_LOGE(TAG, "GRBL task failed to start");
     if (!net_wifi_start())               /* idle unless $240 = 1 and credentials are stored */
         ESP_LOGE(TAG, "network manager failed to start");
+    if (!zbro_link_start())              /* idle until the WiFi station is up */
+        ESP_LOGE(TAG, "Z-Bro link failed to start");
 
     if (hw_ok)
         ESP_LOGI(TAG, "ready: tick %.2f us, field %.0fx%.0f mm, scale %.4f/%.4f V/mm",

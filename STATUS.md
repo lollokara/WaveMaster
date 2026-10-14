@@ -111,6 +111,18 @@ Work through this in order. Do the first steps with the laser disconnected.
 
 Tuning and test patterns: `tools/stream_test.py` generates grids, circles, ladders and squares. It runs in preview (`M66`) unless `--fire` is given.
 
+## Z-Bro S3 side (branch `feature/wifi-ota-printing`)
+
+Built (`pio run`, zero warnings in `src/`, flash 84 %), host tests pass. Nothing here has run against a real C3 yet.
+
+Unverified on hardware:
+
+- Beacon discovery, TCP connect, `HELLO`, `PING` keepalive and reconnect with backoff.
+- `Z` in `G0` / `G1`, `$HZ`, `$ZSTOP`, `$ZGET` / `$ZSET` / `$ZSAVE` / `$ZCAL` against the real axis.
+- Hold / Ctrl-X sending `STOP` during a Z move, and the abort path after a reset (the grbl task waits up to 1.5 s for the
+  `EVT` of the stop so a late event cannot complete the next move).
+- Real Z in `MPos`, state `Run` during a Z move, stack use of the `zbro` task (4.5 KB).
+
 ## Open items
 
 - `START_LATENCY_COUNTS` in `src/dac_task.c` is 0 and needs measuring (item 4).

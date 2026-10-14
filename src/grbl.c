@@ -50,6 +50,8 @@
 #include "motion_task.h"
 #include "net_server.h"
 #include "net_wifi.h"
+#include "zbro_link.h"
+#include "zbro_proto.h"
 
 static const char *TAG = "grbl";
 
@@ -91,6 +93,7 @@ static uint32_t s_gen_seen;               /* GRBL task only */
 static volatile float s_jc_x, s_jc_y;
 static volatile bool s_jc_pending;
 static volatile bool s_jog_active;
+static volatile bool s_z_busy;            /* grbl task is waiting for a Z-Bro move / home */
 static volatile uint32_t s_acked;         /* bytes the host may consider free */
 static uint32_t s_consumed;               /* GRBL task only */
 static volatile float s_pub_wco_x, s_pub_wco_y, s_pub_feed, s_pub_s;
@@ -187,6 +190,42 @@ static bool wait_idle(void)
     return s_reset_gen == s_gen_seen;
 }
 
+static bool z_aborted(void)
+{
+    return s_reset_gen != s_gen_seen;
+}
+
+/* Maps a zbro_link error to a GRBL error code and logs the reason. */
+static int z_fail(int e)
+{
+    const char *why;
+
+    if (e == 0)
+        return 0;
+    switch (e) {
+    case ZBRO_ERR_OFFLINE: why = "not connected"; break;
+    case ZBRO_ERR_TIMEOUT: why = "timeout"; break;
+    case ZBRO_ERR_ABORTED: why = "stopped"; break;
+    case ZBRO_ERR_LINK:    why = "link lost"; break;
+    case ZBRO_E_BUSY:      why = "axis busy"; break;
+    case ZBRO_E_NOT_HOMED: why = "not homed ($HZ)"; break;
+    case ZBRO_E_RANGE:     why = "target out of range"; break;
+    case ZBRO_E_ARG:       why = "bad argument"; break;
+    case ZBRO_E_ENDSTOP:   why = "unexpected endstop"; break;
+    case ZBRO_E_HOME_FAIL: why = "homing failed"; break;
+    case ZBRO_E_FAULT:     why = "axis fault"; break;
+    default:               why = "error"; break;
+    }
+    ESP_LOGW(TAG, "Z-Bro: %s (%d)", why, e);
+    if (s_reset_gen != s_gen_seen)
+        return E_ABORT;
+    if (e == ZBRO_E_RANGE)
+        return 15;
+    if (e == ZBRO_E_ARG)
+        return 3;
+    return 20;
+}
+
 static bool submit(uint8_t type, float x, float y, uint8_t power, float speed, float dwell_us)
 {
     struct motion_seg seg = {
@@ -222,8 +261,8 @@ static int exec_gcode(const char *line, bool jog)
     int motion = -1;
     int g_dwell = 0, g_g10 = 0, g92 = 0, g53 = 0, end_prog = 0;
     int new_wcs = -1;
-    bool have_x = false, have_y = false, have_i = false, have_j = false, have_r = false;
-    float ax = 0, ay = 0, iv = 0, jv = 0, rv = 0, pv = 0, lv = 0;
+    bool have_x = false, have_y = false, have_z = false, have_i = false, have_j = false, have_r = false;
+    float ax = 0, ay = 0, az = 0, iv = 0, jv = 0, rv = 0, pv = 0, lv = 0;
     bool has_p = false, has_l = false;
     int arm = -1, guide = -1, preview = -1;
 
@@ -286,12 +325,13 @@ static int exec_gcode(const char *line, bool jog)
         }
         case 'X': have_x = true; ax = v; break;
         case 'Y': have_y = true; ay = v; break;
+        case 'Z': have_z = true; az = v; break;
         case 'I': have_i = true; iv = v; break;
         case 'J': have_j = true; jv = v; break;
         case 'R': have_r = true; rv = v; break;
         case 'P': has_p = true; pv = v; break;
         case 'L': has_l = true; lv = v; break;
-        default: break;                          /* F S T Z A B C ...: handled below / ignored */
+        default: break;                          /* F S T A B C ...: handled below / ignored */
         }
     }
 
@@ -483,6 +523,21 @@ static int exec_gcode(const char *line, bool jog)
                 }
             }
         }
+    }
+
+    /* Z-Bro axis: only after the XY queue has drained (laser gated off, stream closed). With $250=0 the Z
+     * word is ignored, as before. */
+    if (have_z && !jog && (motion == 0 || motion == 1) && calib_get(CAL_ZBRO_EN) > 0.5f) {
+        float tz = (s_m.relative && !g53) ? zbro_pos() + to_mm(az) : to_mm(az);
+        int ze;
+
+        if (!wait_idle())
+            return E_ABORT;
+        s_z_busy = true;
+        ze = zbro_move(tz, calib_get(CAL_ZBRO_SPEED), (int)calib_get(CAL_ZBRO_TIMEOUT_S));
+        s_z_busy = false;
+        if (ze)
+            return z_fail(ze);
     }
 
     if (end_prog) {
@@ -729,6 +784,105 @@ static int laser_test(const char *p, bool fire)
     }
 }
 
+/* Z-Bro proxies: $HZ $Z $ZSTOP $ZGET key $ZSET key=value $ZSAVE $ZCAL[=tests|ABORT]. Arguments keep their case. */
+static void z_print(const char *reply)
+{
+    static char out[ZBRO_MAX_REPLY + 16];
+
+    snprintf(out, sizeof(out), "[ZBRO:%s]\r\n", reply);
+    host_puts(out);
+}
+
+static int z_proxy(const char *req)
+{
+    static char rep[ZBRO_MAX_REPLY];
+    int e = zbro_request(req, rep, sizeof(rep), 3000);
+
+    if (rep[0])
+        z_print(rep);
+    return z_fail(e);
+}
+
+static int exec_zbro(char *p)
+{
+    char cmd[8];
+    char req[ZBRO_MAX_LINE + 1];
+    size_t len = strlen(p), i = 0;
+    const char *a;
+
+    while (len && p[len - 1] == ' ')
+        p[--len] = '\0';
+    for (p++; *p && *p != ' ' && *p != '=' && i < sizeof(cmd) - 1; p++)
+        cmd[i++] = (*p >= 'a' && *p <= 'z') ? (char)(*p - 'a' + 'A') : *p;
+    cmd[i] = '\0';
+    if (*p && *p != ' ' && *p != '=')
+        return 3;                                /* command word too long */
+    while (*p == ' ' || *p == '=')
+        p++;
+    a = p;
+
+    if (strcmp(cmd, "Z") == 0) {
+        struct zbro_info zi;
+        char line[160];
+
+        zbro_get_info(&zi);
+        snprintf(line, sizeof(line), "enabled=%d link=%s ip=%s fw=%s pos=%.3f state=%s homed=%d endstop=%d",
+                 calib_get(CAL_ZBRO_EN) > 0.5f, zi.online ? "up" : "down", zi.ip[0] ? zi.ip : "-",
+                 zi.fw[0] ? zi.fw : "-", (double)fix0(zi.pos),
+                 zi.state >= 0 ? zbro_state_name(zi.state) : "?", zi.homed, zi.endstop);
+        z_print(line);
+        return 0;
+    }
+    if (strcmp(cmd, "HZ") == 0) {
+        int e;
+
+        if (!wait_idle())
+            return E_ABORT;
+        s_z_busy = true;
+        e = zbro_home((int)calib_get(CAL_ZBRO_TIMEOUT_S));
+        s_z_busy = false;
+        return z_fail(e);
+    }
+    if (strcmp(cmd, "ZSTOP") == 0)
+        return z_proxy("STOP");
+    if (strcmp(cmd, "ZSAVE") == 0)
+        return z_proxy("SAVE");
+    if (strcmp(cmd, "ZGET") == 0) {
+        if (!*a)
+            return 3;
+        snprintf(req, sizeof(req), "GET %s", a);
+        return z_proxy(req);
+    }
+    if (strcmp(cmd, "ZSET") == 0) {
+        const char *v = a;
+
+        while (*v && *v != ' ' && *v != '=')
+            v++;
+        if (v == a || !*v)
+            return 3;
+        snprintf(req, sizeof(req), "SET %.*s %s", (int)(v - a), a, v + 1 + strspn(v + 1, " ="));
+        return z_proxy(req);
+    }
+    if (strcmp(cmd, "ZCAL") == 0) {
+        if (!*a || strcasecmp(a, "STATUS") == 0) {
+            snprintf(req, sizeof(req), "CAL status");
+        } else if (strcasecmp(a, "ABORT") == 0) {
+            snprintf(req, sizeof(req), "CAL abort");
+        } else {
+            size_t o = (size_t)snprintf(req, sizeof(req), "CAL start");
+
+            if (strcasecmp(a, "START") != 0) {
+                req[o++] = ' ';
+                for (; *a && o < sizeof(req) - 1; a++)
+                    req[o++] = (*a == ',') ? ' ' : ((*a >= 'A' && *a <= 'Z') ? (char)(*a - 'A' + 'a') : *a);
+                req[o] = '\0';
+            }
+        }
+        return z_proxy(req);
+    }
+    return 3;
+}
+
 static int exec_dollar(char *line)
 {
     char *p = line;
@@ -745,6 +899,10 @@ static int exec_dollar(char *line)
         return net_wifi_command(p + 5, out_line);
     }
 
+    /* Z-Bro commands carry case-sensitive arguments (setting keys, hostname). */
+    if (strncasecmp(p, "$Z", 2) == 0 || strncasecmp(p, "$HZ", 3) == 0)
+        return exec_zbro(p);
+
     for (len = 0; p[len]; len++)
         if (p[len] >= 'a' && p[len] <= 'z')
             p[len] = (char)(p[len] - 'a' + 'A');
@@ -752,7 +910,7 @@ static int exec_dollar(char *line)
         p[--len] = '\0';
 
     if (len == 1) {
-        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $RD $PW=word $GT=ms $LT=ms,S $WIFI[=ssid,pass|CLEAR] $WIFIH=hexssid,hexpass ~ ! ? ctrl-x]\r\n");
+        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $RD $PW=word $GT=ms $LT=ms,S $WIFI[=ssid,pass|CLEAR] $WIFIH=hexssid,hexpass $Z $HZ $ZSTOP $ZGET key $ZSET key=val $ZSAVE $ZCAL[=tests|ABORT] ~ ! ? ctrl-x]\r\n");
         return 0;
     }
     if (strcmp(p, "$$") == 0) {
@@ -869,13 +1027,14 @@ static void report_status(void)
     bool busy = false;
     int feed;
     char wco[48] = "";
+    float mz = calib_get(CAL_ZBRO_EN) > 0.5f ? zbro_pos() : 0.0f;
 
     if (s_fault) {
         state = "Alarm";
         mx = s_m.x;
         my = s_m.y;
     } else {
-        busy = motion_busy();
+        busy = motion_busy() || s_z_busy;
         if (s_jog_active && !busy)
             s_jog_active = false;
         state = galvo_out_is_held() ? "Hold" : (s_jog_active ? "Jog" : (busy ? "Run" : "Idle"));
@@ -896,8 +1055,8 @@ static void report_status(void)
             rxfree = 0;
         if (rxfree > RX_WINDOW)
             rxfree = RX_WINDOW;
-        host_printf("<%s|MPos:%.3f,%.3f,0.000|FS:%d,%d|Bf:%d,%d%s>\r\n", state,
-                    (double)fix0(mx), (double)fix0(my), feed, (int)lroundf(s_pub_s),
+        host_printf("<%s|MPos:%.3f,%.3f,%.3f|FS:%d,%d|Bf:%d,%d%s>\r\n", state,
+                    (double)fix0(mx), (double)fix0(my), (double)fix0(mz), feed, (int)lroundf(s_pub_s),
                     s_fault ? 0 : (int)motion_queue_free(), rxfree, wco);
     }
 }
@@ -914,13 +1073,14 @@ static bool host_busy(void)
 {
     if (s_fault)
         return false;
-    return motion_busy() || s_jog_active || host_rx_accepted() != s_acked;
+    return motion_busy() || s_z_busy || s_jog_active || host_rx_accepted() != s_acked;
 }
 
 static void on_hold(void)
 {
     if (!s_fault)
         galvo_out_hold(true);
+    zbro_stop();                         /* a Z move cannot be paused: decelerate and report it stopped */
 }
 
 static void on_resume(void)
@@ -939,6 +1099,7 @@ static void on_reset(void)
      * does not delay the abort below; also done in fault mode. The next job
      * re-arms by itself ($226). */
     atmega_link_set_armed(false);
+    zbro_stop();                         /* non-blocking; the grbl task also aborts its Z wait on the generation */
     if (!s_fault) {
         float x, y;
 
@@ -1083,6 +1244,7 @@ bool grbl_task_start(void)
         s_m.x = x;
         s_m.y = y;
     }
+    zbro_set_abort_fn(z_aborted);
     host_serial_set_handlers(&h);
     host_serial_set_busy_fn(host_busy);
     return xTaskCreatePinnedToCore(grbl_task, "grbl", GRBL_TASK_STACK, NULL, GRBL_TASK_PRIO,
