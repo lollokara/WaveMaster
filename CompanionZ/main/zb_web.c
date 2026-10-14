@@ -14,6 +14,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "zb_cal.h"
+#include "zb_fleet.h"
 #include "zb_net.h"
 #include "zb_settings.h"
 #include "zbro_proto.h"
@@ -197,10 +198,24 @@ static esp_err_t ws_handler(httpd_req_t *req)
 
 /* ------------------------------------------------------------- REST --- */
 
+/* "fleet":{...} member for /api/status and /api/wifi (hub URL is validated at write: no quotes/backslashes). */
+static int fleet_json(char *b, size_t n)
+{
+    struct zb_fleet_status f;
+    char hub[128];
+    zb_fleet_status(&f, hub, sizeof(hub));
+    return snprintf(b, n, "\"fleet\":{\"enabled\":%s,\"registered\":%s,\"hb_age\":%d,\"hub\":\"%s\"}",
+                    f.enabled ? "true" : "false", f.registered ? "true" : "false", f.last_hb_age_s, hub);
+}
+
 static esp_err_t h_status(httpd_req_t *req)
 {
-    char b[256];
-    status_json(b, sizeof(b));
+    char b[512];
+    int n = status_json(b, sizeof(b));
+    char f[300];
+    int m = fleet_json(f, sizeof(f));
+    if (n > 1 && n < (int)sizeof(b) && m > 0 && m < (int)sizeof(f) && n + m + 2 < (int)sizeof(b))
+        snprintf(b + n - 1, sizeof(b) - (size_t)n + 1, ",%s}", f);   /* replaces the closing brace */
     return send_json(req, NULL, b);
 }
 
@@ -272,7 +287,7 @@ static esp_err_t h_jog(httpd_req_t *req)
 
 static esp_err_t h_home(httpd_req_t *req) { return send_rc(req, zb_home()); }
 static esp_err_t h_stop(httpd_req_t *req) { return send_rc(req, zb_stop()); }
-static esp_err_t h_estop(httpd_req_t *req) { zb_estop(); return send_rc(req, 0); }
+static esp_err_t h_estop(httpd_req_t *req) { zb_fleet_note_estop(); zb_estop(); return send_rc(req, 0); }
 
 static esp_err_t h_cal_get(httpd_req_t *req)
 {
@@ -315,13 +330,16 @@ static esp_err_t h_cal_abort(httpd_req_t *req)
 
 static esp_err_t h_wifi_get(httpd_req_t *req)
 {
-    char ssid[40], ip[20], b[200];
+    char ssid[40], ip[20], b[560], hub[128], f[300];
     zb_net_wifi_ssid(ssid, sizeof(ssid));
+    zb_fleet_hub_get(hub, sizeof(hub));
+    fleet_json(f, sizeof(f));
     zb_net_ip(ip, sizeof(ip));
     for (char *c = ssid; *c; c++)
         if (*c == '"' || *c == '\\' || (unsigned char)*c < 0x20) *c = '_';
-    snprintf(b, sizeof(b), "{\"ssid\":\"%s\",\"ip\":\"%s\",\"connected\":%s,\"ap\":%s,\"rssi\":%d}", ssid, ip,
-             zb_net_sta_connected() ? "true" : "false", zb_net_ap_active() ? "true" : "false", zb_net_rssi());
+    snprintf(b, sizeof(b), "{\"ssid\":\"%s\",\"ip\":\"%s\",\"connected\":%s,\"ap\":%s,\"rssi\":%d,\"fleet_hub\":\"%s\",%s}",
+             ssid, ip, zb_net_sta_connected() ? "true" : "false", zb_net_ap_active() ? "true" : "false", zb_net_rssi(),
+             hub, f);
     return send_json(req, NULL, b);
 }
 
@@ -331,7 +349,19 @@ static esp_err_t h_wifi_put(httpd_req_t *req)
     if (!j) return ESP_OK;
     const cJSON *s = cJSON_GetObjectItemCaseSensitive(j, "ssid");
     const cJSON *p = cJSON_GetObjectItemCaseSensitive(j, "pass");
+    const cJSON *fh = cJSON_GetObjectItemCaseSensitive(j, "fleet_hub");
     esp_err_t e;
+    if (fh) {                                    /* ESPFleet hub URL: "", "off" or http(s)://...; applied on next boot */
+        if (!cJSON_IsString(fh) || zb_fleet_hub_set(fh->valuestring) != 0) {
+            e = send_rc(req, ZBRO_E_ARG);
+            cJSON_Delete(j);
+            return e;
+        }
+        if (!s) {
+            cJSON_Delete(j);
+            return send_json(req, NULL, "{\"ok\":true,\"reboot_needed\":true}");
+        }
+    }
     if (!cJSON_IsString(s) || (p && !cJSON_IsString(p))) {
         e = send_rc(req, ZBRO_E_ARG);
     } else {

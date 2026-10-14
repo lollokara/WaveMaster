@@ -21,6 +21,7 @@
 #include "mdns.h"
 #include "nvs.h"
 #include "zb_cal.h"
+#include "zb_fleet.h"
 #include "zb_settings.h"
 #include "zbro_proto.h"
 
@@ -307,7 +308,7 @@ static void handle_request(const struct zbro_req *r)
     case ZBRO_C_MOVE:  reply_rc(zb_move_abs(r->a, r->has_b ? r->b : 0)); break;
     case ZBRO_C_JOG:   reply_rc(zb_move_rel(r->a, r->has_b ? r->b : 0)); break;
     case ZBRO_C_STOP:  reply_rc(zb_stop()); break;
-    case ZBRO_C_ESTOP: zb_estop(); reply_rc(0); break;
+    case ZBRO_C_ESTOP: zb_fleet_note_estop(); zb_estop(); reply_rc(0); break;
     case ZBRO_C_GET: {
         float v;
         if (zb_set_get_by_key(r->key, &v)) send_line(b, zbro_fmt_val(b, sizeof(b), r->key, v));

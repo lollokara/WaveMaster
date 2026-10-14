@@ -107,3 +107,43 @@ with `$250=0` Z words are ignored as today.
 | E S3 | executor/sonnet | `src/zbro_link.*`, `src/grbl.c`, `src/calib.*`, `src/CMakeLists.txt`, `src/main.c`, docs |
 
 A/B/C code against the headers `CompanionZ/main/zb_motion.h` and `zb_settings.h` (committed with this plan).
+
+## 9. Fleet (ESPFleet device agent)
+
+The C3 reports to an ESPFleet hub (default `http://192.168.3.87:8080`): heartbeat, metrics, logs, HEALTH records
+and OTA. Component: `CompanionZ/components/espfleet` (vendored, patches and source commit in its `VENDORED.md`),
+glue: `CompanionZ/main/zb_fleet.{c,h}`.
+
+- **Start**: `zb_fleet_start()` in `app_main` only creates a priority-1 `zb_fleet` task. That task starts the agent
+  once the STA has an IP, so boot never waits for WiFi or the hub, and SoftAP-only provisioning never starts it.
+  The agent task (priority 1, 8 KB stack) tolerates a missing network and hub. Name = the Z-Bro hostname; the project
+  slug comes from a Gogs-style git origin at build time, else stays auto.
+- **Hub setting**: NVS `zbro`/`fleet_hub`, set on the WiFi page (`PUT /api/wifi {"fleet_hub": ...}`, applied after
+  a reboot). Unset = `http://192.168.3.87:8080`; empty = discover `_espfleet._tcp` over mDNS; `off` = agent disabled.
+- **Metrics** (heartbeat, about every 30 s, updated every 1 s): `state pos_mm homed endstop driver_en speed_mm_s step_hz
+  s3_link tcp_clients motion_err last_err estop moves dist_mm es_repeat_um lim_speed lim_accel lim_decel lim_home_fast
+  cal_time wifi_reconn cal_running`. Extras: `fw microstep steps_mm calstatus identify`. `dist_mm` is sampled travel
+  (approximate); `tcp_clients` is 0 or 1 (one COM client at a time).
+- **HEALTH** (log tag `health`, first 10 s after the hub is reachable, then hourly, or on the `health` command): heap,
+  reset reason, per-task stack headroom (`zb_motion zb_tcp zb_beacon zb_fleet zb_cal zb_wspush httpd tiT sys_evt wifi
+  mdns main`), counters `wifi_reconn estop motion_err moves hub_fail log_drop`, and the metrics as `custom`.
+- **Logs**: the agent hooks `esp_log` (chained to the previous vprintf, ISR-safe, never blocks, drops when busy) and
+  ships batches to `/api/v1/ingest/logs` (hub source `c6`; the hub has no `c3` source). Domain events are logged with
+  tag `zb_evt` as `EVT <name> key=value ...`: `boot homed move_done err estop s3_link cal_start cal_test cal_done
+  cal_error fleet_cmd identify`. The hub's own patterns also match `WiFi connected, IP: x`, `WiFi disconnected,
+  reason: n`, `Booting firmware <ver>`, `OTA partition marked valid` and `Heap: free=n, min=n`.
+- **Motion path**: untouched. The motion and cal tasks only bump counters and post to a 16-entry queue / task
+  notification (never blocking); metrics, logging and HTTP are done by the `zb_fleet` and agent tasks.
+- **Commands** (hub `ALLOWED`: reboot, identify, ota, ping, factory_reset): `identify` logs and sets an extra (no
+  motion); `stop`, `estop`, `home` (only when IDLE), `health`, `calstatus` are accepted if a hub sends them; no
+  arbitrary moves; `factory_reset` is unsupported.
+- **OTA safety**: the agent calls the gate callback first. `ota` is refused unless the axis is IDLE (the driver is then
+  disabled before flash writes); `reboot`/`restart` E-stop a moving axis and disable the driver first. Rollback is on
+  (`CONFIG_APP_ROLLBACK_ENABLE`): the agent confirms the image after the first hub heartbeat, `zb_fleet` after 90 s if
+  WiFi (or the provisioning AP) is up. Known gap: a move commanded by the S3 or the web UI during the ~20 s download
+  is not blocked; flash writes can disturb step timing, so do not move during an update.
+- **Partitions** (4 MB): `nvs` 24 KB, `otadata` 8 KB, `phy_init`, `ota_0`/`ota_1` 1.5 MB each, `storage` (LittleFS)
+  256 KB, 0x360000-0x400000 spare. The layout changed from the single-app table, so the first flash must be a full
+  USB flash: `pio run -t upload && pio run -t uploadfs` (OTA cannot change the partition table).
+- **Status**: `GET /api/status` and `GET /api/wifi` carry `fleet: {enabled, registered, hb_age, hub}`; the WiFi page
+  shows it with the hub URL field.

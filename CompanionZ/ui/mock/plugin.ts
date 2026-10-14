@@ -221,9 +221,10 @@ export function mockZbro(): Plugin {
           cal.tests.forEach(t => { if (t.status === 'running') t.status = 'failed'; if (t.status === 'pending') t.status = 'skipped'; });
           return send(res, 200, { ok: true });
         }
-        if (path === '/wifi' && m === 'GET') return send(res, 200, { ssid: 'workshop-2g', mode: 'STA', ip: '192.168.1.57' });
+        if (path === '/wifi' && m === 'GET') return send(res, 200, { ssid: 'workshop-2g', mode: 'STA', ip: '192.168.1.57', fleet_hub: 'http://192.168.3.87:8080', fleet: { enabled: true, registered: true, hb_age: 12, hub: 'http://192.168.3.87:8080' } });
         if (path === '/wifi' && m === 'PUT') {
           const b = await body(req);
+          if (b.fleet_hub !== undefined && !b.ssid) return send(res, 200, { ok: true, reboot_needed: true });
           if (!b.ssid) return send(res, 400, { error: 'SSID required', key: 'ssid' });
           return send(res, 200, { ok: true });
         }

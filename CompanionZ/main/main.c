@@ -1,5 +1,6 @@
 #include "esp_log.h"
 #include "zb_cal.h"
+#include "zb_fleet.h"
 #include "zb_motion.h"
 #include "zb_net.h"
 #include "zb_settings.h"
@@ -8,12 +9,14 @@
 static void on_motion_event(enum zb_evt_type type, float pos_mm, int err)
 {
     zb_net_on_event(type, pos_mm, err);
+    zb_fleet_on_event(type, pos_mm, err);
     zb_web_on_event(type, pos_mm, err);
 }
 
 static void on_cal_change(void)
 {
     zb_net_on_cal();
+    zb_fleet_on_cal();
     zb_web_on_cal();
 }
 
@@ -26,4 +29,5 @@ void app_main(void)
     zb_cal_set_cb(on_cal_change);
     zb_net_start();
     zb_web_start();
+    zb_fleet_start();                 /* returns at once; the agent starts later, only once the STA has an IP */
 }

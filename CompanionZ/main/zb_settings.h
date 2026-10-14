@@ -36,6 +36,15 @@ unsigned zb_set_generation(void);                 /* bumped on every change */
 void zb_hostname_get(char *buf, size_t n);
 int  zb_hostname_set(const char *name);
 
+/* ESPFleet hub URL (string, own NVS key "fleet_hub", applied on next boot). "" = discover via mDNS
+ * _espfleet._tcp, "off" = agent disabled, otherwise http(s)://host[:port]. Unset = ZB_FLEET_HUB_DEFAULT.
+ * Buffer of at least 128 bytes. zb_fleet_hub_set returns 0 ok, 4 bad argument. */
+#ifndef ZB_FLEET_HUB_DEFAULT
+#define ZB_FLEET_HUB_DEFAULT "http://192.168.3.87:8080"
+#endif
+void zb_fleet_hub_get(char *buf, size_t n);
+int  zb_fleet_hub_set(const char *url);
+
 /* Derived: steps per mm = steps_rev * microstep / lead_mm. */
 float zb_steps_per_mm(void);
 

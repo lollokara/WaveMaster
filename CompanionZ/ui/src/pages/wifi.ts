@@ -11,6 +11,22 @@ export function wifi(root: HTMLElement) {
     h('button', { type: 'button', class: 'danger', onClick: async () => { try { await api('/reboot', 'POST'); toast('Rebooting. Reconnect in a few seconds.'); } catch (e) { toast((e as ApiError).message, true); } reboot.hidden = true; } }, 'Restart'),
     h('button', { type: 'button', onClick: () => { reboot.hidden = true; } }, 'Cancel'));
 
+  const hub = h('input', { id: 'fleet_hub', type: 'text', autocomplete: 'off', autocapitalize: 'off', spellcheck: false, maxLength: 127, placeholder: 'http://192.168.3.87:8080' });
+  const fleetState = h('div', { class: 'sub mono' });
+  const fleetErr = h('div', { class: 'err', role: 'alert' });
+  const fleet = h('section', { class: 'panel narrow' },
+    h('h2', null, 'Fleet'),
+    fleetState,
+    h('div', { class: 'field' }, h('label', { for: 'fleet_hub' }, 'Fleet hub URL'), h('div', { class: 'ctl' }, hub),
+      h('div', { class: 'hint' }, 'Empty: discover the hub via mDNS. "off": disable the agent. Applies after a reboot.')),
+    fleetErr,
+    h('div', { class: 'row end' },
+      h('button', { type: 'button', class: 'solid', onClick: async () => {
+        fleetErr.textContent = '';
+        try { await api('/wifi', 'PUT', { fleet_hub: hub.value.trim() }); toast('Saved. Reboot to apply.'); }
+        catch (e) { fleetErr.textContent = (e as ApiError).message; }
+      } }, 'Save')));
+
   root.append(
     h('section', { class: 'panel narrow' },
       h('h2', null, 'Network'),
@@ -25,10 +41,15 @@ export function wifi(root: HTMLElement) {
           try { await api('/wifi', 'PUT', { ssid: ssid.value, pass: pass.value }); pass.value = ''; toast('Saved. Reboot to join the new network.'); }
           catch (e) { err.textContent = (e as ApiError).message; }
         } }, 'Save')),
-      reboot));
+      reboot),
+    fleet);
 
-  api<{ ssid: string; mode?: string; ip?: string }>('/wifi').then(r => {
+  api<{ ssid: string; mode?: string; ip?: string; fleet_hub?: string; fleet?: { enabled: boolean; registered: boolean; hb_age: number; hub: string } }>('/wifi').then(r => {
     ssid.value = r.ssid ?? '';
+    hub.value = r.fleet_hub ?? '';
+    const f = r.fleet;
+    fleetState.textContent = !f ? '' : !f.enabled ? 'DISABLED'
+      : f.registered ? `REGISTERED  ${f.hub}  last heartbeat ${f.hb_age} s ago` : `NOT REGISTERED  ${f.hub || 'searching'}`;
     state.textContent = [r.mode === 'AP' ? 'SOFT AP' : r.mode === 'STA' ? 'STATION' : '', r.ip].filter(Boolean).join('  ');
   }).catch(e => { err.textContent = (e as ApiError).message; });
   return () => {};

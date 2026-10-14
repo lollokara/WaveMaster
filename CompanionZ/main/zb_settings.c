@@ -22,6 +22,10 @@ static bool s_nvs_ok;
 static SemaphoreHandle_t s_mtx;
 static char s_host[32] = HOST_DEF;
 
+#define FLEET_KEY "fleet_hub"
+#define FLEET_MAX 127
+static char s_fleet[FLEET_MAX + 1] = ZB_FLEET_HUB_DEFAULT;
+
 static void lock(void)   { if (s_mtx) xSemaphoreTake(s_mtx, portMAX_DELAY); }
 static void unlock(void) { if (s_mtx) xSemaphoreGive(s_mtx); }
 
@@ -30,6 +34,19 @@ static void nvs_put(int id)
     uint32_t bits;
     memcpy(&bits, &s_val[id], sizeof bits);
     if (s_nvs_ok && nvs_set_u32(s_nvs, zbc_defs[id].key, bits) == ESP_OK) s_dirty &= ~(1u << id);
+}
+
+/* "" (discover via mDNS), "off", or http(s)://host[:port][/] without whitespace or quotes. */
+static bool fleet_valid(const char *u)
+{
+    if (!u) return false;
+    size_t n = strlen(u);
+    if (n == 0 || strcmp(u, "off") == 0) return true;
+    if (n > FLEET_MAX) return false;
+    if (strncmp(u, "http://", 7) != 0 && strncmp(u, "https://", 8) != 0) return false;
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)u[i] <= ' ' || u[i] == '"' || u[i] == '\\' || u[i] == 0x7f) return false;
+    return n > (u[4] == 's' ? 8u : 7u);
 }
 
 void zb_settings_init(void)
@@ -55,6 +72,9 @@ void zb_settings_init(void)
         size_t n = sizeof s_host;
         char tmp[32];
         if (nvs_get_str(s_nvs, HOST_KEY, tmp, &n) == ESP_OK && zbc_hostname_valid(tmp)) strcpy(s_host, tmp);
+        n = sizeof s_fleet;
+        char ftmp[sizeof s_fleet];
+        if (nvs_get_str(s_nvs, FLEET_KEY, ftmp, &n) == ESP_OK && fleet_valid(ftmp)) strcpy(s_fleet, ftmp);
     }
     s_mtx = xSemaphoreCreateMutex();
 }
@@ -151,6 +171,26 @@ int zb_hostname_set(const char *name)
     strcpy(s_host, name);
     s_gen++;
     if (s_nvs_ok && nvs_set_str(s_nvs, HOST_KEY, name) == ESP_OK) nvs_commit(s_nvs);
+    unlock();
+    return 0;
+}
+
+void zb_fleet_hub_get(char *buf, size_t n)
+{
+    if (!buf || !n) return;
+    lock();
+    strncpy(buf, s_fleet, n - 1);
+    buf[n - 1] = 0;
+    unlock();
+}
+
+int zb_fleet_hub_set(const char *url)
+{
+    if (!fleet_valid(url)) return 4;
+    lock();
+    strcpy(s_fleet, url);
+    s_gen++;
+    if (s_nvs_ok && nvs_set_str(s_nvs, FLEET_KEY, url) == ESP_OK) nvs_commit(s_nvs);
     unlock();
     return 0;
 }
