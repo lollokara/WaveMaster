@@ -12,7 +12,7 @@ plus hooks in `grbl.c` / `calib.*`. Shared wire-protocol code: `shared/zbro_prot
 | ENABLE (active low) | 0 | OK, no strapping role. **Add 10 kΩ pull-up to 3.3 V**: the A4988 pulls ENABLE low internally, so the motor is energised from power-up until firmware drives the pin. |
 | ENDSTOP | 5 | OK. RTC-capable, ADC2_CH0, JTAG MTDI only if eFuse selects pin-JTAG (default is USB-JTAG). Internal pull-up + switch to GND (NC wiring recommended) + 10 nF to GND. |
 | MS1 / MS2 | 6 / 7 | OK. Free pins (SPI flash is 12–17). A4988 has 100 kΩ pull-downs on MSx. |
-| MS3 | 8 | **Caution.** Strapping pin (GPIO2/8/9). Harmless in normal boot (only read when GPIO9 is low), but many C3 dev boards wire an RGB LED to GPIO8, so MS3 would flicker it / be loaded. Check the board. Not used on A4988 for 1/16 *(MS3 only matters at 1/16: MS1=MS2=MS3=1)* — so it is needed. |
+| MS3 | 8 | **Caution.** Strapping pin (GPIO2/8/9). Harmless in normal boot (only read when GPIO9 is low), but many C3 dev boards wire an RGB LED to GPIO8, so MS3 would flicker it / be loaded. Check the board. MS3 is required: 1/16 step is MS1=MS2=MS3=high. |
 | RESET (active low) | 9 | **Caution.** Strapping pin = BOOT button. If the A4988 board or the button pulls it low at reset, the C3 enters ROM download mode. Make sure nothing holds it low at power-up. The firmware drives it high after boot. |
 | SLEEP (active low) | 10 | OK. After wake-up wait ≥1 ms before STEP (charge pump). |
 | DIR | 21 | **Caution.** U0TXD: the ROM boot log toggles it at start-up. Harmless while ENABLE is held high by the pull-up. Console must stay on USB-Serial-JTAG (GPIO18/19), UART0 console disabled. |
