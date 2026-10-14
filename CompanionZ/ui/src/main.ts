@@ -29,7 +29,7 @@ onStatus(s => {
   const st = s ? s.state : 'OFFLINE';
   badge.dataset.state = st;
   badge.lastElementChild!.textContent = st;
-  meta.textContent = s ? `${s.fw || 'fw ?'}  ${s.rssi} dBm${s.s3 ? '' : '  S3 away'}` : 'no link';
+  meta.textContent = s ? `${s.fw || 'fw ?'}  ${s.rssi} dBm${s.client ? '' : '  no client'}` : 'no link';
 });
 
 let dispose: (() => void) | null = null;

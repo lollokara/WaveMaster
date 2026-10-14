@@ -1,4 +1,4 @@
-export interface Status { pos: number; state: string; homed: boolean; endstop: boolean; fw: string; rssi: number; s3: boolean; uptime: number }
+export interface Status { pos: number; state: string; homed: boolean; endstop: boolean; fw: string; rssi: number; client: boolean; uptime: number }
 export interface Item { key: string; label: string; value: number | string | boolean; min?: number; max?: number; step?: number; unit?: string; type: 'number' | 'bool' | 'enum'; options?: (string | { value: string; label?: string })[] }
 export interface Group { name: string; items: Item[] }
 export interface Trial { value: number; ok: boolean }

@@ -159,7 +159,7 @@ export function mockZbro(): Plugin {
         void homeAtMax;
 
         if (path === '/status' && m === 'GET')
-          return send(res, 200, { pos: +st.pos.toFixed(3), state: st.state, homed: st.homed, endstop: st.pos <= 0.001 && st.homed || st.pos < -0.001, fw: '0.4.2-mock', rssi: -58, s3: true, uptime: Math.round(st.uptime) });
+          return send(res, 200, { pos: +st.pos.toFixed(3), state: st.state, homed: st.homed, endstop: st.pos <= 0.001 && st.homed || st.pos < -0.001, fw: '0.4.2-mock', rssi: -58, client: true, uptime: Math.round(st.uptime) });
         if (path === '/settings' && m === 'GET') return send(res, 200, { groups });
         if (path === '/settings' && m === 'PUT') {
           const b = await body(req);
