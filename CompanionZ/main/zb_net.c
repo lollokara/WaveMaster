@@ -184,8 +184,8 @@ static void wifi_start(void)
     if (s_have_creds) {
         wifi_config_t sta;
         memset(&sta, 0, sizeof(sta));
-        snprintf((char *)sta.sta.ssid, sizeof(sta.sta.ssid), "%s", s_ssid);
-        snprintf((char *)sta.sta.password, sizeof(sta.sta.password), "%s", s_pass);
+        memcpy(sta.sta.ssid, s_ssid, strlen(s_ssid));          /* struct is zeroed, SSID <= 32 */
+        memcpy(sta.sta.password, s_pass, strlen(s_pass));
         sta.sta.threshold.authmode = s_pass[0] ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN;
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
