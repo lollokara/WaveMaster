@@ -28,3 +28,9 @@ test/host/hostlink/test_hostlink.dSYM/
 # gcode test build outputs
 test/host/gcode/test_gcode
 test/host/gcode/test_gcode.dSYM/
+
+# Z-Bro host test binaries
+test/host/zbro/test_zbro
+test/host/zbro_cal/test_cal_search
+test/host/zbro_motion/test_zbro_motion
+test/host/**/*.dSYM/
