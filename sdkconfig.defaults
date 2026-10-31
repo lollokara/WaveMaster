@@ -71,3 +71,10 @@ CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 # dump shows what held the core. Without it only the hardware stage resets the
 # chip and nothing is recorded.
 CONFIG_ESP_TASK_WDT_PANIC=y
+
+# A panic prints its report to the USB console before the core dump is written,
+# and the panic handler arms a 10 s RTC watchdog. When the host (Rayforge) has
+# the port open but does not drain it, the printing outlasts that watchdog: the
+# chip resets with reason "wdt" and no dump. Reboot silently instead, so the dump
+# is written and the real reset reason survives.
+CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y
