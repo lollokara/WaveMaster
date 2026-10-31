@@ -9,6 +9,7 @@
 #include "esp_core_dump.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
+#include "esp_timer.h"
 #include "espfleet_api.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -78,6 +79,116 @@ static void twdt_report(void)
     }
 }
 
+#define SAMPLE_MS    100
+#define SAMPLE_N     64
+#define SAMPLE_MAGIC 0x736d706cu
+
+/* Which task held core 1 in the seconds before a reset: an esp_timer callback (it runs on core 0) records the
+ * task running on core 1 every SAMPLE_MS into RTC memory, and the boot after an abnormal reset logs the
+ * sequence. A task that never yields shows up as one long run. */
+struct sample {
+    uint32_t tick;
+    char core1[8];
+};
+
+static RTC_NOINIT_ATTR uint32_t s_smp_magic;
+static RTC_NOINIT_ATTR uint32_t s_smp_n;
+static RTC_NOINIT_ATTR struct sample s_smp[SAMPLE_N];
+static struct sample s_prev[SAMPLE_N];
+static uint32_t s_prev_n;
+static bool s_prev_lost;
+
+static bool abnormal_reset(void)
+{
+    esp_reset_reason_t r = esp_reset_reason();
+
+    return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT ||
+           r == ESP_RST_BROWNOUT;
+}
+
+static void sample_cb(void *arg)
+{
+    TaskHandle_t t = xTaskGetCurrentTaskHandleForCore(1);
+    struct sample *s = &s_smp[s_smp_n % SAMPLE_N];
+
+    (void)arg;
+    s->tick = xTaskGetTickCount();
+    strlcpy(s->core1, t ? pcTaskGetName(t) : "?", sizeof(s->core1));
+    s_smp_n++;
+}
+
+static void sample_start(void)
+{
+    static esp_timer_handle_t timer;
+    const esp_timer_create_args_t args = { .callback = sample_cb, .name = "smp" };
+
+    if (abnormal_reset()) {
+        if (s_smp_magic == SAMPLE_MAGIC) {
+            memcpy(s_prev, s_smp, sizeof(s_prev));
+            s_prev_n = s_smp_n;
+        } else {
+            s_prev_lost = true;
+        }
+    }
+    s_smp_magic = SAMPLE_MAGIC;
+    s_smp_n = 0;
+    if (esp_timer_create(&args, &timer) == ESP_OK)
+        esp_timer_start_periodic(timer, (uint64_t)SAMPLE_MS * 1000);
+}
+
+static void sample_report(void)
+{
+    uint32_t count = s_prev_n < SAMPLE_N ? s_prev_n : SAMPLE_N;
+    uint32_t base = s_prev_n - count;
+    char out[200];
+    size_t len = 0;
+
+    if (s_prev_lost)
+        ESP_LOGW(TAG, "no core 1 samples: RTC memory did not survive the reset");
+    for (uint32_t k = 0; k < count;) {
+        const struct sample *a = &s_prev[(base + k) % SAMPLE_N];
+        uint32_t run = 1;
+
+        if (k) {
+            uint32_t gap = a->tick - s_prev[(base + k - 1) % SAMPLE_N].tick;
+
+            if (gap > 3 * SAMPLE_MS)
+                len += snprintf(out + len, sizeof(out) - len, " [+%lums]", (unsigned long)gap);
+        }
+        while (k + run < count && strcmp(s_prev[(base + k + run) % SAMPLE_N].core1, a->core1) == 0)
+            run++;
+        len += snprintf(out + len, sizeof(out) - len, " %s*%lu", a->core1, (unsigned long)run);
+        k += run;
+        if (len > sizeof(out) - 28 || k >= count) {
+            ESP_LOGE(TAG, "core1 before the reset (%d ms samples, oldest first):%s", SAMPLE_MS, out);
+            len = 0;
+        }
+    }
+}
+
+/* Minimum free stack (bytes) of each task, logged every 30 s: an overflow shows up as a value near zero. */
+static void stack_report(void)
+{
+    static const char *const names[] = {
+        "dac_task", "grbl", "motion", "host_rx", "zbro", "atmega_link", "net_srv", "net_tx", "net_mgr",
+        "espfleet", "tiT", "sys_evt", "esp_timer", "main", "wifi", "IDLE1",
+    };
+    char out[200];
+    size_t len = 0;
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        TaskHandle_t t = xTaskGetHandle(names[i]);
+
+        if (!t)
+            continue;
+        len += snprintf(out + len, sizeof(out) - len, " %s=%u", names[i], (unsigned)uxTaskGetStackHighWaterMark(t));
+        if (len > sizeof(out) - 24 || i + 1 == sizeof(names) / sizeof(names[0])) {
+            ESP_LOGI(TAG, "stack min free (B):%s", out);
+            len = 0;
+        }
+    }
+}
+
 /* A panic or watchdog reset leaves its summary in the coredump partition. Log it so the hub gets the task, the
  * PC and the backtrace (resolve them with the firmware.elf whose sha is printed). The dump stays in flash: it
  * holds every task's stack, and esptool can read it until the next crash replaces it. Each dump is logged once
@@ -91,6 +202,7 @@ static void crash_report(void)
     esp_err_t err = esp_core_dump_image_check();
 
     twdt_report();
+    sample_report();
     if (err != ESP_OK) {
         ESP_LOGI(TAG, "no core dump from the last reset (%s)", esp_err_to_name(err));
         return;
@@ -132,6 +244,8 @@ static void fleet_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(200));
         if (tick == CRASH_REPORT_TICKS)
             crash_report();
+        if (tick % 150 == 149)
+            stack_report();
     }
 }
 
@@ -142,6 +256,7 @@ static void fleet_start(void)
 {
     espfleet_config_t cfg;
 
+    sample_start();
     espfleet_config_default(&cfg);
     cfg.hub = FLEET_HUB_URL;
     cfg.name = "wavemaster";
