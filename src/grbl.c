@@ -892,6 +892,18 @@ static int z_proxy(const char *req)
     return z_fail(e);
 }
 
+static int home_z(void)
+{
+    int e;
+
+    if (!wait_idle())
+        return E_ABORT;
+    s_z_busy = true;
+    e = zbro_home((int)calib_get(CAL_ZBRO_TIMEOUT_S));
+    s_z_busy = false;
+    return z_fail_alarm(e);
+}
+
 static int exec_zbro(char *p)
 {
     char cmd[8];
@@ -925,16 +937,8 @@ static int exec_zbro(char *p)
         z_print(line);
         return 0;
     }
-    if (strcmp(cmd, "HZ") == 0) {
-        int e;
-
-        if (!wait_idle())
-            return E_ABORT;
-        s_z_busy = true;
-        e = zbro_home((int)calib_get(CAL_ZBRO_TIMEOUT_S));
-        s_z_busy = false;
-        return z_fail_alarm(e);
-    }
+    if (strcmp(cmd, "HZ") == 0)
+        return home_z();
     if (strcmp(cmd, "ZSTOP") == 0)
         return z_proxy("STOP");
     if (strcmp(cmd, "ZSAVE") == 0)
@@ -1024,7 +1028,9 @@ static int exec_dollar(char *line)
         print_params();
         return 0;
     }
-    if (strcmp(p, "$X") == 0 || strcmp(p, "$H") == 0 || strcmp(p, "$HX") == 0 ||
+    if (strcmp(p, "$H") == 0)
+        return calib_get(CAL_ZBRO_EN) > 0.5f ? home_z() : 0;
+    if (strcmp(p, "$X") == 0 || strcmp(p, "$HX") == 0 ||
         strcmp(p, "$HY") == 0 || strcmp(p, "$C") == 0 ||
         strcmp(p, "$SLP") == 0)
         return 0;
