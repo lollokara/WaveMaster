@@ -229,6 +229,33 @@ static int z_fail(int e)
     return 20;
 }
 
+#define Z_RESYNC_MS     10000    /* how long to wait for the link to come back after it dropped mid-move */
+#define Z_RESYNC_TOL_MM 0.05f
+
+/* The C3 finishes a move on its own even if the link drops while the S3 waits for the DONE. Once the link is
+ * back, ask where the axis is: a move that reached its target is a success, anything else stays a failure. */
+static int z_resync(float target, int e)
+{
+    char rep[ZBRO_MAX_LINE];
+    struct zbro_info zi;
+    int64_t t_end = esp_timer_get_time() / 1000 + Z_RESYNC_MS;
+
+    while (esp_timer_get_time() / 1000 < t_end) {
+        if (s_reset_gen != s_gen_seen)
+            return ZBRO_ERR_ABORTED;
+        if (zbro_online() && zbro_request("POS", rep, sizeof(rep), 3000) == 0) {
+            zbro_get_info(&zi);
+            if (zi.state == 0 && fabsf(zi.pos - target) <= Z_RESYNC_TOL_MM) {
+                ESP_LOGW(TAG, "Z-Bro: link dropped during the move, axis is at %.3f: ok", (double)zi.pos);
+                return 0;
+            }
+            return e;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return e;
+}
+
 /* A Z operation that may have left the axis at the wrong height must stop the job: raise an Alarm (the host
  * stops streaming; GRBL-style lockout until $X or a reset). Rejections before any motion (offline, busy, not
  * homed, bad argument, out of range) stay plain errors. A reset already discards the line. */
@@ -567,6 +594,8 @@ static int exec_gcode(const char *line, bool jog)
         }
         if (!ze)
             ze = zbro_move(tz, calib_get(CAL_ZBRO_SPEED), (int)calib_get(CAL_ZBRO_TIMEOUT_S));
+        if (ze == ZBRO_ERR_LINK)
+            ze = z_resync(tz, ze);
         s_z_busy = false;
         if (ze)
             return z_fail_alarm(ze);

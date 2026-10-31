@@ -22,8 +22,8 @@ static const char *TAG = "zbro";
 #define LINK_TASK_PRIO  4
 #define POLL_MS         20
 #define PING_MS         1000
-#define REPLY_MS        2000     /* the C3 answers every request at once; longer = dead */
-#define SILENCE_MS      4500     /* PING is answered every second */
+#define REPLY_MS        5000     /* the C3 answers at once; WiFi retransmits can delay it by a few seconds */
+#define SILENCE_MS      10000    /* PING is answered every second */
 #define CONNECT_MS      3000
 #define DONE_TOL_MM     0.05f    /* EVT DONE counts as arrival only this close to the MOVE target */
 
