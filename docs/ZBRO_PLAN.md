@@ -115,7 +115,8 @@ gzipped into `CompanionZ/data/` for LittleFS. No UI kit, no stock gradients/emoj
 
 ## 7. S3 side
 
-Settings: `$250` Z-Bro enable (0), `$251` Z move timeout s (60), `$252` default Z speed mm/s (0 = C3's max_speed).
+Settings: `$250` Z-Bro enable (0), `$251` Z move timeout s (60), `$252` default Z speed mm/s (0 = C3's max_speed), `$253` boot homing (1).
+Boot homing: the link task sends one `HOME` when the first session after S3 boot finds the C3 `IDLE` (decided at link-up only, so a later reconnect never homes mid-job; `skipped` otherwise). `s_auto` = pending/homing/done/failed/skipped, shown in `$Z`; while `homing`, `run_op` answers BUSY. Refusal, `EVT ERR`, link loss or `$251` timeout (then `STOP`) set `failed` with a log line, no Alarm.
 G-code: `Z<n>` in G0/G1 (absolute/relative follows G90/G91; metres/inches follow G20/G21) → barrier, `MOVE`, wait `DONE`.
 `$HZ` home, `$ZSTOP`, `$Z` status line, `$ZGET key` / `$ZSET key=value` / `$ZSAVE` / `$ZCAL[=tests|ABORT]` proxy to the C3.
 Status report shows the real Z in `MPos:x,y,z`. Hold/Ctrl-X during a Z move sends `STOP`. Any Z move / home that

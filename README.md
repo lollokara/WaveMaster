@@ -220,6 +220,7 @@ A number in brackets is an alias that writes the same value.
 | `$250` | Z-Bro wireless Z axis on (0/1). 0 = `Z` words are ignored. See the Z-Bro section. | 0 | 0 … 1 | `zbroen` |
 | `$251` | Z-Bro move / home timeout, s. | 60 | 1 … 600 | `zbrotmo` |
 | `$252` | Z-Bro speed for G-code Z moves, mm/s. 0 = the C3's `max_speed`. | 0 | 0 … 1000 | `zbrospd` |
+| `$253` | Z-Bro homes itself the first time it is found after boot (0/1). | 1 | 0 … 1 | `zbrohome` |
 
 Read-only GRBL values (`$0`, `$1`, `$2`, `$4`-`$6`, `$10`, `$11`, `$20`-`$27`, `$31`, `$32`, `$102`, `$112`, `$122`, `$132`) are reported for sender compatibility and ignored when set.
 
@@ -277,6 +278,9 @@ let G-code drive it.
 - `G0` / `G1` with `Z<n>`: waits for the XY queue to drain (laser gated off), then moves the axis and waits for it to
   arrive. `G90` / `G91` and `G20` / `G21` apply. `$252` sets the speed (`F` is not used for Z). Errors: the C3 is offline,
   out of range (`error:15`), timeout, not homed, link lost (`error:20`, the reason is in a `[MSG:]` line). With `$250=0` the `Z` word is ignored.
+- **Boot centring**: about 2 s after boot, if the DAC started and the host has sent nothing yet, the beam jumps to the middle of the lens (laser off). It is skipped if any host data arrives first.
+- **Boot homing (`$253=1`)**: when the S3 first links to the Z-Bro after boot and the C3 is idle, it sends one `HOME`. Nothing else is done at that point (no Z moves); Z moves and `$HZ` answer `error:20` (axis busy) until it ends, and a failure is only logged and shown in `$Z` (`autohome=`), no Alarm. It is tried once per S3 boot, at link-up only: a later WiFi reconnect never homes mid-job. `$HZ` repeats it by hand. The axis moves on its own here, so keep the Z path clear before powering the controller.
+- Rayforge: `$J=G91 ... Z<n>` jogs Z (Z-only jogs are accepted when `$250=1`; not cancellable with 0x85). `$HZ` homes. `$HX` / `$HY` are accepted and do nothing.
 - `MPos:x,y,z` in the status report shows the real Z position (0.000 when `$250=0`). While a Z move runs the state is `Run`.
 - Feed hold (`!`) or Ctrl-X during a Z move sends `STOP` (the axis decelerates). A failed or stopped Z move ends with
   `error:20` and `ALARM:3` (state `Alarm`, further G-code answers `error:9`) so the job stops; `$X` or Ctrl-X clears it.
@@ -284,7 +288,7 @@ let G-code drive it.
 
 | Command | Action |
 |:---|:---|
-| `$Z` | Status line: `[ZBRO:enabled=1 link=up ip=... fw=... pos=... state=IDLE homed=1 endstop=0]` |
+| `$Z` | Status line: `[ZBRO:enabled=1 link=up ip=... fw=... pos=... state=IDLE homed=1 endstop=0 autohome=done]` (`autohome` = pending / homing / done / failed / skipped) |
 | `$HZ` | Home the axis (waits up to `$251` s). |
 | `$ZSTOP` | `STOP` (decelerate). |
 | `$ZGET key` | Read a C3 setting: `[ZBRO:VAL key value]`. |

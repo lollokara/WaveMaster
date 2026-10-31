@@ -11,9 +11,12 @@
 #                           ls /dev/cu.usbmodem*). A "VID:PID" such as
 #                           303a:1001 also works.
 #   axes extents / axis_extents   must equal $130 / $131 on the controller.
+#   axes Z extents                must equal [home_backoff, max_range] of the Z-Bro when it homes to min ($ZGET home_to_min side; [3, 60] here).
 #   heads[0].max_power_watts      optical power of your laser (0 = unset).
 #   heads[0].spot_size_mm         your real spot size; sets the raster pitch.
 #
+# The Z axis is the wireless Z-Bro (README "Z-Bro"): needs $250=1 on the controller. With $250=0 the
+# firmware ignores Z words. Z home = $HZ; the controller also homes it by itself when it finds the Z-Bro after boot ($253).
 # Assumes the controller keeps $144=0 (corner origin: (0,0)..(W,H), Y up),
 # which is Rayforge's "Bottom Left" origin.
 machine:
@@ -33,7 +36,7 @@ machine:
   clear_alarm_on_connect: false
   placeholder: false
   home_on_start: false
-  single_axis_homing_enabled: false
+  single_axis_homing_enabled: true
   dialect_uid: wavemaster
   active_wcs: G54
   coordinate_systems:
@@ -62,6 +65,11 @@ machine:
     - letter: Y
       axis_type: linear
       extents: [0, 100]
+      direction: normal
+      resolution: 0.01
+    - letter: Z
+      axis_type: linear
+      extents: [3, 60]
       direction: normal
       resolution: 0.01
   axis_extents: [100, 100]
@@ -162,6 +170,18 @@ machine:
       name: 'DAC readback ($RB)'
       code:
       - '$RB ;read the two DAC output registers (idle only)'
+      enabled: true
+    wavemaster-home-z:
+      uid: wavemaster-home-z
+      name: 'Home Z ($HZ)'
+      code:
+      - '$HZ ;home the Z-Bro axis (needs $250=1)'
+      enabled: true
+    wavemaster-z-status:
+      uid: wavemaster-z-status
+      name: 'Z-Bro status ($Z)'
+      code:
+      - '$Z ;link, position, homed, boot-homing state'
       enabled: true
   speeds:
     max_cut_speed: 60000

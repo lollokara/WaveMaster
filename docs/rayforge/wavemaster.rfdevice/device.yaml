@@ -6,7 +6,7 @@ device:
   name: WaveMaster Galvo
   vendor: WaveMaster
   model: Galvo fiber-laser controller
-  description: ESP32-S3 + AD3552R galvo controller, GRBL 1.1 subset over USB.
+  description: ESP32-S3 + AD3552R galvo controller, GRBL 1.1 subset over USB, optional wireless Z-Bro Z axis ($250=1).
   usb_ids:
   - 303a:1001
 machine:
@@ -24,12 +24,12 @@ machine:
   axis_extents: [100, 100]
   origin: bottom_left
   panel_orientation: native
-  has_z: false
+  has_z: true
   max_travel_speed: 180000
   max_cut_speed: 60000
   acceleration: 2000000
   home_on_start: false
-  single_axis_homing_enabled: false
+  single_axis_homing_enabled: true
   unit_system: metric
   heads:
   - type: LaserHead

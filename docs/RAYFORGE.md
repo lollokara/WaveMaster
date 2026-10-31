@@ -18,7 +18,7 @@ You need three things from [`docs/rayforge/`](rayforge/):
 
 | File | Goes to | What it is |
 |:---|:---|:---|
-| `wavemaster-machine.yaml` | `<config>/machines/wavemaster.yaml` | The machine: GRBL serial driver, 100 x 100 mm, Bottom Left origin, fiber laser head (max power 1000), no Z, arcs on (0.01 mm), no homing, 8 macros. |
+| `wavemaster-machine.yaml` | `<config>/machines/wavemaster.yaml` | The machine: GRBL serial driver, 100 x 100 mm, Bottom Left origin, fiber laser head (max power 1000), Z axis for the Z-Bro (3..60 mm), arcs on (0.01 mm), 10 macros. |
 | `wavemaster-dialect.yaml` | `<config>/dialects/wavemaster.yaml` | The G-code dialect "WaveMaster Galvo". |
 | `wavemaster-machine-wifi.yaml` | `<config>/machines/wavemaster-wifi.yaml` | (optional) The same machine over WiFi: `GrblTelnetDriver`, `host` and `port: 23`. See *Connection over WiFi* below. |
 | `wavemaster.rfdevice/` | (optional) zipped, imported in the wizard | The same machine and dialect as a Rayforge device profile. No port, no macros. |
@@ -92,8 +92,9 @@ Then **Settings > Machines > Add Machine** > **Choose a Machine** > **Import fro
 | `rx_buffer_size_override` | 1024 | Matches `[OPT:V,512,1024]`. `0` would auto-detect the same number from `$I`. 1024 is also the largest value Rayforge accepts. |
 | `poll_status_while_running`, `deadlock_detection` | off | Rayforge defaults. |
 | Work area | 100 x 100 mm, origin `bottom_left` | `$144=0`: (0,0)..(W,H), Y up, X right. |
-| Z axis | none | The firmware has no Z. Rayforge then never emits a Z word. |
-| `home_on_start`, `single_axis_homing_enabled` | off | `$H` is accepted and does nothing. |
+| Z axis | linear, `extents: [3, 60]` | The wireless Z-Bro. Needs `$250=1`; with `$250=0` the firmware ignores Z words. Set the extents to the Z-Bro's usable range: `[home_backoff, max_range]` when `home_to_max=0` (this unit: 3 to 60), `[0, max_range - home_backoff]` when `home_to_max=1`. Read them with `$ZGET max_range`, `$ZGET home_backoff`, `$ZGET home_to_max`. Flip `direction` to `reversed` if Rayforge's up/down is the wrong way round. |
+| `single_axis_homing_enabled` | on | Rayforge sends `$HZ` for Z (`$HX` / `$HY` are accepted and do nothing). |
+| `home_on_start` | off | `$H` is accepted and does nothing. The controller homes the Z-Bro by itself after boot (`$253`), so Rayforge does not need to. |
 | `supports_arcs`, `arc_tolerance` | on, 0.01 mm | The firmware linearises `G2` / `G3` at `$12` (default 0.01). |
 | `max_cut_speed` | 60000 mm/min | Estimate and UI limit. The firmware limit is `$110` (default 300000). Raise it for faster marking. |
 | `max_travel_speed` | 180000 mm/min | Only used for estimates and as the default frame speed. It equals `$201` = 3000 mm/s. Jumps always run at `$201`, not at a G0 feed. |
@@ -219,11 +220,12 @@ clone of 2026-10-12). It has not been run against a real Rayforge install or the
 |:---|:---|:---|
 | **Hardware** > X Extent / Y Extent | `$130` / `$131` (mm) | Default 100 x 100. |
 | **Hardware** > Coordinate Origin (0,0) | **Bottom Left** with `$144=0` | `0` = corner origin: (0,0)..(W,H), work area centred on the lens. `1` = lens centre is (0,0), which Rayforge's work area (it starts at 0,0) cannot express: keep `0`. |
-| **Hardware** > Has Z-Axis | off | No Z axis. |
+| **Hardware** > Has Z-Axis | on | Z-Bro. Extent as in the table above. |
 | **Heads** > laser > Max Power | `$30` | S value for 100 % power. Default 1000. |
 | **General** > Max Cut Speed | up to `$110` (mm/min) | Feeds above `$110` are clamped by the firmware. |
 | **General** > Max Travel Speed | `$201` x 60 (mm/min) | Estimates only. Jumps run at `$201`. |
-| **Advanced** > Home On Start, Allow Single Axis Homing | off | `$H` is accepted and does nothing. |
+| **Advanced** > Allow Single Axis Homing | on | Z home sends `$HZ`. |
+| **Advanced** > Home On Start | off | `$H` is accepted and does nothing; the Z-Bro homes at boot by itself. |
 
 ## 4. Speed semantics
 
@@ -309,7 +311,7 @@ Done with a throwaway Python venv, `python -I`, and a clone of Rayforge at commi
 
 - `DialectManager` loaded `dialects/wavemaster.yaml` and `to_dict(from_dict(file))` reproduced the file exactly.
 - `MachineManager` loaded `machines/wavemaster.yaml` (the real load path, `Machine.from_dict`) and `Machine.to_dict()` reproduced the file exactly. The dialect resolved to `wavemaster` without a "(for ...)" copy, the 8 macros expanded through Rayforge's macro formatter, and the driver arguments are all known setup variables of `GrblSerialDriver`.
-- Rayforge's G-code encoder (`raygeo`) produced the output shown above for a vector job, an arc, and the frame (power 0 and 5 %). No Z word appears.
+- Rayforge's G-code encoder (`raygeo`) produced the output shown above for a vector job, an arc, and the frame (power 0 and 5 %). No Z word appears while the job has no Z (the Z-Bro is untested with Rayforge).
 - `wavemaster.rfdevice/` loaded as a `DeviceProfile`, installed from a zip made with the command above (`install_from_zip`), and `create_machine()` produced the same driver, 100 x 100, Bottom Left, speeds, head and dialect.
 
 Not validated: the GTK user interface itself (menu and button names are read from the source), a real connection to the controller, and anything on the laser. The first-connection check above is the first real test.
