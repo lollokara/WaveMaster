@@ -1,11 +1,14 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "atmega_link.h"
 #include "calib.h"
 #include "dac_task.h"
+#include "esp_attr.h"
 #include "esp_core_dump.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "espfleet_api.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,28 +28,87 @@ static const char *TAG = "wavemaster";
 #define FLEET_HUB_URL    "http://192.168.3.87:8080"
 
 #define CRASH_REPORT_TICKS 150           /* 30 s after boot: the hub link is up */
-#define CRASH_ERASE_TICKS  200           /* 10 s later, once the log shipper has sent it */
+
+#define TWDT_MAGIC 0x74776474u
+
+/* The task watchdog only names the starved task on the console, which the hub never sees. The interrupt hook
+ * below keeps that text, plus what each core was running, in RTC memory (it survives the reset) for the next
+ * boot to log. */
+static RTC_NOINIT_ATTR uint32_t s_twdt_magic;
+static RTC_NOINIT_ATTR char s_twdt_info[224];
+static RTC_NOINIT_ATTR uint32_t s_crash_seen;       /* fingerprint of the core dump already sent to the hub */
+
+static void twdt_collect(void *opaque, const char *msg)
+{
+    (void)opaque;
+    strlcat(s_twdt_info, msg, sizeof(s_twdt_info));
+}
+
+void IRAM_ATTR esp_task_wdt_isr_user_handler(void)
+{
+    char part[40];
+    int cpus = 0;
+
+    s_twdt_info[0] = '\0';
+    esp_task_wdt_print_triggered_tasks(twdt_collect, NULL, &cpus);
+    for (int core = 0; core < 2; core++) {
+        TaskHandle_t t = xTaskGetCurrentTaskHandleForCore(core);
+
+        snprintf(part, sizeof(part), " | core%d running %s", core, t ? pcTaskGetName(t) : "?");
+        strlcat(s_twdt_info, part, sizeof(s_twdt_info));
+    }
+    s_twdt_magic = TWDT_MAGIC;
+}
+
+static void twdt_report(void)
+{
+    size_t n = strnlen(s_twdt_info, sizeof(s_twdt_info) - 1);
+    char chunk[100];
+
+    if (s_twdt_magic != TWDT_MAGIC)
+        return;
+    s_twdt_magic = 0;
+    s_twdt_info[sizeof(s_twdt_info) - 1] = '\0';
+    for (size_t i = 0; i < n; i++)
+        if (s_twdt_info[i] == '\n' || s_twdt_info[i] == '\r')
+            s_twdt_info[i] = ' ';
+    for (size_t off = 0; off < n; off += sizeof(chunk) - 1) {
+        strlcpy(chunk, s_twdt_info + off, sizeof(chunk));
+        ESP_LOGE(TAG, "task watchdog:%s", chunk);
+    }
+}
 
 /* A panic or watchdog reset leaves its summary in the coredump partition. Log it so the hub gets the task, the
- * PC and the backtrace (resolve them with the firmware.elf whose sha is printed). */
-static bool crash_report(void)
+ * PC and the backtrace (resolve them with the firmware.elf whose sha is printed). The dump stays in flash: it
+ * holds every task's stack, and esptool can read it until the next crash replaces it. Each dump is logged once
+ * (fingerprint kept in RTC memory). */
+static void crash_report(void)
 {
     esp_core_dump_summary_t *s;
     char line[96];
     size_t len = 0;
-
+    uint32_t fp;
     esp_err_t err = esp_core_dump_image_check();
 
+    twdt_report();
     if (err != ESP_OK) {
         ESP_LOGI(TAG, "no core dump from the last reset (%s)", esp_err_to_name(err));
-        return false;
+        return;
     }
     s = malloc(sizeof(*s));
     if (!s)
-        return false;
+        return;
     if (esp_core_dump_get_summary(s) == ESP_OK) {
         uint32_t n = s->exc_bt_info.depth < 16 ? s->exc_bt_info.depth : 16;
 
+        fp = s->exc_pc;
+        for (uint32_t i = 0; i < n; i++)
+            fp = fp * 31u + s->exc_bt_info.bt[i];
+        if (fp == s_crash_seen) {
+            free(s);
+            return;
+        }
+        s_crash_seen = fp;
         ESP_LOGE(TAG, "last crash: task %s pc 0x%08lx elf %.9s%s", s->exc_task, (unsigned long)s->exc_pc,
                  (const char *)s->app_elf_sha256, s->exc_bt_info.corrupted ? " (backtrace corrupted)" : "");
         line[0] = '\0';
@@ -60,21 +122,16 @@ static bool crash_report(void)
         }
     }
     free(s);
-    return true;
 }
 
 static void fleet_task(void *arg)
 {
-    bool crash_seen = false;
-
     (void)arg;
     for (unsigned tick = 0;; tick++) {
         espfleet_loop();
         vTaskDelay(pdMS_TO_TICKS(200));
         if (tick == CRASH_REPORT_TICKS)
-            crash_seen = crash_report();
-        else if (tick == CRASH_ERASE_TICKS && crash_seen)
-            esp_core_dump_image_erase();
+            crash_report();
     }
 }
 
