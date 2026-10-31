@@ -57,6 +57,7 @@
  *        0 = Z words are ignored                                      [0]
  *  $251  Z-Bro move / home timeout, s                                 [60]
  *  $252  Z-Bro speed for G-code Z moves, mm/s, 0 = the C3's max_speed [0]
+ *  $253  Z-Bro homes itself when first found after boot (1) or not (0) [1]
  */
 
 #include <stdbool.h>
@@ -102,6 +103,7 @@ enum calib_id {
     CAL_ZBRO_EN,
     CAL_ZBRO_TIMEOUT_S,
     CAL_ZBRO_SPEED,
+    CAL_ZBRO_AUTOHOME,
     CAL_COUNT
 };
 

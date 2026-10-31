@@ -26,6 +26,13 @@
 #define ZBRO_ERR_ABORTED 102    /* reset, hold or STOP while the call was waiting */
 #define ZBRO_ERR_LINK    103    /* link dropped during the call */
 
+/* Boot homing ($253): the link task sends one HOME the first time the C3 is found idle at link-up after S3 boot. */
+#define ZBRO_AUTO_PENDING 0     /* not tried yet (waiting for the C3, or $253=0) */
+#define ZBRO_AUTO_HOMING  1     /* HOME accepted, waiting for EVT HOMED */
+#define ZBRO_AUTO_DONE    2
+#define ZBRO_AUTO_FAILED  3     /* refused or EVT ERR; $HZ retries */
+#define ZBRO_AUTO_SKIPPED 4     /* $253=0, or the C3 was not idle / the grbl task was already using it at link-up */
+
 struct zbro_info {
     bool online;
     char ip[16];
@@ -33,6 +40,7 @@ struct zbro_info {
     float pos;
     int state;                  /* 0..4 as zbro_state_name(), -1 unknown */
     bool homed, endstop;
+    int autohome;               /* ZBRO_AUTO_*: boot homing progress */
 };
 
 bool zbro_link_start(void);

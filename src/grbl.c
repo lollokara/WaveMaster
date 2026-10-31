@@ -42,6 +42,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 #include "galvo_out.h"
 #include "gcode_parse.h"
 #include "host_serial.h"
@@ -358,7 +359,7 @@ static int exec_gcode(const char *line, bool jog)
     }
 
     if (jog) {
-        if (!have_x && !have_y)
+        if (!have_x && !have_y && !(have_z && calib_get(CAL_ZBRO_EN) > 0.5f))   /* Z-only jog needs the Z-Bro */
             return GCODE_ERR_BAD_TARGET;
         motion = 0;
     }
@@ -549,7 +550,7 @@ static int exec_gcode(const char *line, bool jog)
 
     /* Z-Bro axis: only after the XY queue has drained (laser gated off, stream closed). With $250=0 the Z
      * word is ignored, as before. */
-    if (have_z && !jog && (motion == 0 || motion == 1) && calib_get(CAL_ZBRO_EN) > 0.5f) {
+    if (have_z && (motion == 0 || motion == 1) && calib_get(CAL_ZBRO_EN) > 0.5f) {
         float tz = to_mm(az);
         int ze = 0;
 
@@ -857,10 +858,13 @@ static int exec_zbro(char *p)
         char line[160];
 
         zbro_get_info(&zi);
-        snprintf(line, sizeof(line), "enabled=%d link=%s ip=%s fw=%s pos=%.3f state=%s homed=%d endstop=%d",
+        snprintf(line, sizeof(line), "enabled=%d link=%s ip=%s fw=%s pos=%.3f state=%s homed=%d endstop=%d autohome=%s",
                  calib_get(CAL_ZBRO_EN) > 0.5f, zi.online ? "up" : "down", zi.ip[0] ? zi.ip : "-",
                  zi.fw[0] ? zi.fw : "-", (double)fix0(zi.pos),
-                 zi.state >= 0 ? zbro_state_name(zi.state) : "?", zi.homed, zi.endstop);
+                 zi.state >= 0 ? zbro_state_name(zi.state) : "?", zi.homed, zi.endstop,
+                 zi.autohome == ZBRO_AUTO_HOMING ? "homing" : zi.autohome == ZBRO_AUTO_DONE ? "done" :
+                 zi.autohome == ZBRO_AUTO_FAILED ? "failed" :
+                 zi.autohome == ZBRO_AUTO_SKIPPED ? "skipped" : "pending");
         z_print(line);
         return 0;
     }
@@ -963,7 +967,8 @@ static int exec_dollar(char *line)
         print_params();
         return 0;
     }
-    if (strcmp(p, "$X") == 0 || strcmp(p, "$H") == 0 || strcmp(p, "$C") == 0 ||
+    if (strcmp(p, "$X") == 0 || strcmp(p, "$H") == 0 || strcmp(p, "$HX") == 0 ||
+        strcmp(p, "$HY") == 0 || strcmp(p, "$C") == 0 ||
         strcmp(p, "$SLP") == 0)
         return 0;
     if (strcmp(p, "$N") == 0) {
@@ -1211,17 +1216,43 @@ static void run_line(char *line, bool overflow)
     s_acked = s_consumed;
 }
 
+/* Boot: once the DAC is up and the system has had BOOT_CENTER_MS to settle, park the beam in the middle of the
+ * lens (one jump at $201, laser off). Skipped if the output stage failed, or if the host already sent anything
+ * (a job or a jog must not be overridden). */
+#define BOOT_CENTER_MS 2000
+
+static void boot_center(void)
+{
+    float x0, x1, y0, y1;
+
+    if (s_fault || motion_busy() || s_consumed != 0)
+        return;
+    work_limits(&x0, &x1, &y0, &y1);
+    if (submit(MOTION_JUMP, (x0 + x1) * 0.5f, (y0 + y1) * 0.5f, 0, 0.0f, 0.0f)) {
+        publish();
+        ESP_LOGI(TAG, "beam parked at the lens centre (%.1f, %.1f)", (double)s_m.x, (double)s_m.y);
+    }
+}
+
 static void grbl_task(void *arg)
 {
     char line[LINE_MAX_LEN];
     size_t len = 0;
     bool overflow = false, last_cr = false;
     uint8_t buf[64];
+    bool centered = false;
+    int64_t t_boot = esp_timer_get_time() / 1000;
 
     (void)arg;
     print_banner();
     for (;;) {
         size_t n = host_rx_read(buf, sizeof(buf), 100);
+
+        if (!centered && (n || esp_timer_get_time() / 1000 - t_boot >= BOOT_CENTER_MS)) {
+            centered = true;             /* data first = the host is driving: leave the beam alone */
+            if (!n)
+                boot_center();
+        }
 
         for (size_t i = 0; i < n; i++) {
             uint8_t c = buf[i];

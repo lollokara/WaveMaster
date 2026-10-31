@@ -28,7 +28,7 @@ static const char *TAG = "zbro";
 #define DONE_TOL_MM     0.05f    /* EVT DONE counts as arrival only this close to the MOVE target */
 
 enum slot_state { SLOT_IDLE, SLOT_QUEUED, SLOT_SENT, SLOT_DONE };
-enum expect { EXP_NONE, EXP_SLOT, EXP_DISCARD, EXP_POS_DISCARD };
+enum expect { EXP_NONE, EXP_SLOT, EXP_DISCARD, EXP_POS_DISCARD, EXP_AUTOHOME };
 
 /* Single request slot shared between the grbl task and the link task (s_mtx). */
 static struct {
@@ -57,6 +57,7 @@ static volatile bool s_op_home;      /* the armed operation is HOME (completes o
 static volatile float s_op_target;   /* MOVE target, mm */
 static volatile bool s_stopped;      /* a STOP was requested during the armed operation */
 static bool (*s_abort_fn)(void);
+static volatile int s_auto = ZBRO_AUTO_PENDING;   /* boot homing, link task only writes it (except the reset below) */
 
 /* Link-task-only parser state (too big for the 4 KB stack). */
 static struct zbro_lines s_lines;
@@ -125,6 +126,12 @@ static enum expect handle_line(const char *line, size_t len, enum expect exp)
     switch (r->kind) {
     case ZBRO_R_EVT_HOMED:
         s_pos = r->pos;
+        s_homed = true;
+        s_state = 0;
+        if (s_auto == ZBRO_AUTO_HOMING) {
+            s_auto = ZBRO_AUTO_DONE;
+            ESP_LOGI(TAG, "boot homing done, Z=%.3f", (double)r->pos);
+        }
         if (s_op_home)
             evt_fire(0);
         return exp;
@@ -134,6 +141,10 @@ static enum expect handle_line(const char *line, size_t len, enum expect exp)
             evt_fire(fabsf(r->pos - s_op_target) <= DONE_TOL_MM ? 0 : ZBRO_E_STOPPED);
         return exp;
     case ZBRO_R_EVT_ERR:
+        if (s_auto == ZBRO_AUTO_HOMING) {
+            s_auto = ZBRO_AUTO_FAILED;
+            ESP_LOGW(TAG, "boot homing failed (EVT ERR %d), use $HZ", r->code);
+        }
         evt_fire(r->code);
         return exp;
     case ZBRO_R_EVT_CAL:
@@ -153,6 +164,10 @@ static enum expect handle_line(const char *line, size_t len, enum expect exp)
         return exp;
     default:
         break;
+    }
+    if (exp == EXP_AUTOHOME && s_auto == ZBRO_AUTO_HOMING && r->kind == ZBRO_R_ERR) {
+        s_auto = ZBRO_AUTO_FAILED;
+        ESP_LOGW(TAG, "boot homing refused (ERR %d), use $HZ", r->code);
     }
     if (exp == EXP_SLOT)
         slot_finish(r->kind == ZBRO_R_ERR ? r->code : 0, line);
@@ -240,9 +255,10 @@ static bool pump_rx(int fd, enum expect *exp, int64_t *last_rx)
 static bool session(const char *ip, int port)
 {
     enum expect exp = EXP_NONE;
-    int64_t t_sent = 0, t_ping = 0, last_rx;
+    int64_t t_sent = 0, t_ping = 0, t_home = 0, last_rx;
     bool up = false;
     unsigned pings = 0;
+    bool auto_try = (s_auto == ZBRO_AUTO_PENDING);   /* boot homing is only considered once, at link-up */
     int fd = tcp_connect(ip, port);
 
     if (fd < 0) {
@@ -290,6 +306,9 @@ static bool session(const char *ip, int port)
 
         if (exp == EXP_NONE) {
             bool ok = true;
+            bool try_auto = auto_try;
+
+            auto_try = false;
 
             xSemaphoreTake(s_mtx, portMAX_DELAY);
             if (s_stop_req) {
@@ -305,7 +324,18 @@ static bool session(const char *ip, int port)
                 xSemaphoreGive(s_mtx);
                 ok = send_line(fd, line);
                 exp = EXP_SLOT;
+            } else if (try_auto && s_state == 0 && calib_get(CAL_ZBRO_AUTOHOME) > 0.5f && !s_evt_armed) {
+                /* First time the C3 is found idle since the S3 booted: home it. The grbl task cannot start a Z
+                 * operation meanwhile (run_op answers BUSY while s_auto is HOMING). */
+                s_auto = ZBRO_AUTO_HOMING;
+                xSemaphoreGive(s_mtx);
+                ESP_LOGI(TAG, "C3 found, homing the Z axis");
+                ok = send_line(fd, "HOME");
+                exp = EXP_AUTOHOME;
+                t_ping = t_home = t;
             } else {
+                if (try_auto)
+                    s_auto = ZBRO_AUTO_SKIPPED;   /* $253=0 or the axis was busy: never home mid-job later */
                 xSemaphoreGive(s_mtx);
                 if (t - t_ping >= PING_MS) {
                     t_ping = t;
@@ -326,6 +356,13 @@ static bool session(const char *ip, int port)
         if (wait_readable(fd, POLL_MS) && !pump_rx(fd, &exp, &last_rx))
             break;
         t = now_ms();
+        if (s_auto == ZBRO_AUTO_HOMING && t - t_home > (int64_t)calib_get(CAL_ZBRO_TIMEOUT_S) * 1000) {
+            s_auto = ZBRO_AUTO_FAILED;       /* no EVT in time: release run_op / $HZ */
+            send_line(fd, "STOP");
+            exp = EXP_DISCARD;
+            t_sent = t;
+            ESP_LOGW(TAG, "boot homing timed out, stopping the axis");
+        }
         if ((exp != EXP_NONE && t - t_sent > REPLY_MS) || t - last_rx > SILENCE_MS) {
             ESP_LOGW(TAG, "C3 not answering, dropping the link");
             break;
@@ -335,6 +372,10 @@ out:
     if (up)
         ESP_LOGW(TAG, "link down");
     s_online = false;
+    if (s_auto == ZBRO_AUTO_HOMING) {
+        s_auto = ZBRO_AUTO_FAILED;       /* unknown outcome; $HZ or a fresh POS tells */
+        ESP_LOGW(TAG, "link lost during boot homing");
+    }
     slot_finish(ZBRO_ERR_LINK, "");
     evt_fire(ZBRO_ERR_LINK);
     close(fd);
@@ -441,6 +482,7 @@ void zbro_get_info(struct zbro_info *out)
     out->state = s_state;
     out->homed = s_homed;
     out->endstop = s_endstop;
+    out->autohome = s_auto;
 }
 
 void zbro_set_abort_fn(bool (*fn)(void))
@@ -529,6 +571,8 @@ static int run_op(const char *line, int timeout_s, bool home, float target)
 
     if (!s_online)
         return ZBRO_ERR_OFFLINE;
+    if (s_auto == ZBRO_AUTO_HOMING)
+        return ZBRO_E_BUSY;          /* boot homing in progress */
     xSemaphoreTake(s_evt, 0);
     s_evt_code = ZBRO_ERR_LINK;
     s_stopped = false;
