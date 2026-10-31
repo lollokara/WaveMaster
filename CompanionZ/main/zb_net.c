@@ -184,7 +184,13 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *ev = data;
+        wifi_ap_record_t ap;
+
         snprintf(s_sta_ip, sizeof(s_sta_ip), IPSTR, IP2STR(&ev->ip_info.ip));
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+            ESP_LOGI(TAG, "joined ap %02x:%02x:%02x:%02x:%02x:%02x ch %u rssi %d",
+                     ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
+                     (unsigned)ap.primary, ap.rssi);
         s_sta_up = true;
         s_fail_count = 0;
         if (s_ap_on && s_have_creds) {            /* fallback AP no longer needed */
@@ -215,6 +221,8 @@ static void wifi_start(void)
         memcpy(sta.sta.ssid, s_ssid, strlen(s_ssid));          /* struct is zeroed, SSID <= 32 */
         memcpy(sta.sta.password, s_pass, strlen(s_pass));
         sta.sta.threshold.authmode = s_pass[0] ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN;
+        sta.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;           /* the default fast scan joins the first AP found: on a */
+        sta.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;       /* mesh that is often a far node, so take the strongest */
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
         ESP_LOGI(TAG, "joining '%s'", s_ssid);
