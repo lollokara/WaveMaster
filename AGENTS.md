@@ -68,6 +68,14 @@ When modifying firmware code:
    ```
    Compilation must pass with zero warnings in `src/`. The firmware uses `espressif32@6.13.0` (ESP-IDF 5.5).
 
+   Diagnostics for resets and freezes (`src/debug_tools.c`, `src/freeze_watch.c`) are compiled only in the debug
+   build, which sets `CONFIG_WM_DEBUG` through `sdkconfig.debug`:
+   ```bash
+   pio run -e esp32-s3-devkitc-1-debug
+   ```
+   Plain `pio run` builds the normal environment without them. Put any new diagnostic behind `CONFIG_WM_DEBUG` too.
+   After editing `sdkconfig.debug`, delete `sdkconfig.esp32-s3-devkitc-1-debug` so it is regenerated.
+
 2. **ATmega companion**: if you change the companion firmware or the protocol:
    ```bash
    cd ArduinoCompanion && pio run

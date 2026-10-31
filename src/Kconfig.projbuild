@@ -1,0 +1,12 @@
+menu "WaveMaster"
+
+    config WM_DEBUG
+        bool "Debug instrumentation for resets and freezes"
+        default n
+        help
+            Adds the diagnostics in src/debug_tools.c and src/freeze_watch.c: the core 1 task sampler, the task
+            watchdog hook, per-task stack watermarks, the core dump report and the core 0 stall detector. They
+            all log through the ESPFleet agent. Off in a normal build; the esp32-s3-devkitc-1-debug PlatformIO
+            environment turns it on (together with the coredump and watchdog-panic settings in sdkconfig.debug).
+
+endmenu
