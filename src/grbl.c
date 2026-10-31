@@ -85,6 +85,7 @@ static bool s_fault;
 /* $231: guide laser switched on automatically for a frame (moves under
  * M3 S0, which is what Rayforge's Frame sends - real jobs use M4). */
 static bool s_auto_guide;
+static bool s_m3_has_marked;
 static bool s_clamp_warned;
 static uint32_t s_clamp_count;
 
@@ -132,6 +133,7 @@ static void modal_reset(void)
     if ((s_m.preview || s_auto_guide) && !s_fault)
         atmega_link_set_guide(false);
     s_auto_guide = false;
+    s_m3_has_marked = false;
     s_m.motion = 0;
     s_m.relative = false;
     s_m.inches = false;
@@ -142,6 +144,23 @@ static void modal_reset(void)
     s_clamp_warned = false;
     publish();
     s_wco_dirty = true;
+}
+
+/* Pure decision function for $231 auto guide laser on framing moves.
+ * Enables the guide laser for an M3 S0 move, but never once a real cutting
+ * mark (S > 0) has been emitted in this M3 stream: later S0 travel inside a
+ * constant-power job must not light it. The caller drains the queue first, so
+ * the queue being busy (a frame streams ahead of the galvo) must not block it. */
+static bool auto_guide_should_enable(uint8_t laser, float s, bool preview,
+                                     bool auto_guide, bool m3_has_marked,
+                                     bool auto_guide_en)
+{
+    return !auto_guide &&
+           laser == 3 &&
+           !(s > 0.0f) &&
+           !preview &&
+           !m3_has_marked &&
+           auto_guide_en;
 }
 
 static void print_banner(void)
@@ -416,8 +435,11 @@ static int exec_gcode(const char *line, bool jog)
         case 'M': {
             int m = (int)lroundf(v);
 
-            if (m == 3 || m == 4 || m == 5)
+            if (m == 3 || m == 4 || m == 5) {
                 s_m.laser = (uint8_t)m;
+                if (m != 3)
+                    s_m3_has_marked = false;
+            }
             break;
         }
         default:
@@ -538,11 +560,16 @@ static int exec_gcode(const char *line, bool jog)
                     s_jog_active = true;
             }
         } else {
-            if (!s_auto_guide && s_m.laser == 3 && !(s_m.s > 0.0f) && !s_m.preview &&
-                calib_get(CAL_AUTO_GUIDE) > 0.5f) {
+            if (auto_guide_should_enable(s_m.laser, s_m.s, s_m.preview, s_auto_guide,
+                                         s_m3_has_marked, calib_get(CAL_AUTO_GUIDE) > 0.5f)) {
+                if (!wait_idle())
+                    return E_ABORT;
                 atmega_link_set_guide(true);      /* framing: show it with the guide laser */
                 s_auto_guide = true;
             }
+            if (s_m.laser == 3 && s_m.s > 0.0f)
+                s_m3_has_marked = true;
+
             float speed = gcode_mark_speed(s_m.feed, calib_get(CAL_MAX_MARK_RATE),
                                            calib_get(CAL_DEFAULT_MARK_SPEED));
             uint8_t pw = current_power();
@@ -607,6 +634,7 @@ static int exec_gcode(const char *line, bool jog)
         s_m.laser = 0;
         s_m.relative = false;
         s_clamp_warned = false;
+        s_m3_has_marked = false;
         if (s_auto_guide) {
             atmega_link_set_guide(s_m.preview);
             s_auto_guide = false;
