@@ -1,8 +1,10 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "atmega_link.h"
 #include "calib.h"
 #include "dac_task.h"
+#include "esp_core_dump.h"
 #include "esp_log.h"
 #include "espfleet_api.h"
 #include "freertos/FreeRTOS.h"
@@ -22,12 +24,53 @@ static const char *TAG = "wavemaster";
 #define FLEET_TASK_CORE  1               /* core 0 belongs to dac_task */
 #define FLEET_HUB_URL    "http://192.168.3.87:8080"
 
+#define CRASH_REPORT_TICKS 150           /* 30 s after boot: the hub link is up */
+#define CRASH_ERASE_TICKS  200           /* 10 s later, once the log shipper has sent it */
+
+/* A panic or watchdog reset leaves its summary in the coredump partition. Log it so the hub gets the task, the
+ * PC and the backtrace (resolve them with the firmware.elf whose sha is printed). */
+static bool crash_report(void)
+{
+    esp_core_dump_summary_t *s;
+    char line[96];
+    size_t len = 0;
+
+    if (esp_core_dump_image_check() != ESP_OK)
+        return false;
+    s = malloc(sizeof(*s));
+    if (!s)
+        return false;
+    if (esp_core_dump_get_summary(s) == ESP_OK) {
+        uint32_t n = s->exc_bt_info.depth < 16 ? s->exc_bt_info.depth : 16;
+
+        ESP_LOGE(TAG, "last crash: task %s pc 0x%08lx elf %.9s%s", s->exc_task, (unsigned long)s->exc_pc,
+                 (const char *)s->app_elf_sha256, s->exc_bt_info.corrupted ? " (backtrace corrupted)" : "");
+        line[0] = '\0';
+        for (uint32_t i = 0; i < n; i++) {
+            len += snprintf(line + len, sizeof(line) - len, " 0x%08lx", (unsigned long)s->exc_bt_info.bt[i]);
+            if (len > sizeof(line) - 14 || i + 1 == n) {
+                ESP_LOGE(TAG, "backtrace:%s", line);
+                len = 0;
+                line[0] = '\0';
+            }
+        }
+    }
+    free(s);
+    return true;
+}
+
 static void fleet_task(void *arg)
 {
+    bool crash_seen = false;
+
     (void)arg;
-    for (;;) {
+    for (unsigned tick = 0;; tick++) {
         espfleet_loop();
         vTaskDelay(pdMS_TO_TICKS(200));
+        if (tick == CRASH_REPORT_TICKS)
+            crash_seen = crash_report();
+        else if (tick == CRASH_ERASE_TICKS && crash_seen)
+            esp_core_dump_image_erase();
     }
 }
 

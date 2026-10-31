@@ -61,3 +61,8 @@ CONFIG_ESPFLEET_OTA=n
 CONFIG_ESPFLEET_MDNS=n
 CONFIG_ESPFLEET_DEVICE_NAME="wavemaster"
 CONFIG_ESPFLEET_PROJECT_SLUG="lorenzo/wavemaster"
+
+# A panic or watchdog reset leaves its summary (task, PC, backtrace) in the
+# coredump partition; main.c logs it to the hub on the next boot.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y

@@ -4,5 +4,5 @@ idf_component_register(
          "laser_io.c" "ad3552r_board.c" "atmega_link.c" "net_wifi.c" "net_server.c"
          "zbro_link.c" "../shared/zbro_proto.c"
     INCLUDE_DIRS "." "../shared"
-    REQUIRES ad3552r driver nvs_flash esp_timer esp_driver_usb_serial_jtag esp_driver_gptimer esp_driver_ledc esp_driver_spi esp_driver_uart esp_driver_gpio esp_wifi esp_netif esp_event lwip espfleet
+    REQUIRES ad3552r driver nvs_flash esp_timer esp_driver_usb_serial_jtag esp_driver_gptimer esp_driver_ledc esp_driver_spi esp_driver_uart esp_driver_gpio esp_wifi esp_netif esp_event lwip espfleet espcoredump
 )
