@@ -383,13 +383,22 @@ static void do_arm(void)
 
 /* The stream cannot open: drop the chunk, but no faster than it would have
  * played. Recycling instantly lets the motion task spin through the whole job
- * without ever blocking and starve IDLE1 into a task watchdog reset. */
+ * without ever blocking and starve IDLE1 into a task watchdog reset. The wait
+ * is sliced so an abort or a feed hold is seen within DROP_SLICE_MS: a chunk
+ * at a slow tick setting outlasts galvo_out_abort()'s 300 ms acknowledgement. */
+#define DROP_SLICE_MS 10
+
 static void drop_paced(struct galvo_chunk *c)
 {
     uint32_t ms = (uint32_t)((float)c->n_ticks * galvo_out_tick_us() / 1000.0f) + 1;
 
     complete(c, false);
-    vTaskDelay(pdMS_TO_TICKS(ms));
+    while (ms && !atomic_load(&g_galvo.abort) && !atomic_load(&g_galvo.held)) {
+        uint32_t slice = ms < DROP_SLICE_MS ? ms : DROP_SLICE_MS;
+
+        vTaskDelay(pdMS_TO_TICKS(slice));
+        ms -= slice;
+    }
 }
 
 /* Returns 0 when the chunk was consumed (queued or dropped), 1 if it must
@@ -422,6 +431,7 @@ static int try_start(struct galvo_chunk *c)
     if (!s_session_open && !session_open()) {
         if (!s_fault) {
             s_fault = true;
+            laser_io_gate(false);
             atmega_link_set_armed(false);
             atmega_link_set_power(0);
             ESP_LOGE(TAG, "stream open failed; laser disarmed and power zeroed");
@@ -504,7 +514,7 @@ static TickType_t service(void)
     }
 
     held = atomic_load(&g_galvo.held);
-    while (!held) {
+    while (!held && !atomic_load(&g_galvo.abort)) {
         if (!s_next && xQueueReceive(g_galvo.ready_q, &s_next, 0) != pdTRUE) {
             s_next = NULL;
             break;
@@ -512,6 +522,7 @@ static TickType_t service(void)
         if (try_start(s_next))
             break;
         s_next = NULL;
+        held = atomic_load(&g_galvo.held);
     }
 
     if (s_session_open && s_outstanding == 0 && (!s_next || held)) {

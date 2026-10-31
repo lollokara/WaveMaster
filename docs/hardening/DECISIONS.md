@@ -11,3 +11,11 @@ Answers to the five questions in PLAN.md section 5, given by the owner.
    to `docs/rayforge/wavemaster-machine*.yaml` on the Rayforge Mac (not in this repo yet), so this is blocked
    until that Mac is awake and the edits are committed. Needs a bench check that G54/G92 behave.
 5. ESPFleet telemetry: stays always on.
+
+## Known limitations accepted after FINAL-REVIEW.md
+- After the DAC stream recovers from a failed open, the first chunk plays with the laser unarmed
+  (arming is evaluated before session_open). Fails safe: one short mark without emission.
+- `$H` with `$250=1` returns an error when the Z-Bro is offline, like `$HZ`.
+- An M3 stream followed by another M3 stream without an M5 does not auto-light the guide again.
+- Not verified without hardware: gate-edge timing under the new critical section (scope), `$RB`
+  readback after the buffer fix, `$H` homing a real Z-Bro.
