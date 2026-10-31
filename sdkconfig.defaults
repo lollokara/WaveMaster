@@ -66,3 +66,8 @@ CONFIG_ESPFLEET_PROJECT_SLUG="lorenzo/wavemaster"
 # coredump partition; main.c logs it to the hub on the next boot.
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+
+# A starved task (the task watchdog fires after 5 s) must panic, so the core
+# dump shows what held the core. Without it only the hardware stage resets the
+# chip and nothing is recorded.
+CONFIG_ESP_TASK_WDT_PANIC=y

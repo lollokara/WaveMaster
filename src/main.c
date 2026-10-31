@@ -35,8 +35,12 @@ static bool crash_report(void)
     char line[96];
     size_t len = 0;
 
-    if (esp_core_dump_image_check() != ESP_OK)
+    esp_err_t err = esp_core_dump_image_check();
+
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "no core dump from the last reset (%s)", esp_err_to_name(err));
         return false;
+    }
     s = malloc(sizeof(*s));
     if (!s)
         return false;
