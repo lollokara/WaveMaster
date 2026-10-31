@@ -158,6 +158,8 @@ static void apply_config(void)
     strlcpy((char *)wc.sta.password, s_pass, sizeof(wc.sta.password));
     wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;     /* no open / WEP / WPA1 */
     wc.sta.pmf_cfg.capable = true;
+    wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;         /* the default fast scan joins the first AP found: on a */
+    wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;     /* mesh that is often a far node, so take the strongest */
     esp_wifi_set_config(WIFI_IF_STA, &wc);
 }
 
@@ -198,8 +200,15 @@ static void mgr_task(void *arg)
             net_server_drop_client();   /* do not wait for TCP keepalive to notice */
         }
         if (s_ev_ip) {
+            wifi_ap_record_t ap;
+
             s_ev_ip = false;
-            ESP_LOGI(TAG, "connected, ip %s", s_ip);
+            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+                ESP_LOGI(TAG, "connected, ip %s, ap %02x:%02x:%02x:%02x:%02x:%02x ch %u rssi %d", s_ip,
+                         ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
+                         (unsigned)ap.primary, ap.rssi);
+            else
+                ESP_LOGI(TAG, "connected, ip %s", s_ip);
         }
         if (enabled && have) {
             if (!s_running && s_init_fails < INIT_FAILS_MAX) {
