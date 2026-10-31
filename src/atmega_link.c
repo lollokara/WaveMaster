@@ -255,6 +255,7 @@ static void check_link_transition(void)
 static enum action decide(int64_t now, int64_t next_poll)
 {
     enum action act = ACT_NONE;
+    bool dropped = false;
 
     portENTER_CRITICAL(&s_lock);
     if (!link_ok_locked(now)) {
@@ -277,13 +278,15 @@ static enum action decide(int64_t now, int64_t next_poll)
              * silently re-arm, follow it to the safe state. */
             s_des_armed = false;
             s_des_power = 0;
-            ESP_LOGW(TAG, "ATmega is disarmed but arm was still requested; "
-                          "dropping to disarmed");
+            dropped = true;
             act = (s_rs.power != 0) ? ACT_POWER : ACT_NONE;
         } else if (now >= next_poll)
             act = ACT_POLL;
     }
     portEXIT_CRITICAL(&s_lock);
+    if (dropped)                         /* logging takes mutexes: never with the spinlock held */
+        ESP_LOGW(TAG, "ATmega is disarmed but arm was still requested; "
+                      "dropping to disarmed");
     return act;
 }
 
