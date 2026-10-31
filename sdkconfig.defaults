@@ -53,3 +53,11 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 CONFIG_LWIP_MAX_SOCKETS=4
+
+# ESPFleet agent: reports reset reason, version and health to the hub. There
+# is a single app slot (partitions.csv), so OTA stays off (the agent also
+# detects this itself). Its task is created in main.c, pinned to core 1.
+CONFIG_ESPFLEET_OTA=n
+CONFIG_ESPFLEET_MDNS=n
+CONFIG_ESPFLEET_DEVICE_NAME="wavemaster"
+CONFIG_ESPFLEET_PROJECT_SLUG="lorenzo/wavemaster"

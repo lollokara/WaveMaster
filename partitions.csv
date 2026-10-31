@@ -1,0 +1,6 @@
+# Name,    Type, SubType, Offset,   Size,     Flags
+# nvs, phy_init and the table itself sit where the default 1 MB layout put
+# them: NVS holds the calibration, so it must not move. Only factory grew.
+nvs,       data, nvs,     0x9000,   0x6000,
+phy_init,  data, phy,     0xf000,   0x1000,
+factory,   app,  factory, 0x10000,  0x300000,

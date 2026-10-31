@@ -1,0 +1,62 @@
+menu "ESPFleet agent"
+
+    config ESPFLEET_HUB_URL
+        string "Hub base URL"
+        default "http://192.168.3.87:8080"
+        help
+            Base URL of the ESPFleet hub, without a trailing slash.
+            Can be overridden at runtime by espfleet_start()/EspFleet.begin().
+
+    config ESPFLEET_PROJECT_SLUG
+        string "Gogs project (owner/repo)"
+        default ""
+        help
+            Leave empty to derive it from the project's git remote at build time.
+
+    config ESPFLEET_DEVICE_NAME
+        string "Device name"
+        default ""
+        help
+            Leave empty to use espfleet-<last 3 MAC bytes>.
+
+    config ESPFLEET_HEARTBEAT_MS
+        int "Heartbeat interval (ms)"
+        range 5000 3600000
+        default 30000
+
+    config ESPFLEET_OTA
+        bool "Accept over-the-air updates from the hub"
+        default y
+
+    config ESPFLEET_MDNS
+        bool "Advertise _espfleet._tcp over mDNS"
+        default y
+        help
+            Requires the espressif/mdns component. Silently disabled if absent.
+
+    config ESPFLEET_WEB_UI_PORT
+        int "Port of the web UI this project already serves (0 = none)"
+        range 0 65535
+        default 0
+        help
+            The hub shows an "Open Web UI" button when this is non-zero.
+
+    config ESPFLEET_STATUS_PORT
+        int "Port for the agent's own /fleet/info responder (0 = disabled)"
+        range 0 65535
+        default 0
+        help
+            Only needed if this project does not already run an HTTP server.
+            If it does, serve espfleet_info_json() from it instead.
+
+    config ESPFLEET_AGENT_STACK
+        int "Agent task stack size (bytes)"
+        range 4096 16384
+        default 6144
+
+    config ESPFLEET_AGENT_PRIO
+        int "Agent task priority"
+        range 1 10
+        default 1
+
+endmenu

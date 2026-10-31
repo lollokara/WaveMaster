@@ -4,6 +4,9 @@
 #include "calib.h"
 #include "dac_task.h"
 #include "esp_log.h"
+#include "espfleet_api.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "galvo_out.h"
 #include "grbl.h"
 #include "host_serial.h"
@@ -13,6 +16,42 @@
 #include "zbro_link.h"
 
 static const char *TAG = "wavemaster";
+
+#define FLEET_TASK_STACK 6144
+#define FLEET_TASK_PRIO  1
+#define FLEET_TASK_CORE  1               /* core 0 belongs to dac_task */
+#define FLEET_HUB_URL    "http://192.168.3.87:8080"
+
+static void fleet_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        espfleet_loop();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+/* Reports reset reason, version and health to the ESPFleet hub. Waits for the
+ * WiFi station's IP by itself. Needs NVS (calib_init) and the host log wrapper
+ * (host_serial_init) to be up so it can chain onto it. */
+static void fleet_start(void)
+{
+    espfleet_config_t cfg;
+
+    espfleet_config_default(&cfg);
+    cfg.hub = FLEET_HUB_URL;
+    cfg.name = "wavemaster";
+    cfg.enable_ota = false;
+    cfg.enable_mdns = false;
+    cfg.spawn_task = false;
+    if (espfleet_start(&cfg) != 0) {
+        ESP_LOGE(TAG, "ESPFleet agent failed to start");
+        return;
+    }
+    if (xTaskCreatePinnedToCore(fleet_task, "espfleet", FLEET_TASK_STACK, NULL,
+                                FLEET_TASK_PRIO, NULL, FLEET_TASK_CORE) != pdPASS)
+        ESP_LOGE(TAG, "ESPFleet task failed to start");
+}
 
 void app_main(void)
 {
@@ -42,6 +81,7 @@ void app_main(void)
         ESP_LOGE(TAG, "network manager failed to start");
     if (!zbro_link_start())              /* idle until the WiFi station is up */
         ESP_LOGE(TAG, "Z-Bro link failed to start");
+    fleet_start();
 
     if (hw_ok)
         ESP_LOGI(TAG, "ready: tick %.2f us, field %.0fx%.0f mm, scale %.4f/%.4f V/mm",

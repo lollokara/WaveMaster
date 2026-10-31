@@ -1,0 +1,14 @@
+{
+  "name": "espfleet",
+  "version": "1.1.0",
+  "description": "Lightweight fleet agent for ESP32 boards: heartbeat to a central hub, report the exact git commit you are running, expose a JSON status endpoint, advertise over mDNS and accept HTTP OTA updates. Works on esp32, esp32s2, esp32s3, esp32c3, esp32c5 and esp32c6, under both the Arduino and ESP-IDF frameworks.",
+  "keywords": "esp32, ota, fleet, mdns, gogs, management",
+  "license": "MIT",
+  "frameworks": ["arduino", "espidf"],
+  "platforms": ["espressif32"],
+  "headers": "EspFleet.h",
+  "build": {
+    "srcDir": "src",
+    "srcFilter": ["+<*.cpp>"]
+  }
+}
