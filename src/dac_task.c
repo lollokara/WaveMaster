@@ -366,6 +366,17 @@ static void do_arm(void)
     }
 }
 
+/* The stream cannot open: drop the chunk, but no faster than it would have
+ * played. Recycling instantly lets the motion task spin through the whole job
+ * without ever blocking and starve IDLE1 into a task watchdog reset. */
+static void drop_paced(struct galvo_chunk *c)
+{
+    uint32_t ms = (uint32_t)((float)c->n_ticks * galvo_out_tick_us() / 1000.0f) + 1;
+
+    complete(c, false);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
 /* Returns 0 when the chunk was consumed (queued or dropped), 1 if it must
  * wait (kept in s_next). */
 static int try_start(struct galvo_chunk *c)
@@ -394,7 +405,7 @@ static int try_start(struct galvo_chunk *c)
         atomic_fetch_add(&g_galvo.barriers, 1);
     }
     if (!s_session_open && !session_open()) {
-        complete(c, false); /* drop */
+        drop_paced(c);
         return 0;
     }
     if (s_outstanding >= MAX_INFLIGHT)
