@@ -575,7 +575,8 @@ int32_t ad3552r_write_reg(struct ad3552r_desc *desc, uint8_t addr,
 			  uint16_t val)
 {
 	struct ad3552_transfer_data msg = { 0 };
-	uint8_t buf[AD3552R_MAX_REG_SIZE] = { 0 };
+	/* +1 for prepended instruction byte in single_transfer */
+	uint8_t buf[AD3552R_MAX_REG_SIZE + 1] = { 0 };
 	uint8_t reg_len;
 	int32_t err;
 
@@ -615,7 +616,8 @@ int32_t ad3552r_write_reg(struct ad3552r_desc *desc, uint8_t addr,
 int32_t ad3552r_read_reg(struct ad3552r_desc *desc, uint8_t addr, uint16_t *val)
 {
 	struct ad3552_transfer_data msg = { 0 };
-	uint8_t buf[AD3552R_MAX_REG_SIZE] = { 0 };
+	/* +1 for prepended instruction byte in single_transfer */
+	uint8_t buf[AD3552R_MAX_REG_SIZE + 1] = { 0 };
 	uint8_t reg_len;
 	int32_t err;
 
