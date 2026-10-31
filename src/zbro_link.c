@@ -101,8 +101,10 @@ static bool send_line(int fd, const char *line)
     while (off < n) {
         int w = send(fd, b + off, n - off, 0);
 
-        if (w <= 0)
+        if (w <= 0) {
+            ESP_LOGW(TAG, "send failed (%d, errno %d), request '%.12s'", w, errno, line);
             return false;
+        }
         off += (size_t)w;
     }
     return true;
@@ -228,8 +230,13 @@ static bool pump_rx(int fd, enum expect *exp, int64_t *last_rx)
     uint8_t buf[96];
     int n = recv(fd, buf, sizeof(buf), 0);
 
-    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+        if (n == 0)
+            ESP_LOGW(TAG, "the C3 closed the link");
+        else
+            ESP_LOGW(TAG, "receive failed, errno %d", errno);
         return false;
+    }
     for (int i = 0; i < n; i++) {
         const char *line;
         size_t len;
@@ -364,7 +371,8 @@ static bool session(const char *ip, int port)
             ESP_LOGW(TAG, "boot homing timed out, stopping the axis");
         }
         if ((exp != EXP_NONE && t - t_sent > REPLY_MS) || t - last_rx > SILENCE_MS) {
-            ESP_LOGW(TAG, "C3 not answering, dropping the link");
+            ESP_LOGW(TAG, "C3 not answering (waiting for reply type %d: %ld ms since the request, %ld ms since any data), dropping the link",
+                     (int)exp, (long)(t - t_sent), (long)(t - last_rx));
             break;
         }
     }

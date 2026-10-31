@@ -33,6 +33,7 @@
 #define BEACON_MS      2000
 #define AP_WINDOW_MS   (10 * 60 * 1000)   /* fallback AP stays up this long after the STA gave up */
 #define PING_TIMEOUT_MS 3000              /* no traffic from the client for this long during its move: STOP */
+#define TX_STALL_MS    500                /* a full send buffer is waited out this long before the client is dropped */
 
 static const char *TAG = "zb_net";
 
@@ -249,21 +250,35 @@ static void mdns_start(void)
 
 /* ------------------------------------------------------- COM link ----- */
 
-/* Non-blocking send of one complete line. Any failure drops the client (the S3 reconnects). */
+/* Sends one complete line without blocking the caller for long. A momentarily full send buffer (EAGAIN: a WiFi
+ * hiccup, the S3 slow to ACK) is waited out for TX_STALL_MS, since a half-sent line would break the framing.
+ * Any other failure, or a longer stall, drops the client (the S3 reconnects). */
 static void send_line(const char *s, int n)
 {
     if (n <= 0 || !s_tx_mtx) return;
     xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
     if (s_cfd >= 0) {
         int off = 0;
+        int64_t t0 = esp_timer_get_time();
         while (off < n) {
             int r = send(s_cfd, s + off, n - off, MSG_DONTWAIT);
-            if (r <= 0) {
-                if (r < 0 && errno == EINTR) continue;
-                shutdown(s_cfd, SHUT_RDWR);       /* the RX loop sees EOF and closes */
-                break;
+            if (r > 0) {
+                off += r;
+                continue;
             }
-            off += r;
+            if (r < 0 && errno == EINTR) continue;
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+                esp_timer_get_time() - t0 < (int64_t)TX_STALL_MS * 1000) {
+                fd_set wr;
+                struct timeval tv = {.tv_sec = 0, .tv_usec = 20 * 1000};
+                FD_ZERO(&wr);
+                FD_SET(s_cfd, &wr);
+                select(s_cfd + 1, NULL, &wr, NULL, &tv);
+                continue;
+            }
+            ESP_LOGW(TAG, "send failed (%d, errno %d, %d of %d bytes), dropping the client", r, errno, off, n);
+            shutdown(s_cfd, SHUT_RDWR);       /* the RX loop sees EOF and closes */
+            break;
         }
     }
     xSemaphoreGive(s_tx_mtx);
