@@ -63,6 +63,7 @@ static uint64_t s_chunk_start;
 static uint64_t s_next_edge_time;
 static volatile bool s_alarm_armed;
 static volatile bool s_gate_state;
+static portMUX_TYPE s_edge_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_tick_q8;              /* timer counts per tick * 256 */
 static atomic_int s_isr_inflight;       /* queued and not yet completed */
 static volatile bool s_isr_drained;     /* inflight reached 0 */
@@ -111,8 +112,9 @@ static void IRAM_ATTR isr_arm_next(void)
         s_alarm_cfg.alarm_count = t;
         s_alarm_cfg.reload_count = 0;
         s_alarm_cfg.flags.auto_reload_on_alarm = false;
-        gptimer_set_alarm_action(s_timer, &s_alarm_cfg);
         s_alarm_armed = true;
+        if (gptimer_set_alarm_action(s_timer, &s_alarm_cfg) != ESP_OK)
+            s_alarm_armed = false;
         return;
     }
     isr_disarm();
@@ -121,17 +123,22 @@ static void IRAM_ATTR isr_arm_next(void)
 static bool IRAM_ATTR on_alarm(gptimer_handle_t t, const gptimer_alarm_event_data_t *e, void *ctx)
 {
     (void)t; (void)e; (void)ctx;
-    if (!s_cur || !s_alarm_armed)
+    portENTER_CRITICAL_ISR(&s_edge_mux);
+    if (!s_cur || !s_alarm_armed) {
+        portEXIT_CRITICAL_ISR(&s_edge_mux);
         return false; /* stale */
+    }
     if (timer_now() < s_next_edge_time) {
         s_alarm_armed = false;
         isr_arm_next(); /* early/stale wake: re-arm the same edge */
+        portEXIT_CRITICAL_ISR(&s_edge_mux);
         return false;
     }
     s_alarm_armed = false;
     isr_toggle();
     s_edge_idx++;
     isr_arm_next();
+    portEXIT_CRITICAL_ISR(&s_edge_mux);
     return false;
 }
 
@@ -141,6 +148,7 @@ static void IRAM_ATTR stream_pre(void *user)
     struct galvo_chunk *c = (struct galvo_chunk *)user;
     uint64_t now = timer_now();
 
+    portENTER_CRITICAL_ISR(&s_edge_mux);
     isr_disarm();
     s_edge_idx = 0;
     s_chunk_start = now + START_LATENCY_COUNTS;
@@ -148,6 +156,7 @@ static void IRAM_ATTR stream_pre(void *user)
     laser_io_gate(c->gate_start);
     s_cur = c;
     isr_arm_next();
+    portEXIT_CRITICAL_ISR(&s_edge_mux);
 }
 
 /* Runs in the SPI ISR right after the chunk's transaction completed (and,
@@ -158,6 +167,7 @@ static void IRAM_ATTR stream_post(void *user)
     BaseType_t hp = pdFALSE;
     int left;
 
+    portENTER_CRITICAL_ISR(&s_edge_mux);
     isr_disarm();
     s_cur = NULL;
     left = atomic_fetch_sub(&s_isr_inflight, 1) - 1;
@@ -173,6 +183,8 @@ static void IRAM_ATTR stream_post(void *user)
         s_gate_state = c->gate_end;
         laser_io_gate(c->gate_end);
     }
+    portEXIT_CRITICAL_ISR(&s_edge_mux);
+
     if (s_task) {
         vTaskNotifyGiveFromISR(s_task, &hp);
         if (hp == pdTRUE)
@@ -185,6 +197,7 @@ static SemaphoreHandle_t s_init_sem;
 static SemaphoreHandle_t s_bus_mtx;     /* held for the whole stream session */
 static bool s_init_ok;
 static bool s_session_open;
+static bool s_fault;
 static spi_device_handle_t s_dev;
 static struct galvo_chunk *s_next;      /* dequeued, waiting to be started */
 static int s_outstanding;               /* queued minus reaped */
@@ -257,7 +270,8 @@ static bool session_open(void)
     xSemaphoreTake(s_bus_mtx, portMAX_DELAY);
     err = ad3552r_board_stream_open(hz);
     if (err) {
-        ESP_LOGE(TAG, "stream open failed: %ld", (long)err);
+        if (!s_fault)
+            ESP_LOGE(TAG, "stream open failed: %ld", (long)err);
         xSemaphoreGive(s_bus_mtx);
         return false;
     }
@@ -278,6 +292,7 @@ static bool session_open(void)
     s_isr_drained = false;
     s_drained = false;
     s_session_open = true;
+    s_fault = false;
     s_idle_since_us = esp_timer_get_time();
     return true;
 }
@@ -313,7 +328,7 @@ static bool needs_power(const struct galvo_chunk *c)
 {
     struct atmega_status st;
 
-    if (c->power_word < 0 || (!c->gate_start && c->n_edges == 0))
+    if (s_fault || c->power_word < 0 || (!c->gate_start && c->n_edges == 0))
         return false;
     atmega_link_get_status(&st);
     return st.link_ok && st.power != (uint8_t)c->power_word;
@@ -344,7 +359,7 @@ static bool needs_arm(const struct galvo_chunk *c)
 {
     struct atmega_status st;
 
-    if (s_arm_failed || calib_get(CAL_AUTO_ARM) == 0.0f)
+    if (s_fault || s_arm_failed || calib_get(CAL_AUTO_ARM) == 0.0f)
         return false;
     if (!c->gate_start && c->n_edges == 0)
         return false;
@@ -405,6 +420,12 @@ static int try_start(struct galvo_chunk *c)
         atomic_fetch_add(&g_galvo.barriers, 1);
     }
     if (!s_session_open && !session_open()) {
+        if (!s_fault) {
+            s_fault = true;
+            atmega_link_set_armed(false);
+            atmega_link_set_power(0);
+            ESP_LOGE(TAG, "stream open failed; laser disarmed and power zeroed");
+        }
         drop_paced(c);
         return 0;
     }
