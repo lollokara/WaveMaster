@@ -29,4 +29,8 @@ bool dac_task_readback(uint16_t *code_x, uint16_t *code_y);
  * the number of registers read into addrs/vals, or a negative value. */
 int dac_task_regdump(const uint8_t **addrs, uint16_t *vals, size_t max);
 
+/* Diagnostic: the DAC's alert registers (see ad3552r_board_alert_status()).
+ * Same rules as dac_task_regdump(). Returns 0, or a negative value. */
+int dac_task_alert(uint16_t *iface, uint16_t *mask, uint16_t *err, bool clear);
+
 #endif /* DAC_TASK_H_ */

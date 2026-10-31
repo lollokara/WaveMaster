@@ -64,6 +64,15 @@ uint32_t ad3552r_board_guard_repairs(void);
  * static table) or a negative error. Only while the stream is closed. */
 int32_t ad3552r_board_dump_regs(const uint8_t **addrs, uint16_t *vals, size_t max);
 
+/* Diagnostics: INTERFACE_STATUS_A, ERR_ALARM_MASK and ERR_STATUS, the
+ * registers behind the DAC's ALERT output. With clear the latched error bits
+ * that were set are written back (write-1-to-clear). Only while the stream is
+ * closed. Returns 0 or a negative error. */
+int32_t ad3552r_board_alert_status(uint16_t *iface, uint16_t *mask, uint16_t *err, bool clear);
+
+/* Comma-separated names of the status bits set in iface / err ("" when none). */
+void ad3552r_board_alert_names(char *out, size_t size, uint16_t iface, uint16_t err);
+
 /* spi_device_handle_t of the current device (valid after stream_open). */
 void *ad3552r_board_spi_dev(void);
 /* Clock the device really runs at (Hz), 0 if unknown. */

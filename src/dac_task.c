@@ -659,3 +659,14 @@ int dac_task_regdump(const uint8_t **addrs, uint16_t *vals, size_t max)
     xSemaphoreGive(s_bus_mtx);
     return n;
 }
+
+int dac_task_alert(uint16_t *iface, uint16_t *mask, uint16_t *err, bool clear)
+{
+    int32_t e;
+
+    if (!s_init_ok || xSemaphoreTake(s_bus_mtx, 0) != pdTRUE)
+        return -1; /* stream open (or not ready) */
+    e = ad3552r_board_alert_status(iface, mask, err, clear);
+    xSemaphoreGive(s_bus_mtx);
+    return e ? -1 : 0;
+}

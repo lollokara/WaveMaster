@@ -1006,7 +1006,7 @@ static int exec_dollar(char *line)
         p[--len] = '\0';
 
     if (len == 1) {
-        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $RD $PW=word $GT=ms $LT=ms,S $WIFI[=ssid,pass|CLEAR] $WIFIH=hexssid,hexpass $Z $HZ $ZSTOP $ZGET key $ZSET key=val $ZSAVE $ZCAL[=tests|ABORT] ~ ! ? ctrl-x]\r\n");
+        host_puts("[HLP:$$ $# $G $I $N $x=val $Nx=line $J=line $SLP $C $X $H $S $RB $RD $DS[=C] $PW=word $GT=ms $LT=ms,S $WIFI[=ssid,pass|CLEAR] $WIFIH=hexssid,hexpass $Z $HZ $ZSTOP $ZGET key $ZSET key=val $ZSAVE $ZCAL[=tests|ABORT] ~ ! ? ctrl-x]\r\n");
         return 0;
     }
     if (strcmp(p, "$$") == 0) {
@@ -1040,6 +1040,21 @@ static int exec_dollar(char *line)
     }
     if (strncmp(p, "$N", 2) == 0 && strchr(p, '='))
         return 0;                                /* startup blocks are not stored */
+    if (strcmp(p, "$DS") == 0 || strcmp(p, "$DS=C") == 0) {
+        /* The DAC's ALERT output: status registers behind it. $DS=C clears the latched bits. */
+        uint16_t iface = 0, mask = 0, err = 0;
+        char names[96];
+
+        if (s_fault || motion_busy() || galvo_out_busy() ||
+            dac_task_alert(&iface, &mask, &err, p[3] == '=') != 0) {
+            host_puts("[MSG:DS unavailable (busy or SPI error)]\r\n");
+        } else {
+            ad3552r_board_alert_names(names, sizeof(names), iface, err);
+            host_printf("[MSG:DS iface=%02X mask=%02X err=%02X set=%s%s]\r\n", iface & 0xFF, mask & 0xFF,
+                        err & 0xFF, names[0] ? names : "none", p[3] == '=' ? " (cleared)" : "");
+        }
+        return 0;
+    }
     if (strcmp(p, "$RB") == 0) {
         uint16_t cx, cy;
 

@@ -311,6 +311,53 @@ int32_t ad3552r_board_dump_regs(const uint8_t **addrs, uint16_t *vals, size_t ma
     return (int32_t)n;
 }
 
+#define IFACE_CLEARABLE (AD3552R_MASK_CLOCK_COUNTING_ERROR | AD3552R_MASK_INVALID_OR_NO_CRC | \
+                         AD3552R_MASK_WRITE_TO_READ_ONLY_REGISTER | \
+                         AD3552R_MASK_PARTIAL_REGISTER_ACCESS | AD3552R_MASK_REGISTER_ADDRESS_INVALID)
+#define ERR_CLEARABLE (AD3552R_MASK_REF_RANGE_ERR_STATUS | \
+                       AD3552R_MASK_DUAL_SPI_STREAM_EXCEEDS_DAC_ERR_STATUS | \
+                       AD3552R_MASK_MEM_CRC_ERR_STATUS | AD3552R_MASK_RESET_STATUS)
+
+int32_t ad3552r_board_alert_status(uint16_t *iface, uint16_t *mask, uint16_t *err, bool clear)
+{
+    int32_t e = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_INTERFACE_STATUS_A, iface);
+
+    if (!e)
+        e = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_ERR_ALARM_MASK, mask);
+    if (!e)
+        e = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_ERR_STATUS, err);
+    if (e || !clear)
+        return e;
+    /* Not NOT_READY (read-only): writing it back would raise WRITE_TO_READ_ONLY. */
+    if (*iface & IFACE_CLEARABLE)
+        e = ad3552r_write_reg(g_dac, AD3552R_REG_ADDR_INTERFACE_STATUS_A, *iface & IFACE_CLEARABLE);
+    if (!e && (*err & ERR_CLEARABLE))
+        e = ad3552r_write_reg(g_dac, AD3552R_REG_ADDR_ERR_STATUS, *err & ERR_CLEARABLE);
+    return e;
+}
+
+void ad3552r_board_alert_names(char *out, size_t size, uint16_t iface, uint16_t err)
+{
+    static const struct { bool is_err; uint16_t bit; const char *name; } bits[] = {
+        { false, AD3552R_MASK_INTERFACE_NOT_READY, "NOT_READY" },
+        { false, AD3552R_MASK_CLOCK_COUNTING_ERROR, "CLOCK_COUNT" },
+        { false, AD3552R_MASK_INVALID_OR_NO_CRC, "SPI_CRC" },
+        { false, AD3552R_MASK_WRITE_TO_READ_ONLY_REGISTER, "WRITE_RO" },
+        { false, AD3552R_MASK_PARTIAL_REGISTER_ACCESS, "PARTIAL_ACCESS" },
+        { false, AD3552R_MASK_REGISTER_ADDRESS_INVALID, "BAD_ADDRESS" },
+        { true, AD3552R_MASK_REF_RANGE_ERR_STATUS, "REF_RANGE" },
+        { true, AD3552R_MASK_DUAL_SPI_STREAM_EXCEEDS_DAC_ERR_STATUS, "STREAM_EXCEEDS_DAC" },
+        { true, AD3552R_MASK_MEM_CRC_ERR_STATUS, "MEM_CRC" },
+        { true, AD3552R_MASK_RESET_STATUS, "RESET" },
+    };
+    size_t o = 0;
+
+    out[0] = '\0';
+    for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]) && o < size; i++)
+        if ((bits[i].is_err ? err : iface) & bits[i].bit)
+            o += snprintf(out + o, size - o, "%s%s", o ? "," : "", bits[i].name);
+}
+
 /*
  * Open order (all configuration in single-lane, non-streaming mode, where
  * register reads are verified reliable; nothing is read over quad SPI):
