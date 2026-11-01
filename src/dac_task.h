@@ -12,6 +12,7 @@
  * galvo_out.c + dac_task.c (see galvo_chunk.h).
  */
 
+#include "sdkconfig.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -32,5 +33,13 @@ int dac_task_regdump(const uint8_t **addrs, uint16_t *vals, size_t max);
 /* Diagnostic: the DAC's alert registers (see ad3552r_board_alert_status()).
  * Same rules as dac_task_regdump(). Returns 0, or a negative value. */
 int dac_task_alert(uint16_t *iface, uint16_t *mask, uint16_t *err, bool clear);
+
+#if CONFIG_WM_DEBUG
+/* Debug ($DT): runs one controlled stream session on the DAC task, streaming
+ * `chunks` chunks of `ticks` ticks of the held point (nothing moves, gate off),
+ * and returns the alert registers found when it closed. Only when idle.
+ * Returns 0, or a negative value (busy, bad arguments, timeout). */
+int dac_task_session_test(uint32_t ticks, uint32_t chunks, uint16_t *iface, uint16_t *err);
+#endif
 
 #endif /* DAC_TASK_H_ */

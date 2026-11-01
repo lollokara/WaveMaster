@@ -209,6 +209,22 @@ static DMA_ATTR uint8_t s_last_point[GALVO_BYTES_PER_TICK];
 static DMA_ATTR uint8_t s_final_point[GALVO_BYTES_PER_TICK];
 static spi_transaction_t s_final_trans;
 
+#if CONFIG_WM_DEBUG
+/* Why the DAC lights its ALERT output: what each stream session leaves in the
+ * status registers, and a controlled session ($DT) to tell the open/close
+ * frames from the data frames. */
+#define DBG_ALERT_LOG_MAX 20
+#define DT_MAX_TICKS 128
+#define DT_MAX_CHUNKS 8
+static uint32_t s_dbg_chunks, s_dbg_ticks, s_dbg_last_ticks, s_dbg_alert_logs;
+static uint16_t s_dbg_iface, s_dbg_err;
+static SemaphoreHandle_t s_dt_done;
+static volatile bool s_dt_pending;
+static uint32_t s_dt_ticks, s_dt_chunks;
+static int s_dt_rc;
+static DMA_ATTR uint8_t s_dt_buf[DT_MAX_TICKS * GALVO_BYTES_PER_TICK];
+#endif
+
 void dac_task_notify(void)
 {
     if (s_task)
@@ -293,9 +309,32 @@ static bool session_open(void)
     s_drained = false;
     s_session_open = true;
     s_fault = false;
+#if CONFIG_WM_DEBUG
+    s_dbg_chunks = s_dbg_ticks = s_dbg_last_ticks = 0;
+#endif
     s_idle_since_us = esp_timer_get_time();
     return true;
 }
+
+#if CONFIG_WM_DEBUG
+/* Single-lane, stream closed, bus still held. Clears what it reads, so the
+ * next session's flag is attributable to that session. NOT_READY (0x80) is a
+ * status, not an error. */
+static void dbg_alert_check(void)
+{
+    uint16_t mask = 0;
+
+    s_dbg_iface = s_dbg_err = 0xFFFF;
+    if (ad3552r_board_alert_status(&s_dbg_iface, &mask, &s_dbg_err, true) != 0)
+        return;
+    if (((s_dbg_iface & 0x7F) || s_dbg_err) && s_dbg_alert_logs < DBG_ALERT_LOG_MAX) {
+        s_dbg_alert_logs++;
+        ESP_LOGW(TAG, "DAC alert after session: iface=0x%02x err=0x%02x (chunks=%lu ticks=%lu last=%lu)",
+                 s_dbg_iface, s_dbg_err, (unsigned long)s_dbg_chunks, (unsigned long)s_dbg_ticks,
+                 (unsigned long)s_dbg_last_ticks);
+    }
+}
+#endif
 
 /* Precondition: nothing outstanding. Deasserts CS with a last transaction
  * that repeats the last point (the DAC holds its value), then returns the
@@ -319,8 +358,61 @@ static void session_close(void)
     s_session_open = false;
     s_drained = false;
     s_isr_drained = false;
+#if CONFIG_WM_DEBUG
+    dbg_alert_check();
+#endif
     xSemaphoreGive(s_bus_mtx);
 }
+
+#if CONFIG_WM_DEBUG
+/* $DT: a controlled session, run from this task so it cannot race the stream
+ * state. Streams the held point (nothing moves, gate off), then reports what
+ * session_close() found in the alert registers. */
+static void dbg_run_session_test(void)
+{
+    spi_transaction_t t;
+    uint16_t mask = 0, iface = 0, err = 0;
+    uint32_t i;
+
+    s_dt_rc = -1;
+    s_dbg_iface = s_dbg_err = 0xFFFF;
+    laser_io_gate(false);
+    xSemaphoreTake(s_bus_mtx, portMAX_DELAY);
+    ad3552r_board_alert_status(&iface, &mask, &err, true);
+    xSemaphoreGive(s_bus_mtx);
+    if (session_open()) {
+        for (i = 0; i < s_dt_ticks; i++)
+            memcpy(s_dt_buf + i * GALVO_BYTES_PER_TICK, s_last_point, GALVO_BYTES_PER_TICK);
+        for (i = 0; s_dt_ticks && i < s_dt_chunks; i++) {
+            memset(&t, 0, sizeof(t));
+            t.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_CS_KEEP_ACTIVE;
+            t.length = (size_t)s_dt_ticks * GALVO_BYTES_PER_TICK * 8;
+            t.tx_buffer = s_dt_buf;
+            if (spi_device_transmit(s_dev, &t) != ESP_OK)
+                break;
+        }
+        session_close();
+        s_dt_rc = 0;
+    }
+    s_dt_pending = false;
+    xSemaphoreGive(s_dt_done);
+}
+
+int dac_task_session_test(uint32_t ticks, uint32_t chunks, uint16_t *iface, uint16_t *err)
+{
+    if (!s_init_ok || ticks > DT_MAX_TICKS || chunks > DT_MAX_CHUNKS || s_dt_pending)
+        return -1;
+    s_dt_ticks = ticks;
+    s_dt_chunks = chunks;
+    s_dt_pending = true;
+    dac_task_notify();
+    if (xSemaphoreTake(s_dt_done, pdMS_TO_TICKS(3000)) != pdTRUE)
+        return -1;
+    *iface = s_dbg_iface;
+    *err = s_dbg_err;
+    return s_dt_rc;
+}
+#endif
 
 /* True if this chunk will open the gate but the ATmega does not hold the
  * power word it was generated for (e.g. M11 zeroed it after the last job). */
@@ -460,6 +552,11 @@ static int try_start(struct galvo_chunk *c)
         return 0;
     }
     s_outstanding++;
+#if CONFIG_WM_DEBUG
+    s_dbg_chunks++;
+    s_dbg_ticks += (uint32_t)c->n_ticks;
+    s_dbg_last_ticks = (uint32_t)c->n_ticks;
+#endif
     return 0;
 }
 
@@ -512,6 +609,11 @@ static TickType_t service(void)
             do_abort();
         return pdMS_TO_TICKS(5);
     }
+
+#if CONFIG_WM_DEBUG
+    if (s_dt_pending && !s_session_open && s_outstanding == 0 && !s_next)
+        dbg_run_session_test();
+#endif
 
     held = atomic_load(&g_galvo.held);
     while (!held && !atomic_load(&g_galvo.abort)) {
@@ -627,6 +729,11 @@ bool dac_task_start(void)
 {
     s_init_sem = xSemaphoreCreateBinary();
     s_bus_mtx = xSemaphoreCreateMutex();
+#if CONFIG_WM_DEBUG
+    s_dt_done = xSemaphoreCreateBinary();
+    if (!s_dt_done)
+        return false;
+#endif
     if (!s_init_sem || !s_bus_mtx)
         return false;
     if (xTaskCreatePinnedToCore(dac_task, "dac_task", DAC_TASK_STACK, NULL,

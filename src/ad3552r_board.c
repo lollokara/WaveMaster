@@ -271,6 +271,13 @@ static uint32_t guard_check_and_repair(void)
             continue;
         if (v == s_guard_vals[i])
             continue;
+        if (!fixed) {
+            uint16_t iface = 0, err = 0;
+
+            ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_INTERFACE_STATUS_A, &iface);
+            ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_ERR_STATUS, &err);
+            ESP_LOGW(TAG, "DAC alert at repair: iface=0x%02x err=0x%02x (err bit 0 = the DAC reset)", iface, err);
+        }
         ESP_LOGW(TAG, "DAC config reg 0x%02x changed: 0x%02x (expected 0x%02x) - restoring",
                  s_guard_regs[i], v, s_guard_vals[i]);
         ad3552r_write_reg(g_dac, s_guard_regs[i], s_guard_vals[i]);

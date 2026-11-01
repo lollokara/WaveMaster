@@ -1055,6 +1055,24 @@ static int exec_dollar(char *line)
         }
         return 0;
     }
+#if CONFIG_WM_DEBUG
+    if (strncmp(p, "$DT=", 4) == 0) {
+        /* Debug: one controlled stream session of <ticks>[,<chunks>] held-point ticks, then the DAC alert bits. */
+        unsigned ticks = 0, chunks = 1;
+        uint16_t iface = 0, err = 0;
+        char names[96];
+
+        if (sscanf(p + 4, "%u,%u", &ticks, &chunks) < 1 || s_fault || motion_busy() || galvo_out_busy() ||
+            dac_task_session_test(ticks, chunks, &iface, &err) != 0) {
+            host_puts("[MSG:DT unavailable (busy, bad arguments or SPI error)]\r\n");
+        } else {
+            ad3552r_board_alert_names(names, sizeof(names), iface, err);
+            host_printf("[MSG:DT ticks=%u chunks=%u iface=%02X err=%02X set=%s]\r\n", ticks, chunks,
+                        iface & 0xFF, err & 0xFF, names[0] ? names : "none");
+        }
+        return 0;
+    }
+#endif
     if (strcmp(p, "$RB") == 0) {
         uint16_t cx, cy;
 
