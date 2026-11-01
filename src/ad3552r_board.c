@@ -207,7 +207,6 @@ int32_t ad3552r_board_write_volts(uint8_t ch, float volts)
 #define STREAM_BYTES_PER_POINT AD3552R_STREAM_BYTES_PER_POINT
 
 static bool s_stream_mode_configured = false;
-static uint32_t s_stream_saved_clock_hz = 0;
 static uint8_t s_stream_marker[1];
 
 /*
@@ -424,8 +423,12 @@ int32_t ad3552r_board_stream_open(uint32_t clock_hz)
     g_dac->spi_cfg.stream_length_keep_value = 1;
     s_stream_mode_configured = true;
 
-    /* 4: quad, slow clock, instruction only. */
-    s_stream_saved_clock_hz = g_dac->spi->clock_hz;
+    /* 4: quad, slow clock, instruction only. The clock is never restored after
+     * a session: changing it removes and re-adds the SPI device, which
+     * reconfigures the CS and SCLK pins on a live bus, and the DAC counted
+     * the stray edges (CLOCK_COUNTING_ERROR after every session, even with no
+     * data). Register traffic is rare and does not mind the slow clock; the
+     * device is only re-created when the tick period changes. */
     err = ad3552r_esp32_spi_set_clock(g_dac->spi, clock_hz);
     if (err) {
         ad3552r_board_stream_end();
@@ -446,7 +449,6 @@ int32_t ad3552r_board_stream_open(uint32_t clock_hz)
     if (err) {
         ad3552r_esp32_spi_set_lines(g_dac->spi, 1);
         set_qspi_pin(false);
-        ad3552r_esp32_spi_set_clock(g_dac->spi, s_stream_saved_clock_hz);
         ad3552r_board_stream_end();
     }
     return err;
@@ -457,7 +459,6 @@ void ad3552r_board_stream_close(void)
     ad3552r_esp32_spi_stream_release(g_dac->spi);
     ad3552r_esp32_spi_set_lines(g_dac->spi, 1);
     set_qspi_pin(false);
-    ad3552r_esp32_spi_set_clock(g_dac->spi, s_stream_saved_clock_hz);
     ad3552r_board_stream_end();
 }
 
