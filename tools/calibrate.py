@@ -51,6 +51,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "rftest"))
 
+import calibrate_live as clive                                # noqa: E402
 import calibrate_math as cm                                   # noqa: E402
 import gcode_gen as gg                                        # noqa: E402
 from calibrate_math import CalibError                         # noqa: E402
@@ -280,6 +281,18 @@ class Wizard:
         self.range_source = ""
         self.focus_best: Optional[dict] = None
         self.pending_restore: dict[int, float] = {}    # settings changed temporarily by a step (restore_pending)
+        self.live: bool = getattr(args, "live", False)
+
+    def run_live(self, step: Any) -> dict[str, Any]:
+        key_input = getattr(self.provider, "key_input", None)
+        if key_input is None and isinstance(self.provider, clive.LiveInput):
+            key_input = self.provider
+        display = getattr(self.provider, "display", None)
+        is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+        if key_input is None and is_tty:
+            return clive.run_live_step_curses(self, step)
+        else:
+            return clive.run_live_loop(self, step, key_input=key_input, display=display)
 
     # ---- console helpers
     def say(self, text: str = "") -> None:
@@ -951,6 +964,10 @@ class Wizard:
         return ok
 
     def step_range(self) -> dict:
+        if self.live:
+            self.header("range: largest correct galvo deflection (live interactive guide laser)")
+            step = clive.LiveRangeStep(self, self.a.guide_feed)
+            return self.run_live(step)
         self.header("range: largest correct galvo deflection (guide laser only)")
         self.say("Goal: the largest deflection the galvos display correctly, in DAC volts per axis (full scale is +-10 V),")
         self.say("independent of the mm scale. Rectangles are traced with the guide laser, never the marking laser.")
@@ -1049,6 +1066,10 @@ class Wizard:
         return res
 
     def step_field(self) -> dict:
+        if self.live:
+            self.header("field: lens, origin and laser PRR (live interactive box)")
+            step = clive.LiveFieldStep(self, self.a.guide_feed)
+            return self.run_live(step)
         self.header("field: lens, origin and laser PRR")
         self.say("Enter the working field of the lens (e.g. 100 for an F-theta f=160 mm lens, 70, 150, 200).")
         self.say("Press Enter to keep the current value. Use the real, usable field - patterns are kept inside it.")
@@ -1104,6 +1125,10 @@ class Wizard:
         raise CalibError("no valid direction")
 
     def step_orientation(self) -> dict:
+        if self.live:
+            self.header("orientation: +X must go right, +Y must go away from you (live interactive arrows)")
+            step = clive.LiveOrientationStep(self, self.a.guide_feed)
+            return self.run_live(step)
         self.header("orientation: +X must go right, +Y must go away from you (guide laser)")
         self.say("Stand/sit at the front of the machine, looking down at the work surface. A red guide-laser arrow")
         self.say("is traced for a few seconds around the field centre; say where its HEAD (the pointed end) is.")
@@ -1152,6 +1177,10 @@ class Wizard:
         raise CalibError("no valid length")
 
     def step_scale(self) -> dict:
+        if self.live and not self.a.fire:
+            self.header("scale: $100 / $101 (live interactive square)")
+            step = clive.LiveScaleStep(self, self.a.guide_feed)
+            return self.run_live(step)
         self.header("scale: $100 / $101 (volts per mm)")
         g = self.geometry()
         fire = self.use_fire("the test square")
@@ -1184,6 +1213,10 @@ class Wizard:
 
     # -- distortion
     def step_distortion(self) -> dict:
+        if self.live and not self.a.fire:
+            self.header("distortion: $142 (live interactive curvature)")
+            step = clive.LiveDistortionStep(self, self.a.guide_feed)
+            return self.run_live(step)
         self.header("distortion: $142 (k1) and the scales")
         g = self.geometry()
         fire = self.use_fire("the large square")
@@ -1238,6 +1271,10 @@ class Wizard:
 
     # -- offset
     def step_offset(self) -> dict:
+        if self.live and not self.a.fire:
+            self.header("offset: $140 / $141 (live interactive crosshair)")
+            step = clive.LiveOffsetStep(self, self.a.guide_feed)
+            return self.run_live(step)
         self.header("offset: $140 / $141 (volts)")
         fire = self.use_fire("the crosshair")
         g = self.geometry()
@@ -1745,8 +1782,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--geom-feed", type=float, default=1200.0,
                    help="marking speed for the scale/distortion/offset marks, mm/min (default 1200 = 20 mm/s; "
                         "slow so the lines are clean and easy to measure)")
-    p.add_argument("--guide-feed", type=float, default=6000.0, help="guide-laser trace speed, mm/min (default 6000)")
+    p.add_argument("--guide-feed", type=float, default=clive.DEFAULT_GUIDE_FEED,
+                   help=f"guide-laser trace speed, mm/min (default {clive.DEFAULT_GUIDE_FEED:g}; fast for steady, flicker-free light)")
     p.add_argument("--guide-seconds", type=float, default=3.0, help="how long a guide pattern is traced (default 3)")
+    p.add_argument("--live", dest="live", action="store_true", default=None,
+                   help="enable live interactive keyboard calibration (default when stdin and stdout are TTYs, unless --mock)")
+    p.add_argument("--no-live", dest="live", action="store_false",
+                   help="disable live interactive calibration mode (use typed prompts)")
+    p.add_argument("--keys", help="comma-separated list of scripted keys for live calibration testing (e.g. '],enter')")
     p.add_argument("--card", type=parse_card, default=(60.0, 60.0), help="test card size WxH in mm (default 60x60)")
     p.add_argument("--focus-radius", type=float, default=5.0, help="focus step: circle radius in mm (default 5)")
     p.add_argument("--focus-power", type=float, default=None,
@@ -1776,6 +1819,11 @@ def load_backup(path: Path) -> dict[int, float]:
 
 
 def run(args: argparse.Namespace, provider: Any = None, mock: Any = None) -> int:
+    if getattr(args, "live", None) is None:
+        is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+        args.live = is_tty and not getattr(args, "mock", False)
+    if getattr(args, "keys", None) and provider is None:
+        provider = clive.ScriptedKeyInput(args.keys.split(","))
     if args.max_power < 0:
         print("--max-power must be >= 0", file=sys.stderr)
         return 2

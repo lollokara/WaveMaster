@@ -7,21 +7,77 @@ error went away. This document is the procedure behind it.
 
 ```bash
 pip install pyserial
-python3 tools/calibrate.py /dev/ttyACM0                   # guide laser only: safe, no emission
+python3 tools/calibrate.py /dev/ttyACM0                   # live interactive guide laser by default on a TTY
+python3 tools/calibrate.py /dev/ttyACM0 --no-live         # classic prompt-driven mode (type measurements)
+python3 tools/calibrate.py /dev/ttyACM0 --guide-feed 30000 # custom guide laser trace speed (default 24000)
 python3 tools/calibrate.py /dev/ttyACM0 --fire --max-power 300   # also the real-laser steps (starts with focus)
-python3 tools/calibrate.py /dev/ttyACM0 --fire --step focus --focus-radius 5 --focus-power 150   # focal distance only
-python3 tools/calibrate.py /dev/ttyACM0 --step range --range-levels 0.5,0.8,1.0   # galvo range only (guide laser)
-python3 tools/calibrate.py /dev/ttyACM0 --step scale --step offset   # selected steps only
+python3 tools/calibrate.py /dev/ttyACM0 --step range --step offset # tune deflection limits & centre offset live
 python3 tools/calibrate.py /dev/ttyACM0 --restore tools/calibrate/runs/<ts>/settings_before.json
 python3 tools/calibrate.py --mock                          # rehearse offline (tools/rftest/mock_grbl.py)
-python3 tools/calibrate_selftest.py                        # offline self-test of the wizard and its math
+python3 tools/calibrate.py --mock --live --step range --step offset # test live keyboard mode offline
+python3 tools/calibrate_selftest.py                        # offline self-test of the wizard, math, and live mode
 ```
 
 The port is the ESP32-S3 native USB (same as `tools/rftest`). Close Rayforge first.
 
-At every prompt: a number (`12.34` or `12,34`; two numbers may be separated by a space),
+In typed mode (non-live or `--no-live`): at every prompt type a number (`12.34` or `12,34`),
 `s` skips the current step, `q` quits (you get the summary and an offer to restore the
 backup), `again` draws the pattern again.
+
+In live interactive mode (`--live`, active by default when running in a terminal): the guide
+laser (`M3 S0`, safe red preview) traces the step shape continuously in a loop while you
+adjust it in real time with the keyboard.
+
+## Live Interactive Mode (`--live`)
+
+In live mode, shape-based setup steps (`range`, `field`/`origin`, `orientation`, `scale`,
+`distortion`, `offset`) trace their patterns continuously with the red guide laser. Instead
+of stopping to measure and type numbers, you nudge, resize, and align the shape directly on
+your fixture or bed with the keyboard.
+
+The terminal curses UI (or plain-text display in headless/piped sessions) shows the live
+geometry, volts per axis, and exact proposed `$` settings computed by the exact same
+calibration math as the typed path. When you press Enter, the settings are applied immediately.
+
+### Key Map
+
+| Key | Action | Description |
+|:---|:---|:---|
+| **Arrow keys** (`Up`, `Down`, `Left`, `Right`) | Move shape / crosshair | In `offset`: jogs the crosshair to the reference mark. In other steps: nudges position. |
+| **Shift + Arrows** / **Ctrl + Arrows** | Coarse move | Jumps by coarse step size. |
+| `[` / `]` or `-` / `+` | Resize / Grow / Shrink | Expands or contracts the shape (square side in `scale`, field box in `field`, deflection fraction in `range`, k1 in `distortion`). |
+| `a` | Cycle active axis | Cycles axis modification: `both` &rarr; `X only` &rarr; `Y only` &rarr; `both`. |
+| `x` / `y` / `b` | Select axis directly | In `range`/`scale`/`field`: selects X only, Y only, or both axes. In `orientation`: toggles X invert / Y invert. |
+| `Tab` or `m` | Cycle step size | Cycles between `fine`, `normal`, and `coarse` step increments. |
+| `1`, `2`, `3` | Direct step size | Selects `1` = fine, `2` = normal, `3` = coarse. |
+| `<` / `>` (or `,` / `.`) | Trace speed | Multiplies or divides guide trace speed by 1.25 (range 600 mm/min to firmware ceiling). |
+| `o` / `0` / `1` | Origin toggle | In `field`: toggles between origin 0 (corner) and 1 (lens centre). |
+| `r` | Reset | Resets shape parameters to their values at the start of the step. |
+| `Enter` | Accept & Apply | Accepts current live geometry and writes the computed `$` settings. |
+| `s` | Skip | Skips the current step without changing any settings. |
+| `q` | Quit | Quits the wizard, shuts off preview, and offers to restore the initial settings backup. |
+
+### Guide Feed Speed & Firmware Limits
+
+The guide laser runs with `M3 S0` (never firing, never arming, safe red light). To produce a
+steady persistence-of-vision outline without flicker, `--guide-feed` defaults to **24,000 mm/min**
+(400 mm/s), raised from the legacy 6,000 mm/min (100 mm/s). At 24,000 mm/min, a 20 mm square is
+refreshed 5 times per second and a crosshair at 10 Hz, appearing as a continuous line rather than
+a moving dot.
+
+* **Firmware trace speed ceiling**: In WaveMaster firmware (`src/calib.c`, `src/gcode_parse.c`),
+  marking feed is clamped to `vmax = calib_get(CAL_MAX_MARK_RATE) / 60.0f` (`$110`/`$111`).
+  The default `$110` setting is **300,000 mm/min (5,000 mm/s)**, with an absolute parameter ceiling
+  of 3,000,000 mm/min (50,000 mm/s). The live `<` and `>` keys allow speeding up or slowing down
+  the trace, clamped within `[600 mm/min, min(300000, $110)]`, never exceeding the firmware ceiling.
+
+### Flags
+
+* `--live`: Enable live interactive keyboard mode. Default when stdin and stdout are interactive TTYs
+  (disabled by default when running under `--mock` unless `--live` is explicitly passed).
+* `--no-live`: Disable live interactive mode and fall back to classic prompt-based typed questions.
+* `--guide-feed SPEED`: Initial guide laser trace speed in mm/min (default 24000.0).
+* `--keys LIST`: Comma-separated list of scripted keys for testing (e.g. `--keys "],enter,left,enter"`).
 
 ## What you need
 

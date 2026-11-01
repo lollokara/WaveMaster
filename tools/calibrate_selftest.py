@@ -38,6 +38,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "rftest"))
 
 import calibrate as cal                          # noqa: E402
+import calibrate_live as clive                     # noqa: E402
 import calibrate_math as cm                      # noqa: E402
 from calibrate_math import CalibError            # noqa: E402
 from mock_grbl import MockGrbl                   # noqa: E402
@@ -468,6 +469,7 @@ class FwMock(MockGrbl):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.fired_prr: list[float] = []      # $220 in force whenever a mark was streamed (in order, no repeats)
+        self.feeds_seen: list[float] = []
 
     def _dollar(self, line, gen):
         if line.rstrip() == "$$":
@@ -494,6 +496,8 @@ class FwMock(MockGrbl):
         return super()._stats_text().replace("link=1", f"link={self.link}")
 
     def _move(self, mo, w, k, jog, gen):
+        if not self.feeds_seen or self.feeds_seen[-1] != self.feed:
+            self.feeds_seen.append(self.feed)
         if mo in (1, 2, 3) and self.laser in (3, 4) and self.s > 0 and not self.preview:
             self.ever_fired = True
             if not self.fired_prr or self.fired_prr[-1] != self.settings[220]:
@@ -508,8 +512,9 @@ class Bench:
                  max_clean_feed_mm_s: float = 1000.0, max_clean_jump: float = 5000.0, fire: bool = True,
                  inject: dict | None = None, raise_on: dict | None = None, raise_nth: dict | None = None,
                  apply_range: bool = False, focus_script: list | None = None, focus_best: str = "1",
-                 field_blank: bool = False, prr_best_hz: float = 55000.0):
+                 field_blank: bool = False, prr_best_hz: float = 55000.0, key_input: Any = None):
         self.mock, self.h, self.quant = mock, hidden, quant
+        self.key_input = key_input
         self.true = true_delays or {210: 150.0, 211: 60.0, 212: 500.0, 213: 3.0, 214: 140.0, 215: 40.0}
         self.tol = 15.0
         self.p_thr, self.p_sat = true_power
@@ -1101,6 +1106,91 @@ def test_e2e_restore(tmp: Path, full_out: Path) -> None:
     check("--restore also reads a raw `$$` text dump", code == 0 and mock.settings[3] == 1 and mock.settings[100] == 0.09)
 
 
+def test_e2e_live(tmp: Path) -> None:
+    print("end to end: live interactive keyboard mode (guide laser, scripted keys)")
+    h = Hidden(("x", "y"), (1, 1), T=(0.1, 0.1), d=0.0, v0=(0.0, 0.0))
+
+    # 1. Live range step
+    # Start: fx=0.7, fy=0.7.
+    # '>' raises feed (24000 * 1.25 = 30000). ']' grows both (0.75, 0.75).
+    # 'x' selects X axis. ']' grows X (0.80, 0.75).
+    # 'y' selects Y axis. '[' shrinks Y (0.80, 0.70).
+    # 'tab' switches to coarse mode (step 0.10). ']' grows Y (0.80, 0.80).
+    # 'enter' accepts.
+    keys_range = [">", "]", "x", "]", "y", "[", "tab", "]", "enter"]
+    in_range = clive.ScriptedKeyInput(keys_range)
+    code, mock, bench, out, text = run_wizard(tmp, "live_range", h, ["--live", "--step", "range"],
+                                              key_input=in_range)
+    check("live range: exit code 0", code == 0, text[-400:])
+    s = mock.settings
+    # 8.0 V on X (channel 0) and 8.0 V on Y (channel 1)
+    # suggest_work_area at 0.1 V/mm with margin 0.5 V -> 2 * (8.0 - 0.5) / 0.1 = 150 mm
+    typed_range = cm.suggest_work_area(8.0, 8.0, 0.1, 0.1, 0.5, 0.0, 0.0)
+    check("live range: resize & axis keys modified shape ($130=150, $131=150)",
+          s[130] == 150.0 and s[131] == 150.0, f"got {s[130]} x {s[131]}")
+    check("live range: Enter returns exactly the value the old typed path returns for 8.0V / 8.0V",
+          (s[130], s[131]) == typed_range)
+    check("live range: temporary values $130/$131/$142 restored cleanly",
+          s[142] == 0.0)
+    check("live range: guide-feed key '>' changed F in G-code to 30000",
+          any(abs(f - 30000.0) < 1e-3 for f in mock.feeds_seen), str(mock.feeds_seen))
+    check("live range: laser never armed or fired",
+          not mock.ever_fired and not mock.ever_armed)
+
+    # 2. Live offset step
+    # Start: (0, 0). '<' lowers feed (24000 / 1.25 = 19200). 'left', 'left' (-0.20 mm).
+    # 'up' (+0.10 mm). 'tab' switches to coarse (1.00 mm). 'shift_left' (-1.00 mm -> -1.20 mm).
+    # 'enter' accepts.
+    keys_offset = ["<", "left", "left", "up", "tab", "shift_left", "enter"]
+    in_offset = clive.ScriptedKeyInput(keys_offset)
+    code, mock, bench, out, text = run_wizard(tmp, "live_offset", h, ["--live", "--step", "offset"],
+                                              key_input=in_offset)
+    check("live offset: exit code 0", code == 0, text[-400:])
+    s = mock.settings
+    # move_x = -1.20, move_y = +0.10 -> dx = +1.20, dy = -0.10
+    typed_offset = cm.offset_update(base_settings(), 1.20, -0.10)
+    check("live offset: arrows and step-size changed crosshair ($140, $141)",
+          abs(s[140] - typed_offset[140]) < 1e-4 and abs(s[141] - typed_offset[141]) < 1e-4,
+          f"got {s[140]} {s[141]} want {typed_offset}")
+    check("live offset: Enter returns exactly the value the old typed path returns for same geometry",
+          abs(s[140] - typed_offset[140]) < 1e-5 and abs(s[141] - typed_offset[141]) < 1e-5)
+    check("live offset: guide-feed key '<' changed F in G-code to 19200",
+          any(abs(f - 19200.0) < 1e-3 for f in mock.feeds_seen), str(mock.feeds_seen))
+
+    # 3. Live scale step
+    # Start: 20x20 mm. ']' grows both by 0.20 mm -> 20.20 mm. 'enter' accepts.
+    keys_scale = ["]", "enter"]
+    in_scale = clive.ScriptedKeyInput(keys_scale)
+    code, mock, bench, out, text = run_wizard(tmp, "live_scale", h, ["--live", "--step", "scale"],
+                                              key_input=in_scale)
+    check("live scale: exit code 0", code == 0, text[-400:])
+    check("live scale: resize keys changed scale ($100=$101=0.101)",
+          abs(mock.settings[100] - 0.101) < 1e-5 and abs(mock.settings[101] - 0.101) < 1e-5,
+          f"got {mock.settings[100]} {mock.settings[101]}")
+
+    # 4. Live 's' (skip) behaves
+    in_skip = clive.ScriptedKeyInput(["s"])
+    code, mock, bench, out, text = run_wizard(tmp, "live_skip", h, ["--live", "--step", "range"],
+                                              key_input=in_skip)
+    check("live 's': exit code 0, step skipped, no settings changed",
+          code == 0 and mock.settings[130] == 100.0 and mock.settings[131] == 100.0)
+
+    # 5. Live 'q' (quit) behaves
+    in_quit = clive.ScriptedKeyInput(["q"])
+    code, mock, bench, out, text = run_wizard(tmp, "live_quit", h, ["--live", "--step", "range"],
+                                              key_input=in_quit)
+    check("live 'q': exit code 0, wizard quit cleanly, disarmed",
+          code == 0 and not mock.armed and not mock.guide)
+
+    # 6. Command line integration test with --keys
+    import subprocess
+    cmd = [sys.executable, str(HERE / "calibrate.py"), "--mock", "--live", "--step", "range",
+           "--step", "offset", "--keys", "],enter,left,enter", "--out", str(tmp / "cli_test")]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    check("cli run: calibrate.py --mock --live --step range --step offset --keys",
+          proc.returncode == 0, proc.stderr[-300:] if proc.returncode != 0 else "")
+
+
 def main() -> int:
     global VERBOSE
     VERBOSE = "-v" in sys.argv
@@ -1123,6 +1213,7 @@ def main() -> int:
         test_e2e_focus(tmp)
         test_e2e_prr(tmp)
         test_e2e_restore(tmp, full_out)
+        test_e2e_live(tmp)
     finally:
         if keep:
             print(f"kept {tmp}")
