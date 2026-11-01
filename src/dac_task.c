@@ -317,17 +317,22 @@ static bool session_open(void)
 }
 
 #if CONFIG_WM_DEBUG
-/* Single-lane, stream closed, bus still held. Clears what it reads, so the
- * next session's flag is attributable to that session. NOT_READY (0x80) is a
- * status, not an error. */
+/* Single-lane, stream closed, bus still held. Read-only, so the ALERT output
+ * keeps showing real faults; logs when the alert state changes. NOT_READY
+ * (0x80) is a status, not an error. */
 static void dbg_alert_check(void)
 {
+    static uint16_t prev_iface, prev_err;
     uint16_t mask = 0;
 
     s_dbg_iface = s_dbg_err = 0xFFFF;
-    if (ad3552r_board_alert_status(&s_dbg_iface, &mask, &s_dbg_err, true) != 0)
+    if (ad3552r_board_alert_status(&s_dbg_iface, &mask, &s_dbg_err, false) != 0)
         return;
-    if (((s_dbg_iface & 0x7F) || s_dbg_err) && s_dbg_alert_logs < DBG_ALERT_LOG_MAX) {
+    if ((s_dbg_iface & 0x7F) == prev_iface && s_dbg_err == prev_err)
+        return;
+    prev_iface = s_dbg_iface & 0x7F;
+    prev_err = s_dbg_err;
+    if ((prev_iface || prev_err) && s_dbg_alert_logs < DBG_ALERT_LOG_MAX) {
         s_dbg_alert_logs++;
         ESP_LOGW(TAG, "DAC alert after session: iface=0x%02x err=0x%02x (chunks=%lu ticks=%lu last=%lu)",
                  s_dbg_iface, s_dbg_err, (unsigned long)s_dbg_chunks, (unsigned long)s_dbg_ticks,

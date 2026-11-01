@@ -389,7 +389,21 @@ int32_t ad3552r_board_stream_open(uint32_t clock_hz)
     uint16_t xfer_reg = 0, cfg_b = 0, rb_mode = 0, rb_xfer = 0;
     int32_t err;
 
-    /* 1-3: single lane, QSPI pin low (the closed state), normal clock. */
+    /* The stream clock is never restored after a session: changing it removes
+     * and re-adds the SPI device, which reconfigures the CS and SCLK pins on a
+     * live bus, and the DAC counted the stray edges (CLOCK_COUNTING_ERROR after
+     * every session, even with no data). Register traffic is rare and does not
+     * mind the slow clock, so the device is only re-created when the tick
+     * period changes. That change is our own doing: clear just that flag, so
+     * the ALERT output keeps meaning a real fault (RESET_STATUS is left alone). */
+    if (clock_hz != g_dac->spi->clock_hz) {
+        err = ad3552r_esp32_spi_set_clock(g_dac->spi, clock_hz);
+        if (err)
+            return err;
+        ad3552r_write_reg(g_dac, AD3552R_REG_ADDR_INTERFACE_STATUS_A, AD3552R_MASK_CLOCK_COUNTING_ERROR);
+    }
+
+    /* 1-3: single lane, QSPI pin low (the closed state). */
     guard_check_and_repair();
 
     err = ad3552r_read_reg(g_dac, AD3552R_REG_ADDR_TRANSFER_REGISTER, &xfer_reg);
@@ -423,17 +437,7 @@ int32_t ad3552r_board_stream_open(uint32_t clock_hz)
     g_dac->spi_cfg.stream_length_keep_value = 1;
     s_stream_mode_configured = true;
 
-    /* 4: quad, slow clock, instruction only. The clock is never restored after
-     * a session: changing it removes and re-adds the SPI device, which
-     * reconfigures the CS and SCLK pins on a live bus, and the DAC counted
-     * the stray edges (CLOCK_COUNTING_ERROR after every session, even with no
-     * data). Register traffic is rare and does not mind the slow clock; the
-     * device is only re-created when the tick period changes. */
-    err = ad3552r_esp32_spi_set_clock(g_dac->spi, clock_hz);
-    if (err) {
-        ad3552r_board_stream_end();
-        return err;
-    }
+    /* 4: quad, instruction only (the clock was set above). */
     set_qspi_pin(true);
     ad3552r_esp32_spi_set_lines(g_dac->spi, 4);
 
