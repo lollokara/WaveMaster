@@ -497,6 +497,55 @@ def suggest_work_area(vx: float, vy: float, scale_x: float, scale_y: float, marg
     return one(vx, scale_x, offset_x), one(vy, scale_y, offset_y)
 
 
+# ----------------------------------------------------------- galvo bounds ----
+
+BOUNDS_CORNERS: tuple = ("top-left", "top-right", "bottom-right", "bottom-left")
+BOUNDS_MIN_HALF_V = 0.5     # a smaller half-travel means the dot was not really driven to the edges
+
+
+@dataclass
+class BoundsResult:
+    """What the four corner readings of the bounds step say.  Volts are absolute DAC volts on the channel that
+    drives physical X / Y.  `spread_v` is how much the two readings of the same edge disagree (a tilted or
+    misjudged edge); it does not enter the result, which uses their mean."""
+    centre_v: tuple[float, float]
+    half_v: tuple[float, float]
+    offsets: dict
+    work_area: tuple[float, float]
+    spread_v: tuple[float, float]
+
+
+def bounds_from_corners(s: Mapping[int, float], corners: Mapping[str, tuple[float, float]],
+                        margin_v: float = 0.5) -> BoundsResult:
+    """Offset and range from the four points where the dot started to fade, in one go.
+
+    `corners` maps each name of BOUNDS_CORNERS to (V on the channel driving physical X, V on the channel
+    driving physical Y).  An edge is the mean of its two corners.  The centre of the usable travel is where
+    the field must sit, so it is the offset: V = mm * scale + offset gives `offset` at the field centre.  Half
+    the travel is the usable half-range; the work area follows from it exactly as in suggest_work_area() with
+    the offset taking part, so a field centred on the offset gets W = 2 (half - margin) / |scale|."""
+    swap = s.get(143, 0.0)
+    cx, cy = channel_for_axis("x", swap), channel_for_axis("y", swap)
+    missing = [n for n in BOUNDS_CORNERS if n not in corners]
+    if missing:
+        raise CalibError("missing corner(s): " + ", ".join(missing))
+    tl, tr = corners["top-left"], corners["top-right"]
+    br, bl = corners["bottom-right"], corners["bottom-left"]
+    left_x, right_x = (tl[0] + bl[0]) / 2.0, (tr[0] + br[0]) / 2.0
+    top_y, bottom_y = (tl[1] + tr[1]) / 2.0, (bl[1] + br[1]) / 2.0
+    centre = ((left_x + right_x) / 2.0, (top_y + bottom_y) / 2.0)
+    half = (abs(right_x - left_x) / 2.0, abs(top_y - bottom_y) / 2.0)
+    if min(half) < BOUNDS_MIN_HALF_V:
+        raise CalibError(f"the corners are too close together (half travel {half[0]:g} V x {half[1]:g} V): drive "
+                         "the dot out to where it starts to fade")
+    kx, ky = scale_key_for_axis("x", swap), scale_key_for_axis("y", swap)
+    work = suggest_work_area(half[0] + abs(centre[0]), half[1] + abs(centre[1]), s.get(kx, 0.1), s.get(ky, 0.1),
+                             margin_v, centre[0], centre[1])
+    offsets = {140 + cx: clamp(centre[0], -10.0, 10.0), 140 + cy: clamp(centre[1], -10.0, 10.0)}
+    spread = (max(abs(tl[0] - bl[0]), abs(tr[0] - br[0])), max(abs(tl[1] - tr[1]), abs(bl[1] - br[1])))
+    return BoundsResult(centre, half, offsets, work, spread)
+
+
 # ----------------------------------------------------------------- delays ---
 
 @dataclass

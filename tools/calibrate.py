@@ -12,6 +12,8 @@ Steps (default: all, in this order, each skippable):
     range        guide laser only: largest correct galvo deflection, volts per axis -> suggested $130/$131
     field        lens field size ($130/$131), origin ($144), laser PRR ($220/$221)
     orientation  guide-laser arrows -> $143 swap and $3 invert so +X = right, +Y = away
+    bounds       (live mode) a dot driven to the four corners until it fades -> offset $140/$141 and range
+                 $130/$131 in one; in live mode the default run uses it instead of range and offset
     scale        centred square -> $100/$101
     distortion   big square + cross -> $142 (k1) and the scales
     offset       crosshair -> $140/$141
@@ -59,8 +61,8 @@ from gcode_gen import Box, MoveTo, SetPower, SetSpeed         # noqa: E402
 from rfclient import RayforgeClient, SessionLogger, strip_comment  # noqa: E402
 from run_tests import SafetyError, assert_safe                # noqa: E402
 
-STEP_ORDER = ("connect", "focus", "range", "field", "orientation", "scale", "distortion", "offset", "delays",
-              "power", "prr", "speed", "summary")
+STEP_ORDER = ("connect", "focus", "range", "field", "orientation", "bounds", "scale", "distortion", "offset",
+              "delays", "power", "prr", "speed", "summary")
 FIRE_STEPS = ("focus", "delays", "power", "prr")
 STEP_INFO = {
     "connect": "handshake, current values, backup",
@@ -68,6 +70,7 @@ STEP_INFO = {
     "range": "galvo maximum deflection (volts per axis), guide laser",
     "field": "lens field size, origin, laser PRR",
     "orientation": "guide laser: +X right, +Y away ($143, $3)",
+    "bounds": "dot to the four corners: offset ($140, $141) and range ($130, $131), live mode",
     "scale": "square size ($100, $101)",
     "distortion": "F-theta correction ($142) and scales",
     "offset": "centre offset ($140, $141)",
@@ -963,6 +966,16 @@ class Wizard:
                       + f" (or --restore {self.out / 'settings_before.json'})")
         return ok
 
+    def step_bounds(self) -> dict:
+        if not self.live:
+            self.warn("the bounds step needs the live keyboard mode (--live); use the range and offset steps instead")
+            raise SkipStep()
+        self.header("bounds: offset and range from the four corners (live interactive guide laser dot)")
+        self.say("Goal: drive the dot to each corner of the galvo travel until it just starts to fade; the centre of the")
+        self.say("four limits is the offset ($140 / $141) and half their span the range ($130 / $131). Arrows follow what")
+        self.say("you see, so run the orientation step first. $130 / $131 / $142 are restored first, then the result is written.")
+        return self.run_live(clive.LiveBoundsStep(self, self.a.guide_feed))
+
     def step_range(self) -> dict:
         if self.live:
             self.header("range: largest correct galvo deflection (live interactive guide laser)")
@@ -1832,6 +1845,8 @@ def run(args: argparse.Namespace, provider: Any = None, mock: Any = None) -> int
         return 2
     explicit = bool(args.step)
     steps = list(args.step) if args.step else list(STEP_ORDER)
+    if not explicit:
+        steps = [n for n in steps if n not in (("range", "offset") if args.live else ("bounds",))]
     if not args.restore and explicit and any(s in FIRE_STEPS for s in steps) and not args.fire:
         print("REFUSING: steps 'focus', 'delays', 'power' and 'prr' emit the real laser. Re-run with --fire "
               "(and read tools/CALIBRATION.md).", file=sys.stderr)

@@ -322,6 +322,37 @@ def test_delays_misc() -> None:
     check("transform: invert, then swap, then scale, then offset", abs(v[0] - 4.5) < 1e-9 and abs(v[1] + 1.5) < 1e-9, str(v))
 
 
+def test_bounds_math() -> None:
+    print("bounds: offset and range from the four corner readings")
+    corners = {"top-left": (-8.0, 8.5), "top-right": (9.0, 8.5), "bottom-right": (9.0, -7.5),
+               "bottom-left": (-8.0, -7.5)}
+    r = cm.bounds_from_corners(base_settings(), corners, 0.5)
+    check("bounds: centre of the limits is the offset, half the span the range",
+          r.centre_v == (0.5, 0.5) and r.half_v == (8.5, 8.0) and r.offsets == {140: 0.5, 141: 0.5}, str(r))
+    check("bounds: work area is 2 (half - margin) / scale, offset not subtracted twice", r.work_area == (160.0, 150.0),
+          str(r.work_area))
+    # the same travel through suggest_work_area() the way the range and offset steps would
+    check("bounds: agrees with suggest_work_area() fed the absolute limit and the offset",
+          r.work_area == cm.suggest_work_area(8.5 + 0.5, 8.0 + 0.5, 0.1, 0.1, 0.5, 0.5, 0.5))
+    check("bounds: nothing to disagree about when both readings of each edge match", r.spread_v == (0.0, 0.0))
+    tilted = dict(corners, **{"top-left": (-8.0, 8.5), "bottom-left": (-7.4, -7.5)})
+    check("bounds: a tilted edge shows up as spread, the mean is used",
+          abs(cm.bounds_from_corners(base_settings(), tilted, 0.5).spread_v[0] - 0.6) < 1e-9)
+    sw = cm.bounds_from_corners(base_settings({143: 1, 101: 0.2, 100: 0.1}), corners, 0.5)
+    check("bounds: with the axes swapped X is channel 1 ($141, $101) and Y is channel 0 ($140, $100)",
+          sw.offsets == {141: 0.5, 140: 0.5} and sw.work_area == (cm.suggest_work_area(9.0, 8.5, 0.2, 0.1, 0.5, 0.5, 0.5)),
+          str(sw))
+    neg = cm.bounds_from_corners(base_settings({100: -0.1}), corners, 0.5)
+    check("bounds: a negative scale gives the same work area", neg.work_area == r.work_area)
+    for bad, why in (({k: v for k, v in corners.items() if k != "top-left"}, "a missing corner"),
+                     ({k: (0.1, 0.1) for k in corners}, "corners that never left the middle")):
+        try:
+            cm.bounds_from_corners(base_settings(), bad, 0.5)
+            check(f"bounds: rejects {why}", False)
+        except cm.CalibError:
+            check(f"bounds: rejects {why}", True)
+
+
 def test_range_math() -> None:
     print("volts -> mm inversion, range ladder, work-area suggestion")
     rng = random.Random(11)
@@ -1190,6 +1221,66 @@ def test_e2e_live(tmp: Path) -> None:
     check("cli run: calibrate.py --mock --live --step range --step offset --keys",
           proc.returncode == 0, proc.stderr[-300:] if proc.returncode != 0 else "")
 
+    test_e2e_bounds(tmp, h)
+
+
+def streamed_moves(out: Path) -> list[tuple[float, float]]:
+    """Every X/Y target the wizard sent, in order."""
+    moves = []
+    for ln in (out / "events.jsonl").read_text().splitlines():
+        ev = json.loads(ln)
+        if ev.get("kind") == "tx_line":
+            m = re.match(r"G[01]\b.*?X(-?[\d.]+).*?Y(-?[\d.]+)", ev["line"])
+            if m:
+                moves.append((float(m.group(1)), float(m.group(2))))
+    return moves
+
+
+def test_e2e_bounds(tmp: Path, h: "Hidden") -> None:
+    print("end to end: live bounds step (dot to the four corners -> offset and range in one)")
+    # Defaults: scale 0.1 V/mm, no swap or invert, so the dot starts 7 V from the centre and the arrows move it
+    # by 0.05 V per press. Temporary work area 202 mm with the origin at 101 mm: X mm = V / 0.1 + 101.
+    keys = ["left", "left", "up", "up", "enter",             # top-left      (-7.10, +7.10)
+            "right", "right", "right", "enter",              # top-right     (+7.15, +7.10)  y reused
+            "down", "enter",                                 # bottom-right  (+7.15, -7.05)  x reused
+            "enter"]                                         # bottom-left   (-7.10, -7.05)  both reused
+    code, mock, bench, out, text = run_wizard(tmp, "live_bounds", h, ["--live", "--step", "bounds"],
+                                              key_input=clive.ScriptedKeyInput(keys))
+    check("live bounds: exit code 0", code == 0, text[-400:])
+    want = cm.bounds_from_corners(base_settings(), {"top-left": (-7.10, 7.10), "top-right": (7.15, 7.10),
+                                                    "bottom-right": (7.15, -7.05), "bottom-left": (-7.10, -7.05)}, 0.5)
+    s = mock.settings
+    check("live bounds: the centre of the four limits became the offset ($140 = $141 = +0.025 V)",
+          abs(s[140] - 0.025) < 1e-4 and abs(s[141] - 0.025) < 1e-4
+          and all(abs(v - 0.025) < 1e-9 for v in want.offsets.values()), f"got {s[140]} {s[141]} want {want.offsets}")
+    check("live bounds: half the span became the range ($130 = 132.5 mm, $131 = 131.5 mm)",
+          (s[130], s[131]) == want.work_area == (132.5, 131.5), f"got {s[130]} x {s[131]} want {want.work_area}")
+    check("live bounds: temporary $142 restored", s[142] == 0.0)
+    moves = streamed_moves(out)
+    check("live bounds: the dot starts 7 V out (X 31 mm, Y 171 mm) and each arrow press moves it 0.05 V = 0.5 mm",
+          moves[:4] == [(30.5, 171.0), (30.0, 171.0), (30.0, 171.5), (30.0, 172.0)], str(moves[:4]))
+    check("live bounds: laser never armed or fired, guide off again",
+          not mock.ever_fired and not mock.ever_armed and not mock.guide)
+
+    # Going back a corner (p) re-records it: the second top-left reading is 0.05 V further out.
+    keys = ["enter", "p", "left", "enter", "enter", "enter", "enter"]
+    code, mock, bench, out, text = run_wizard(tmp, "live_bounds_back", h, ["--live", "--step", "bounds"],
+                                              key_input=clive.ScriptedKeyInput(keys))
+    s = mock.settings
+    check("live bounds: p goes back and the redone corner replaces the first reading ($140 = -0.025 V, $141 = 0)",
+          code == 0 and abs(s[140] + 0.025) < 1e-4 and abs(s[141]) < 1e-4, f"got {s[140]} {s[141]}")
+
+    # Stopping before the fourth corner changes nothing.
+    code, mock, bench, out, text = run_wizard(tmp, "live_bounds_part", h, ["--live", "--step", "bounds"],
+                                              key_input=clive.ScriptedKeyInput(["enter", "enter"]))
+    check("live bounds: with fewer than four corners nothing is written",
+          code == 0 and mock.settings[130] == 100.0 and mock.settings[140] == 0.0)
+
+    # Without --live the step explains itself and is skipped.
+    code, mock, bench, out, text = run_wizard(tmp, "bounds_nolive", h, ["--step", "bounds"])
+    check("bounds without --live is skipped, settings untouched",
+          code == 0 and mock.settings[130] == 100.0 and "needs the live keyboard mode" in text)
+
 
 def main() -> int:
     global VERBOSE
@@ -1205,6 +1296,7 @@ def main() -> int:
         test_scale_distortion()
         test_delays_misc()
         test_range_math()
+        test_bounds_math()
         test_patterns()
         full_out = test_e2e_full(tmp)
         test_e2e_orientations(tmp, quick)

@@ -12,6 +12,7 @@ python3 tools/calibrate.py /dev/ttyACM0 --no-live         # classic prompt-drive
 python3 tools/calibrate.py /dev/ttyACM0 --guide-feed 30000 # custom guide laser trace speed (default 24000)
 python3 tools/calibrate.py /dev/ttyACM0 --fire --max-power 300   # also the real-laser steps (starts with focus)
 python3 tools/calibrate.py /dev/ttyACM0 --step range --step offset # tune deflection limits & centre offset live
+python3 tools/calibrate.py /dev/ttyACM0 --step bounds             # offset and range in one: dot to the four corners
 python3 tools/calibrate.py /dev/ttyACM0 --restore tools/calibrate/runs/<ts>/settings_before.json
 python3 tools/calibrate.py --mock                          # rehearse offline (tools/rftest/mock_grbl.py)
 python3 tools/calibrate.py --mock --live --step range --step offset # test live keyboard mode offline
@@ -52,8 +53,9 @@ calibration math as the typed path. When you press Enter, the settings are appli
 | `1`, `2`, `3` | Direct step size | Selects `1` = fine, `2` = normal, `3` = coarse. |
 | `<` / `>` (or `,` / `.`) | Trace speed | Multiplies or divides guide trace speed by 1.25 (range 600 mm/min to firmware ceiling). |
 | `o` / `0` / `1` | Origin toggle | In `field`: toggles between origin 0 (corner) and 1 (lens centre). |
-| `r` | Reset | Resets shape parameters to their values at the start of the step. |
-| `Enter` | Accept & Apply | Accepts current live geometry and writes the computed `$` settings. |
+| `r` | Reset | Resets shape parameters to their values at the start of the step (in `bounds`: restarts the current corner). |
+| `p` / `Backspace` | Previous corner | In `bounds` only: goes back one corner and puts the dot where you recorded it. |
+| `Enter` | Accept & Apply | Accepts current live geometry and writes the computed `$` settings. In `bounds`: records the corner; the fourth `Enter` shows the centre and the next one applies. |
 | `s` | Skip | Skips the current step without changing any settings. |
 | `q` | Quit | Quits the wizard, shuts off preview, and offers to restore the initial settings backup. |
 
@@ -292,6 +294,36 @@ below 0.15 %.
 Typical: `|k1|` between 1e-7 and 1e-5 for a 100 mm F-theta lens (for R = 40 mm, `k1 R^2` is
 a few tenths of a percent up to a few percent). The wizard warns when `|k1 R^2| > 0.1` and clamps
 k1 to the firmware range -1..1.
+
+### bounds (`$140`, `$141`, `$130`, `$131`), live mode, guide laser only
+
+Offset and range in one step. A single red dot (the guide laser, never the marking laser) is
+driven with the arrow keys to each corner in turn: top-left, top-right, bottom-right,
+bottom-left. At each corner push the dot outwards until it **just starts to fade** (or clip,
+or lose its sharp round shape), then press `Enter`. The next corner starts where the previous
+one left off on the shared edge, so only a few key presses are needed.
+
+The dot is positioned in absolute DAC volts, so the result does not depend on the scale or the
+offset currently set. The arrows follow what you see (right is right, up is away from you), so
+run `orientation` first; if an arrow moves the dot the wrong way, the orientation is not right yet.
+
+What it computes, from the four readings:
+
+* the centre of the usable travel on each axis, which is the **offset** (`$140`, `$141`): this is
+  the point the field must be centred on, so it is exactly the voltage the mirror has at the
+  field centre;
+* half the span, which is the **range**: the work area is `2 (half span - margin) / scale`, the
+  same formula as the `range` step, with the margin `--range-margin-v` (default 0.5 V). The two
+  readings of each edge are averaged; if they differ by more than 0.3 V the screen warns that the
+  edge is tilted or was judged at a different brightness.
+
+After the fourth corner the dot jumps to the computed centre as a check. `Enter` applies the
+offsets and the work area, `p` goes back to redo a corner. `$130`/`$131`/`$142` are changed
+temporarily during the step so that nothing is clamped, and restored before the result is written.
+
+In live mode the default run uses `bounds` instead of `range` and `offset`. Run `--step offset`
+afterwards if you also want to align the picture to a reference mark on the fixture, which is a
+different thing from centring on the mirror travel. Without `--live` the step is skipped.
 
 ### offset (`$140`, `$141`)
 
