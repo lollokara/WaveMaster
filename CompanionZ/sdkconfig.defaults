@@ -23,3 +23,7 @@ CONFIG_RMT_ISR_IRAM_SAFE=y
 CONFIG_RMT_TX_ISR_HANDLER_IN_IRAM=y
 CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
 CONFIG_FREERTOS_IN_IRAM=y
+
+# The S3 link sends one TCP segment per line (TCP_NODELAY); the send queue holds 4*SND_BUF/MSS segments.
+# At 5760 a WiFi hiccup of ~1 s during a move filled it with POS reports and cost the link.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520

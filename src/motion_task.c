@@ -29,7 +29,7 @@
 static const char *TAG = "motion";
 
 #define MOTION_TASK_PRIO     8
-#define MOTION_TASK_STACK    4096
+#define MOTION_TASK_STACK    5120
 #define MOTION_TASK_CORE     1
 #define IDLE_POLL_MS         50
 #define ABORT_WAIT_MS        300

@@ -32,8 +32,9 @@
 #define STA_FAIL_LIMIT 8              /* failed attempts before the provisioning AP comes up alongside */
 #define BEACON_MS      2000
 #define AP_WINDOW_MS   (10 * 60 * 1000)   /* fallback AP stays up this long after the STA gave up */
-#define PING_TIMEOUT_MS 3000              /* no traffic from the client for this long during its move: STOP */
-#define TX_STALL_MS    500                /* a full send buffer is waited out this long before the client is dropped */
+#define PING_TIMEOUT_MS 8000              /* no traffic from the client for this long during its move: STOP. The S3
+                                           * pings every second; TCP retransmits after a WiFi loss burst take 5-7 s */
+#define TX_STALL_MS    3000               /* a full send buffer is waited out this long before the client is dropped */
 
 static const char *TAG = "zb_net";
 
@@ -252,8 +253,9 @@ static void mdns_start(void)
 
 /* Sends one complete line without blocking the caller for long. A momentarily full send buffer (EAGAIN: a WiFi
  * hiccup, the S3 slow to ACK) is waited out for TX_STALL_MS, since a half-sent line would break the framing.
- * Any other failure, or a longer stall, drops the client (the S3 reconnects). */
-static void send_line(const char *s, int n)
+ * Any other failure, or a longer stall, drops the client (the S3 reconnects). A droppable line (a periodic
+ * progress report) is skipped instead when not a byte of it fits, so reports never cost the link. */
+static void send_line_opt(const char *s, int n, bool droppable)
 {
     if (n <= 0 || !s_tx_mtx) return;
     xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
@@ -267,6 +269,7 @@ static void send_line(const char *s, int n)
                 continue;
             }
             if (r < 0 && errno == EINTR) continue;
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && droppable && off == 0) break;
             if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
                 esp_timer_get_time() - t0 < (int64_t)TX_STALL_MS * 1000) {
                 fd_set wr;
@@ -282,6 +285,11 @@ static void send_line(const char *s, int n)
         }
     }
     xSemaphoreGive(s_tx_mtx);
+}
+
+static void send_line(const char *s, int n)
+{
+    send_line_opt(s, n, false);
 }
 
 static void send_err(int code, const char *text)
@@ -312,12 +320,12 @@ static void reply_rc(int rc)
     else send_err(rc, zb_err_text(rc));
 }
 
-static void send_pos(void)
+static void send_pos(bool droppable)
 {
     struct zb_status s;
     char b[ZBRO_MAX_LINE];
     zb_motion_status(&s);
-    send_line(b, zbro_fmt_pos(b, sizeof(b), s.pos, (int)s.state, s.homed, s.endstop));
+    send_line_opt(b, zbro_fmt_pos(b, sizeof(b), s.pos, (int)s.state, s.homed, s.endstop), droppable);
 }
 
 void zb_net_on_event(enum zb_evt_type type, float pos_mm, int err)
@@ -372,7 +380,7 @@ static void handle_request(const struct zbro_req *r)
     switch (r->cmd) {
     case ZBRO_C_HELLO: send_line(b, zbro_fmt_hello(b, sizeof(b), ZB_FW_VERSION)); break;
     case ZBRO_C_PING:  send_line(b, zbro_fmt_ok(b, sizeof(b))); break;
-    case ZBRO_C_POS:   send_pos(); break;
+    case ZBRO_C_POS:   send_pos(false); break;
     case ZBRO_C_HOME:  s_client_op = true; client_op_rc(zb_home()); break;
     case ZBRO_C_MOVE:  s_client_op = true; client_op_rc(zb_move_abs(r->a, r->has_b ? r->b : 0)); break;
     case ZBRO_C_JOG:   s_client_op = true; client_op_rc(zb_move_rel(r->a, r->has_b ? r->b : 0)); break;
@@ -514,7 +522,7 @@ static void tcp_task(void *arg)
         }
 
         if (cfd >= 0 && s_client_op && esp_timer_get_time() - s_last_rx_us > (int64_t)PING_TIMEOUT_MS * 1000)
-            stop_orphan_op("no PING for 3 s");
+            stop_orphan_op("client silent");
 
         /* POS reports: every rpt_hz while moving, once more when the axis comes to rest. */
         if (cfd >= 0) {
@@ -523,7 +531,7 @@ static void tcp_task(void *arg)
             TickType_t now = xTaskGetTickCount();
             bool moving = st.state != ZB_IDLE;
             if ((moving && now - last_rpt >= period) || (!moving && prev_state != ZB_IDLE)) {
-                send_pos();
+                send_pos(moving);
                 last_rpt = now;
             }
         }

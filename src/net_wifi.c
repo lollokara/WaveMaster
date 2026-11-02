@@ -13,7 +13,7 @@
 #include "net_server.h"
 #include "nvs.h"
 
-#define MGR_TASK_STACK 4096
+#define MGR_TASK_STACK 5120
 #define MGR_TASK_PRIO  4
 #define MGR_PERIOD_MS  500
 #define BACKOFF_MIN_MS 1000

@@ -40,7 +40,7 @@ static const char *TAG = "atmega_link";
 #define ATMEGA_PIN_RX      43
 #define ATMEGA_BAUD        250000
 
-#define LINK_TASK_STACK    3072
+#define LINK_TASK_STACK    4096
 #define LINK_TASK_PRIO     5
 #define LINK_TASK_CORE     1
 

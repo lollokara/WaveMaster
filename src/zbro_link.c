@@ -18,13 +18,17 @@
 
 static const char *TAG = "zbro";
 
-#define LINK_TASK_STACK 4608
+#define LINK_TASK_STACK 5632
 #define LINK_TASK_PRIO  4
 #define POLL_MS         20
 #define PING_MS         1000
-#define REPLY_MS        5000     /* the C3 answers at once; WiFi retransmits can delay it by a few seconds */
-#define SILENCE_MS      10000    /* PING is answered every second */
+#define REPLY_MS        5000     /* a caller's request fails after this; the link stays up for a late reply */
+#define SILENCE_MS      15000    /* no byte from the C3 for this long, or a reply this late: the link is dead.
+                                  * lwIP retransmission backoff after a WiFi loss burst alone reaches 5-7 s. */
 #define CONNECT_MS      3000
+#define SEND_TIMEOUT_S  3
+#define REDIAL_TRIES    5        /* after a drop, dial the last address directly before waiting for a beacon */
+#define REDIAL_MS       300
 #define DONE_TOL_MM     0.05f    /* EVT DONE counts as arrival only this close to the MOVE target */
 
 enum slot_state { SLOT_IDLE, SLOT_QUEUED, SLOT_SENT, SLOT_DONE };
@@ -210,7 +214,7 @@ static int tcp_connect(const char *ip, int port)
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err)
         goto fail;
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) & ~O_NONBLOCK);
-    tv.tv_sec = 1;
+    tv.tv_sec = SEND_TIMEOUT_S;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -370,7 +374,15 @@ static bool session(const char *ip, int port)
             t_sent = t;
             ESP_LOGW(TAG, "boot homing timed out, stopping the axis");
         }
-        if ((exp != EXP_NONE && t - t_sent > REPLY_MS) || t - last_rx > SILENCE_MS) {
+        if (exp == EXP_SLOT && t - t_sent > REPLY_MS) {
+            /* Fail the caller now but keep the link: the reply is most likely held up by TCP retransmits. */
+            bool pos = strncmp(s_slot.line, "POS", 3) == 0;
+
+            ESP_LOGW(TAG, "no reply to '%.12s' in %d ms, keeping the link", s_slot.line, REPLY_MS);
+            slot_finish(ZBRO_ERR_TIMEOUT, "");
+            exp = pos ? EXP_POS_DISCARD : EXP_DISCARD;
+        }
+        if ((exp != EXP_NONE && t - t_sent > SILENCE_MS) || t - last_rx > SILENCE_MS) {
             ESP_LOGW(TAG, "C3 not answering (waiting for reply type %d: %ld ms since the request, %ld ms since any data), dropping the link",
                      (int)exp, (long)(t - t_sent), (long)(t - last_rx));
             break;
@@ -413,6 +425,9 @@ static void link_task(void *arg)
 {
     uint32_t backoff = 1000;
     int udp = -1;
+    int redial = 0;
+    char last_ip[16] = "";
+    int last_port = 0;
 
     (void)arg;
     for (;;) {
@@ -428,6 +443,16 @@ static void link_task(void *arg)
                 udp = -1;
             }
             vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        if (redial > 0) {
+            /* The C3 keeps its address across a WiFi hiccup: dial it again without waiting for a beacon. */
+            redial--;
+            if (session(last_ip, last_port)) {
+                redial = REDIAL_TRIES;
+                backoff = 1000;
+            }
+            vTaskDelay(pdMS_TO_TICKS(REDIAL_MS));
             continue;
         }
         if (udp < 0)
@@ -449,9 +474,14 @@ static void link_task(void *arg)
             continue;
         close(udp);                      /* drop queued beacons, listen again after the session */
         udp = -1;
-        if (session(ip, port))
+        if (session(ip, port)) {
+            strlcpy(last_ip, ip, sizeof(last_ip));
+            last_port = port;
+            redial = REDIAL_TRIES;
             backoff = 1000;
-        else if (backoff < 8000)
+            continue;
+        }
+        if (backoff < 8000)
             backoff *= 2;
         vTaskDelay(pdMS_TO_TICKS(backoff));
     }

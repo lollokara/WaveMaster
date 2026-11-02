@@ -12,7 +12,7 @@
 #include "host_serial.h"
 #include "lwip/sockets.h"
 
-#define SRV_TASK_STACK 4096
+#define SRV_TASK_STACK 5120
 #define TX_TASK_STACK  4096
 #define TASK_PRIO      10               /* same as host_rx: '!' and Ctrl-X latency */
 #define RX_CHUNK       512

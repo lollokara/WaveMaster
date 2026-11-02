@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_app_desc.h"
 #include "esp_attr.h"
 #include "esp_core_dump.h"
 #include "esp_log.h"
@@ -182,11 +183,13 @@ static void stack_report(void)
 /* A panic or watchdog reset leaves its summary in the coredump partition. Log it so the hub gets the task, the
  * PC and the backtrace (resolve them with the firmware.elf whose sha is printed). The dump stays in flash: it
  * holds every task's stack, and esptool can read it until the next crash replaces it. Each dump is logged once
- * (fingerprint kept in RTC memory). */
+ * (fingerprint kept in RTC memory), and only if this firmware wrote it: RTC memory does not survive a power
+ * cycle, and a dump left by an older build says nothing about the current one. */
 static void crash_report(void)
 {
     esp_core_dump_summary_t *s;
     char line[96];
+    char elf[10];
     size_t len = 0;
     uint32_t fp;
     esp_err_t err = esp_core_dump_image_check();
@@ -200,7 +203,15 @@ static void crash_report(void)
     s = malloc(sizeof(*s));
     if (!s)
         return;
-    if (esp_core_dump_get_summary(s) == ESP_OK) {
+    esp_app_get_elf_sha256(elf, sizeof(elf));
+    if (esp_core_dump_get_summary(s) != ESP_OK) {
+        free(s);
+        return;
+    }
+    if (strncmp(elf, (const char *)s->app_elf_sha256, sizeof(elf) - 1) != 0) {
+        ESP_LOGI(TAG, "core dump in flash is from another build (elf %.9s), not reported",
+                 (const char *)s->app_elf_sha256);
+    } else {
         uint32_t n = s->exc_bt_info.depth < 16 ? s->exc_bt_info.depth : 16;
 
         fp = s->exc_pc;

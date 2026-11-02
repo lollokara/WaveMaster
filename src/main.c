@@ -18,7 +18,7 @@
 
 static const char *TAG = "wavemaster";
 
-#define FLEET_TASK_STACK 6144
+#define FLEET_TASK_STACK 8192
 #define FLEET_TASK_PRIO  1
 #define FLEET_TASK_CORE  1               /* core 0 belongs to dac_task */
 #define FLEET_HUB_URL    "http://192.168.3.87:8080"
